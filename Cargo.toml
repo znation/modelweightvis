@@ -8,12 +8,7 @@ description = "Tensor-format-aware visualization built on arbvis"
 # arbvis core. Both `path` and `version` so the dep resolves from a
 # sibling `arbvis` clone during dev; the version pin is what'll be
 # enforced once `arbvis` ships to crates.io and the `path =` is dropped.
-#
-# Today the `arbvis` crate only exists inside the in-progress split
-# worktree (see `~/hf/arbvis/.claude/worktrees/focused-mclaren-c3e069/`).
-# Once the workspace-split branch lands on `~/hf/arbvis`'s `main`, this
-# path becomes `../arbvis/crates/arbvis` (the canonical sibling layout).
-arbvis = { path = "../arbvis/.claude/worktrees/focused-mclaren-c3e069/crates/arbvis", version = "0.1.0" }
+arbvis = { path = "../arbvis/crates/arbvis", version = "0.1.0" }
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
