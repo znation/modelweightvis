@@ -1284,7 +1284,7 @@ pub async fn build_multi_safetensors_diff_sources(
 /// Build per-tensor diff Sources from multiple remote .safetensors files on each side.
 ///
 /// When `stream` is false (the default) every shard is downloaded to the
-/// local hf-hub cache and mmapped before any source is constructed, so the
+/// local HF cache (via the `hf` CLI) and mmapped before any source is constructed, so the
 /// per-tile diff path is pure memcpy. When `stream` is true each xet-backed
 /// file gets a `Data::Xet` reader (one V2 reconstruction fetch per file,
 /// then direct-CAS range fetches afterward — see `XetReader`) and non-xet
@@ -1321,7 +1321,7 @@ async fn build_multi_safetensors_diff_sources_from_http(
                             Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
                             Err(e) => {
                                 log::warn!(
-                                    "{}: XetReader build failed ({e}); falling back to hf-hub Data::Http",
+                                    "{}: XetReader build failed ({e}); falling back to Data::Http",
                                     spec.filename,
                                 );
                                 Ok(Arc::new(Data::Http {
@@ -1459,8 +1459,8 @@ pub async fn prepare_moe_diff_sources(
         // In streaming mode each shard becomes an `Arc<Data::Xet>` (or
         // `Data::Http` fallback) and per-tile diffs go over HTTP. In the
         // disk-backed default we skip the xet reconstruction setup entirely
-        // — `materialize_remote_arcs` below downloads every shard via
-        // hf-hub and replaces the arc with a `Data::Mapped` mmap, so the
+        // — `materialize_remote_arcs` below downloads every shard via the
+        // `hf` CLI and replaces the arc with a `Data::Mapped` mmap, so the
         // per-tile path is pure memcpy.
         let mut datas: Vec<Arc<Data>> = if stream {
             let pb = setup_progress(
@@ -1479,7 +1479,7 @@ pub async fn prepare_moe_diff_sources(
                             Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
                             Err(e) => {
                                 log::warn!(
-                                    "{}: XetReader build failed ({e}); falling back to hf-hub Data::Http",
+                                    "{}: XetReader build failed ({e}); falling back to Data::Http",
                                     spec.filename,
                                 );
                                 Ok(Arc::new(Data::Http {
