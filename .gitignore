@@ -2,3 +2,8 @@
 Cargo.lock.user
 *.swp
 .DS_Store
+
+# Per-developer Cargo overrides (e.g. `[patch]` block redirecting the
+# arbvis git dep to a local sibling checkout — see README's
+# "Local arbvis co-development" section).
+/.cargo/

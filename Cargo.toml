@@ -5,10 +5,11 @@ edition = "2021"
 description = "Tensor-format-aware visualization built on arbvis"
 
 [dependencies]
-# arbvis core. Both `path` and `version` so the dep resolves from a
-# sibling `arbvis` clone during dev; the version pin is what'll be
-# enforced once `arbvis` ships to crates.io and the `path =` is dropped.
-arbvis = { path = "../arbvis/crates/arbvis", version = "0.1.0" }
+# arbvis core. Pinned to a specific commit on znation/arbvis. Bump the
+# `rev` when picking up arbvis changes. For local co-development against
+# a sibling arbvis checkout, add a `[patch]` block in `.cargo/config.toml`
+# (gitignored) — see README's "Local arbvis co-development" section.
+arbvis = { git = "https://github.com/znation/arbvis", rev = "c2ae3ce87bb5e7e526af6ec75df7bc05ffac94b5" }
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }

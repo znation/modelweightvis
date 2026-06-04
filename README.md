@@ -104,15 +104,7 @@ The `modelweightvis` binary itself is tiny — it builds an `arbvis::Registry::w
 
 ## Building
 
-Requires Rust (stable). modelweightvis depends on `arbvis` as a sibling path-dep, so you need a checkout of [arbvis](https://github.com/znation/arbvis) next to this repo:
-
-```
-~/your-code/
-├── arbvis/            # https://github.com/znation/arbvis
-└── modelweightvis/    # this repo
-```
-
-Then:
+Requires Rust (stable).
 
 ```sh
 cargo build --release
@@ -125,9 +117,27 @@ Or install into your `PATH`:
 cargo install --path .
 ```
 
-The `Cargo.toml` path-dep is `arbvis = { path = "../arbvis/crates/arbvis", version = "0.1.0" }`. The `version =` pin will take over once arbvis publishes to crates.io.
+`Cargo.toml` pins arbvis to a specific commit on [znation/arbvis](https://github.com/znation/arbvis) via `arbvis = { git = "…", rev = "…" }`. Cargo fetches and builds it on first build; no sibling checkout needed. Bump the `rev` to pick up new arbvis changes.
 
-Alternatively, the [arbvis](https://github.com/znation/arbvis) repo is a Cargo workspace that includes the same `modelweightvis` source as a member — `cargo build --release -p modelweightvis` from there builds an identical binary without needing this standalone checkout.
+### Local arbvis co-development
+
+If you're editing arbvis and want modelweightvis to build against your local checkout instead of the pinned git rev, create a gitignored `.cargo/config.toml` next to this repo's `Cargo.toml`:
+
+```toml
+# .cargo/config.toml — not committed; per-developer override.
+[patch."https://github.com/znation/arbvis"]
+arbvis = { path = "../arbvis" }
+```
+
+Layout:
+
+```
+~/your-code/
+├── arbvis/            # https://github.com/znation/arbvis
+└── modelweightvis/    # this repo (with .cargo/config.toml above)
+```
+
+`cargo build` will now resolve arbvis from `../arbvis` instead of GitHub. Remove the file (or the `[patch]` block) to switch back to the pinned rev.
 
 ## Credits
 

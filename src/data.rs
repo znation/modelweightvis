@@ -1312,41 +1312,42 @@ async fn build_multi_safetensors_diff_sources_from_http(
         let total = specs.len() as u64;
         let pb = setup_progress("source files (xet reconstruction for diff)", total);
         let pb_for_workers = pb.clone();
-        let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> = stream::iter(specs.into_iter().enumerate())
-            .map(|(i, spec)| {
-                let pb = pb_for_workers.clone();
-                async move {
-                    let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
-                        match XetReader::new(&spec).await {
-                            Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
-                            Err(e) => {
-                                log::warn!(
+        let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> =
+            stream::iter(specs.into_iter().enumerate())
+                .map(|(i, spec)| {
+                    let pb = pb_for_workers.clone();
+                    async move {
+                        let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
+                            match XetReader::new(&spec).await {
+                                Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
+                                Err(e) => {
+                                    log::warn!(
                                     "{}: XetReader build failed ({e}); falling back to Data::Http",
                                     spec.filename,
                                 );
-                                Ok(Arc::new(Data::Http {
-                                    repo: spec.repo.clone(),
-                                    filename: Arc::clone(&spec.filename),
-                                    revision: Arc::clone(&spec.revision),
-                                }))
+                                    Ok(Arc::new(Data::Http {
+                                        repo: spec.repo.clone(),
+                                        filename: Arc::clone(&spec.filename),
+                                        revision: Arc::clone(&spec.revision),
+                                    }))
+                                }
                             }
+                        } else {
+                            Ok(Arc::new(Data::Http {
+                                repo: spec.repo.clone(),
+                                filename: Arc::clone(&spec.filename),
+                                revision: Arc::clone(&spec.revision),
+                            }))
+                        };
+                        if let Some(pb) = pb.as_ref() {
+                            pb.inc(1);
                         }
-                    } else {
-                        Ok(Arc::new(Data::Http {
-                            repo: spec.repo.clone(),
-                            filename: Arc::clone(&spec.filename),
-                            revision: Arc::clone(&spec.revision),
-                        }))
-                    };
-                    if let Some(pb) = pb.as_ref() {
-                        pb.inc(1);
+                        (i, r)
                     }
-                    (i, r)
-                }
-            })
-            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
-            .collect()
-            .await;
+                })
+                .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+                .collect()
+                .await;
         if let Some(pb) = pb.as_ref() {
             pb.finish_and_clear();
         }
@@ -1468,43 +1469,42 @@ pub async fn prepare_moe_diff_sources(
                 specs_owned.len() as u64,
             );
             let pb_for_workers = pb.clone();
-            let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> = stream::iter(
-                specs_owned.iter().cloned().enumerate(),
-            )
-            .map(|(i, spec)| {
-                let pb = pb_for_workers.clone();
-                async move {
-                    let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
-                        match XetReader::new(&spec).await {
-                            Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
-                            Err(e) => {
-                                log::warn!(
+            let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> =
+                stream::iter(specs_owned.iter().cloned().enumerate())
+                    .map(|(i, spec)| {
+                        let pb = pb_for_workers.clone();
+                        async move {
+                            let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
+                                match XetReader::new(&spec).await {
+                                    Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
+                                    Err(e) => {
+                                        log::warn!(
                                     "{}: XetReader build failed ({e}); falling back to Data::Http",
                                     spec.filename,
                                 );
+                                        Ok(Arc::new(Data::Http {
+                                            repo: spec.repo.clone(),
+                                            filename: Arc::clone(&spec.filename),
+                                            revision: Arc::clone(&spec.revision),
+                                        }))
+                                    }
+                                }
+                            } else {
                                 Ok(Arc::new(Data::Http {
                                     repo: spec.repo.clone(),
                                     filename: Arc::clone(&spec.filename),
                                     revision: Arc::clone(&spec.revision),
                                 }))
+                            };
+                            if let Some(pb) = pb.as_ref() {
+                                pb.inc(1);
                             }
+                            (i, r)
                         }
-                    } else {
-                        Ok(Arc::new(Data::Http {
-                            repo: spec.repo.clone(),
-                            filename: Arc::clone(&spec.filename),
-                            revision: Arc::clone(&spec.revision),
-                        }))
-                    };
-                    if let Some(pb) = pb.as_ref() {
-                        pb.inc(1);
-                    }
-                    (i, r)
-                }
-            })
-            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
-            .collect()
-            .await;
+                    })
+                    .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+                    .collect()
+                    .await;
             if let Some(pb) = pb.as_ref() {
                 pb.finish_and_clear();
             }
