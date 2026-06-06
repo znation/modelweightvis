@@ -154,7 +154,6 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 [[package]]
 name = "arbvis"
 version = "0.1.0"
-source = "git+https://github.com/znation/arbvis?rev=bdf6d442e#bdf6d442e67a7462612027b47067d3ed1be78d11"
 dependencies = [
  "ab_glyph",
  "anyhow",
