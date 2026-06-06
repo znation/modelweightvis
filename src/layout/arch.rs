@@ -828,7 +828,169 @@ impl ArchLayout {
             sorted_idx,
         })
     }
+
+    /// Build the per-expert summary canvas: 3 or 4 panels side-by-side, each
+    /// a `n_layers × n_experts` U8 heatmap rendered at `MOE_SUMMARY_CELL_PX`
+    /// pixels per scalar. Triggered by [`crate::layout::select_layout`] when
+    /// any source carries a `MoeSummaryPanel` extension tag (set by
+    /// [`crate::data::prepare_moe_summary_sources`]).
+    ///
+    /// Panels appear in a fixed order — gate_proj, up_proj, down_proj, then
+    /// router if present. Each panel is one synthetic tensor of shape
+    /// `(n_layers, n_experts)`; the existing dtype-aware U8 element
+    /// colourizer paints each scalar through the plain pixel LUT.
+    ///
+    /// Returns `None` if no source carries a `MoeSummaryPanel` tag.
+    pub fn try_build_moe_summary(
+        sources: &[Source],
+        cumulative_offsets: &[u64],
+    ) -> Option<Self> {
+        use crate::format::moe::ExpertWeight as EW;
+
+        // Collect (weight, source_idx, &TensorMeta, base_off, n_layers, n_experts)
+        // for every source carrying a MoeSummaryPanel. Sources are emitted in
+        // a stable order by `prepare_moe_summary_sources` (gate, up, down,
+        // router) and each has exactly one synthetic tensor of shape
+        // [n_layers, n_experts] U8.
+        let mut panels: Vec<(EW, usize, &TensorMeta, u64, u32, u32)> = Vec::new();
+        for (sidx, s) in sources.iter().enumerate() {
+            let Some(tag) = s.extensions.get::<crate::data::MoeSummaryPanel>().copied() else {
+                continue;
+            };
+            let Some(st) = s.extensions.get::<crate::format::ModelInfo>() else {
+                continue;
+            };
+            let Some(t) = st.tensors.first() else {
+                continue;
+            };
+            let off = cumulative_offsets.get(sidx).copied().unwrap_or(0);
+            panels.push((tag.weight, sidx, t, off, tag.n_layers, tag.n_experts));
+        }
+        if panels.is_empty() {
+            return None;
+        }
+
+        // Sort panels into a stable display order: gate, up, down, router.
+        // The variant order in `ExpertWeight` already gives this — `Router`
+        // is the last variant — so we sort by the enum's natural ordering.
+        panels.sort_by_key(|(w, _, _, _, _, _)| *w);
+
+        // All panels must share `n_layers` and `n_experts` (they're derived
+        // from the same expert grouping in source prep). If they differ,
+        // something upstream is wrong — bail rather than render a jagged
+        // canvas.
+        let n_layers = panels[0].4;
+        let n_experts = panels[0].5;
+        if panels.iter().any(|p| p.4 != n_layers || p.5 != n_experts) {
+            log::warn!(
+                "moe-summary layout: panels disagree on (n_layers, n_experts); refusing to lay out"
+            );
+            return None;
+        }
+        if n_layers == 0 || n_experts == 0 {
+            return None;
+        }
+
+        let scale = MOE_SUMMARY_CELL_PX as f32;
+        let panel_w = n_experts.saturating_mul(MOE_SUMMARY_CELL_PX);
+        let panel_h = n_layers.saturating_mul(MOE_SUMMARY_CELL_PX);
+        let n_panels = panels.len() as u32;
+        let canvas_w_raw = n_panels
+            .saturating_mul(panel_w)
+            .saturating_add(n_panels.saturating_sub(1).saturating_mul(MOE_SUMMARY_PANEL_PAD));
+        let canvas_h_raw = panel_h;
+
+        // Place one PlacedTensor per panel, left-to-right.
+        let mut tensors: Vec<PlacedTensor> = Vec::new();
+        for (idx, (weight, sidx, t, base_off, _, _)) in panels.iter().enumerate() {
+            let panel_x = (idx as u32) * (panel_w + MOE_SUMMARY_PANEL_PAD);
+            tensors.push(PlacedTensor {
+                source_idx: *sidx,
+                tensor_id: idx,
+                name: t.name.clone(),
+                dtype: t.dtype,
+                tensor_byte_start: base_off + t.file_start,
+                tensor_rows: n_layers as u64,
+                tensor_cols: n_experts as u64,
+                disp_w: panel_w,
+                disp_h: panel_h,
+                scale,
+                canvas_x: panel_x,
+                canvas_y: 0,
+                hue: name_hue(weight.label()),
+                layer_idx: None,
+            });
+        }
+
+        let raw_canvas_w = align_up(canvas_w_raw.max(1), TILE);
+        let raw_canvas_h = align_up(canvas_h_raw.max(1), TILE);
+        let raw_width_tiles = (raw_canvas_w / TILE).max(1);
+        let raw_height_tiles = (raw_canvas_h / TILE).max(1);
+        let width_tiles = next_pow2(raw_width_tiles);
+        let height_tiles = next_pow2(raw_height_tiles);
+        let canvas_w = width_tiles * TILE;
+        let canvas_h = height_tiles * TILE;
+        let max_zoom = (width_tiles.min(height_tiles).max(1) as f64).log2().round() as u32;
+
+        // Each cell is 16×16 px — no shrinkage, no detail pyramid needed.
+        let detail_depth = 0u32;
+
+        let mut sorted_idx: Vec<usize> = (0..tensors.len()).collect();
+        sorted_idx.sort_by_key(|&i| {
+            let t = &tensors[i];
+            (t.canvas_y, t.canvas_x)
+        });
+
+        log::info!(
+            "moe-summary layout: {} panel(s), {} layer(s) × {} expert(s) per panel @ {}px/cell; \
+             canvas {}×{} ({} × {} tiles, max_zoom={})",
+            tensors.len(),
+            n_layers,
+            n_experts,
+            MOE_SUMMARY_CELL_PX,
+            canvas_w,
+            canvas_h,
+            width_tiles,
+            height_tiles,
+            max_zoom,
+        );
+
+        Some(Self {
+            width: canvas_w,
+            height: canvas_h,
+            // Unpadded content extent so the viewer's `map.fitBounds` zooms
+            // onto the panels instead of the next-pow2-padded tile grid.
+            content_w: canvas_w_raw.max(1),
+            content_h: canvas_h_raw.max(1),
+            width_tiles,
+            height_tiles,
+            total_tiles: width_tiles as u64 * height_tiles as u64,
+            max_zoom,
+            detail_depth,
+            tensors,
+            layer_bounds: Vec::new(),
+            architecture: format!(
+                "MoE per-expert summary ({} panel{}, {} layer(s) × {} expert(s))",
+                n_panels,
+                if n_panels == 1 { "" } else { "s" },
+                n_layers,
+                n_experts,
+            ),
+            sorted_idx,
+        })
+    }
 }
+
+/// Display pixels per scalar cell in the MoE-summary heatmaps. Big enough
+/// to be readable as an individual cell at the overview zoom, small enough
+/// that 60 experts × 24 layers (Qwen1.5-MoE) fits on one screen without
+/// scrolling. Doubles as the panel's `scale` — element shape is
+/// `(n_layers, n_experts)` and `display = element × scale`.
+const MOE_SUMMARY_CELL_PX: u32 = 16;
+/// Gutter between the (gate / up / down / router) panels in the summary
+/// layout. Matches `MOE_CELL_PAD` for visual consistency with the diff
+/// layout's outer gutters.
+const MOE_SUMMARY_PANEL_PAD: u32 = 16;
 
 /// Target longest-axis size, in overview pixels, for a single per-weight
 /// tensor inside an MoE-diff cell. The layout stacks every layer × 3 weights
@@ -1779,5 +1941,138 @@ mod tests {
             layout.detail_depth, MOE_MAX_DETAIL_DEPTH,
             "MoE detail pyramid must be capped at {MOE_MAX_DETAIL_DEPTH}",
         );
+    }
+
+    /// Build a synthetic `Source` for the MoE-summary layout: one U8 tensor
+    /// of shape `[n_layers, n_experts]` carrying both a `ModelInfo` (so the
+    /// PlacedTensor can fish out the meta) and a `MoeSummaryPanel` tag (so
+    /// the layout plugin recognises it).
+    fn synthetic_summary_source(
+        weight: crate::format::moe::ExpertWeight,
+        n_layers: u32,
+        n_experts: u32,
+    ) -> Source {
+        use crate::data::MoeSummaryPanel;
+        let nbytes = (n_layers as u64) * (n_experts as u64);
+        let t = TensorMeta {
+            name: format!("moe-summary::{}", weight.label()),
+            dtype: Dtype::U8,
+            shape: vec![n_layers as u64, n_experts as u64],
+            file_start: 0,
+            file_end: nbytes,
+            packed_sidecars: None,
+        };
+        let mut extensions = Extensions::default();
+        extensions.insert(crate::format::ModelInfo {
+            format: crate::format::SourceFormat::Safetensors,
+            tensors: vec![t],
+            color_ranges: Vec::new(),
+        });
+        extensions.insert(MoeSummaryPanel {
+            weight,
+            n_layers,
+            n_experts,
+        });
+        Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(vec![0u8; nbytes as usize]),
+            byte_size: nbytes,
+            name_override: None,
+            xet_terms: None,
+            extensions,
+        }
+    }
+
+    #[test]
+    fn moe_summary_layout_places_three_panels_in_a_row() {
+        use crate::format::moe::ExpertWeight as EW;
+        let n_layers = 24u32;
+        let n_experts = 60u32;
+        let sources = vec![
+            synthetic_summary_source(EW::GateProj, n_layers, n_experts),
+            synthetic_summary_source(EW::UpProj, n_layers, n_experts),
+            synthetic_summary_source(EW::DownProj, n_layers, n_experts),
+        ];
+        let cumulative = vec![0u64, 0u64, 0u64];
+        let layout = ArchLayout::try_build_moe_summary(&sources, &cumulative)
+            .expect("moe-summary layout built");
+
+        assert_eq!(layout.tensors.len(), 3, "one PlacedTensor per panel");
+
+        // Panels in canonical order: gate, up, down.
+        let names: Vec<String> = layout.tensors.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "moe-summary::gate_proj".to_string(),
+                "moe-summary::up_proj".to_string(),
+                "moe-summary::down_proj".to_string(),
+            ],
+        );
+
+        // Each panel is `n_experts × n_layers × CELL_PX` and they're laid
+        // out side-by-side with one `MOE_SUMMARY_PANEL_PAD` gutter between.
+        let panel_w = n_experts * MOE_SUMMARY_CELL_PX;
+        let panel_h = n_layers * MOE_SUMMARY_CELL_PX;
+        for (i, t) in layout.tensors.iter().enumerate() {
+            assert_eq!(t.disp_w, panel_w, "panel {i} width");
+            assert_eq!(t.disp_h, panel_h, "panel {i} height");
+            assert_eq!(t.canvas_y, 0);
+            let expected_x = (i as u32) * (panel_w + MOE_SUMMARY_PANEL_PAD);
+            assert_eq!(t.canvas_x, expected_x, "panel {i} canvas_x");
+            assert_eq!(t.tensor_rows, n_layers as u64);
+            assert_eq!(t.tensor_cols, n_experts as u64);
+            assert_eq!(t.scale, MOE_SUMMARY_CELL_PX as f32);
+        }
+
+        // Unpadded content extent reflects the actual matrix, not the
+        // power-of-two padded tile grid.
+        let expected_w = 3 * panel_w + 2 * MOE_SUMMARY_PANEL_PAD;
+        assert_eq!(layout.content_w, expected_w);
+        assert_eq!(layout.content_h, panel_h);
+
+        // No detail pyramid for a 16-px-per-cell heatmap.
+        assert_eq!(layout.detail_depth, 0);
+    }
+
+    #[test]
+    fn moe_summary_layout_includes_router_when_present() {
+        use crate::format::moe::ExpertWeight as EW;
+        let n_layers = 4u32;
+        let n_experts = 8u32;
+        let sources = vec![
+            synthetic_summary_source(EW::GateProj, n_layers, n_experts),
+            synthetic_summary_source(EW::UpProj, n_layers, n_experts),
+            synthetic_summary_source(EW::DownProj, n_layers, n_experts),
+            synthetic_summary_source(EW::Router, n_layers, n_experts),
+        ];
+        let cumulative = vec![0u64; sources.len()];
+        let layout = ArchLayout::try_build_moe_summary(&sources, &cumulative)
+            .expect("moe-summary layout built");
+
+        assert_eq!(layout.tensors.len(), 4);
+        let last = &layout.tensors[3];
+        assert_eq!(last.name, "moe-summary::router");
+    }
+
+    #[test]
+    fn moe_summary_layout_returns_none_without_any_panel() {
+        // Plain source with no MoeSummaryPanel tag → plugin shouldn't fire.
+        let sources = vec![synthetic_source(vec![])];
+        let cumulative = vec![0u64];
+        assert!(ArchLayout::try_build_moe_summary(&sources, &cumulative).is_none());
+    }
+
+    #[test]
+    fn moe_summary_layout_rejects_mismatched_panels() {
+        use crate::format::moe::ExpertWeight as EW;
+        let sources = vec![
+            synthetic_summary_source(EW::GateProj, 4, 8),
+            synthetic_summary_source(EW::UpProj, 4, 16), // different n_experts!
+        ];
+        let cumulative = vec![0u64; sources.len()];
+        // Inconsistent panel dimensions: refuse rather than render a
+        // jagged canvas. (Function logs a warning and returns None.)
+        assert!(ArchLayout::try_build_moe_summary(&sources, &cumulative).is_none());
     }
 }

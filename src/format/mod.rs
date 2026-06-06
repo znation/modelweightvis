@@ -24,11 +24,14 @@ pub mod pickle;
 pub mod safetensors;
 pub mod types;
 
-pub use dtype::{rms_from_buf, Dtype, ElementStride, TensorElementReader};
+pub use dtype::{
+    frobenius_from_buf, mean_abs_from_buf, rms_from_buf, sparsity_from_buf, Dtype, ElementStride,
+    TensorElementReader,
+};
 pub use name_map::to_canonical;
-// DiffMetric / DiffFill moved to arbvis; re-export so the many
-// `format::DiffMetric` call sites below keep compiling.
-pub use arbvis::DiffMetric;
+// DiffMetric / DiffFill / SummaryStat moved to arbvis; re-export so the
+// many `format::DiffMetric` call sites below keep compiling.
+pub use arbvis::{DiffMetric, SummaryStat};
 pub use types::{ModelInfo, TensorMeta, ABS_LOG_MAX, ABS_LOG_MIN, K_RMS_SAT, RMS_FLOOR};
 
 /// Which model file format produced a [`ModelInfo`].

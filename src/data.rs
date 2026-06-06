@@ -255,6 +255,19 @@ pub struct MoeCell {
     pub j: u32,
 }
 
+/// Per-panel tag attached to each `--moe-summary` source. One source per
+/// `ExpertWeight` variant present in the model (gate/up/down/router); the
+/// source's bytes are a `n_layers × n_experts` U8 heatmap, row-major
+/// (rows = layers, cols = experts), normalized to `0..=255` per panel.
+/// Presence of this extension on any source routes `select_layout` to the
+/// MoE-summary layout plugin.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeSummaryPanel {
+    pub weight: ExpertWeight,
+    pub n_layers: u32,
+    pub n_experts: u32,
+}
+
 // === extracted from arbvis::data (load_model_info,fetch_model_header) ===
 /// Read just the header of a recognised model file and return parsed
 /// metadata. Dispatches on `format`.
@@ -1863,6 +1876,502 @@ pub async fn prepare_moe_diff_sources(
     let _ = weight_keys; // intentional: silence unused if log changes
 
     Ok((sources, total))
+}
+
+/// Build per-expert summary `Source`s for `--moe-summary`. Emits one
+/// `Source` per per-weight panel (gate / up / down, plus router when the
+/// checkpoint has `mlp.gate.weight` tensors) carrying a `MoeSummaryPanel`
+/// extension tag and an in-memory `n_layers × n_experts` U8 heatmap. The
+/// `MoeSummaryLayoutPlugin` reads the tags back and lays the panels out
+/// side-by-side.
+///
+/// Reuses the same file-opening / header-fetch / per-expert grouping
+/// scaffolding as [`prepare_moe_diff_sources`]; the duplication is
+/// intentional for now (the shared scaffolding is the easy half of an
+/// eventual extraction once the summary code stabilises).
+pub async fn prepare_moe_summary_sources(
+    input: &str,
+    stat: format::SummaryStat,
+    stream: bool,
+) -> anyhow::Result<(Vec<Source>, u64)> {
+    // === File opening — identical to prepare_moe_diff_sources ============
+    let (datas, fmts, file_names) = if hf_url::is_repo_level(input)? {
+        let listed = hf_url::list_repo_as_http_specs(input)
+            .await
+            .with_context(|| format!("listing files in {input}"))?;
+        let st_specs: Vec<&(String, hf_url::RemoteFileSpec)> = listed
+            .iter()
+            .filter(|(n, _)| SourceFormat::from_name(n).is_some())
+            .collect();
+        if st_specs.is_empty() {
+            anyhow::bail!("--moe-summary: no .safetensors / .gguf files in {input}");
+        }
+        let fmts: Vec<SourceFormat> = st_specs
+            .iter()
+            .map(|(n, _)| SourceFormat::from_name(n).unwrap_or(SourceFormat::Safetensors))
+            .collect();
+        let names: Vec<String> = st_specs.iter().map(|(n, _)| n.clone()).collect();
+        let specs_owned: Vec<RemoteFileSpec> = st_specs.iter().map(|(_, s)| s.clone()).collect();
+        let mut datas: Vec<Arc<Data>> = if stream {
+            let pb = setup_progress(
+                "source files (xet reconstruction for moe-summary)",
+                specs_owned.len() as u64,
+            );
+            let pb_for_workers = pb.clone();
+            let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> =
+                stream::iter(specs_owned.iter().cloned().enumerate())
+                    .map(|(i, spec)| {
+                        let pb = pb_for_workers.clone();
+                        async move {
+                            let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
+                                match XetReader::new(&spec).await {
+                                    Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
+                                    Err(e) => {
+                                        log::warn!(
+                                    "{}: XetReader build failed ({e}); falling back to Data::Http",
+                                    spec.filename,
+                                );
+                                        Ok(Arc::new(Data::Http {
+                                            repo: spec.repo.clone(),
+                                            filename: Arc::clone(&spec.filename),
+                                            revision: Arc::clone(&spec.revision),
+                                        }))
+                                    }
+                                }
+                            } else {
+                                Ok(Arc::new(Data::Http {
+                                    repo: spec.repo.clone(),
+                                    filename: Arc::clone(&spec.filename),
+                                    revision: Arc::clone(&spec.revision),
+                                }))
+                            };
+                            if let Some(pb) = pb.as_ref() {
+                                pb.inc(1);
+                            }
+                            (i, r)
+                        }
+                    })
+                    .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+                    .collect()
+                    .await;
+            if let Some(pb) = pb.as_ref() {
+                pb.finish_and_clear();
+            }
+            out.sort_by_key(|(i, _)| *i);
+            out.into_iter()
+                .map(|(_, r)| r)
+                .collect::<anyhow::Result<Vec<_>>>()?
+        } else {
+            specs_owned
+                .iter()
+                .map(|spec| {
+                    Arc::new(Data::Http {
+                        repo: spec.repo.clone(),
+                        filename: Arc::clone(&spec.filename),
+                        revision: Arc::clone(&spec.revision),
+                    })
+                })
+                .collect()
+        };
+        if !stream {
+            materialize_remote_arcs(
+                &mut datas,
+                &specs_owned,
+                "source files (downloading for moe-summary)",
+            )
+            .await?;
+        }
+        (datas, fmts, names)
+    } else {
+        let resolved = hf_url::resolve(Path::new(input))
+            .await
+            .with_context(|| format!("resolving {input}"))?;
+        let files: Vec<PathBuf> = if resolved.is_dir() {
+            collect_files_recursive(&resolved)
+                .into_iter()
+                .filter(|p| SourceFormat::from_path(p).is_some())
+                .collect()
+        } else {
+            vec![resolved]
+        };
+        if files.is_empty() {
+            anyhow::bail!(
+                "--moe-summary: no recognised model files (.safetensors / .gguf) in {input}"
+            );
+        }
+        let mut datas = Vec::with_capacity(files.len());
+        let mut fmts = Vec::with_capacity(files.len());
+        let mut names = Vec::with_capacity(files.len());
+        for p in &files {
+            let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
+            datas.push(Arc::new(Data::Mapped(unsafe { Mmap::map(&f) }?)));
+            fmts.push(SourceFormat::from_path(p).unwrap_or(SourceFormat::Safetensors));
+            names.push(
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+        }
+        (datas, fmts, names)
+    };
+
+    // === Header fetch — identical to prepare_moe_diff_sources ============
+    let total_headers = datas.len() as u64;
+    let pb = setup_progress("source files (model headers)", total_headers);
+    let headers: Vec<(usize, Vec<format::TensorMeta>)> = {
+        let pb = pb.clone();
+        let items: Vec<(usize, Arc<Data>, SourceFormat)> = datas
+            .iter()
+            .zip(fmts.iter())
+            .enumerate()
+            .map(|(i, (d, fmt))| (i, Arc::clone(d), *fmt))
+            .collect();
+        let mut out: Vec<(usize, anyhow::Result<Vec<format::TensorMeta>>)> = stream::iter(items)
+            .map(|(i, d, fmt)| {
+                let pb = pb.clone();
+                async move {
+                    let r = fetch_model_header(&d, fmt).await.map(|(t, _)| t).with_context(
+                        || format!("reading {fmt:?} header for moe-summary file {i}"),
+                    );
+                    if let Some(pb) = pb.as_ref() {
+                        pb.inc(1);
+                    }
+                    (i, r)
+                }
+            })
+            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        out.sort_by_key(|(i, _)| *i);
+        out.into_iter()
+            .map(|(i, r)| r.map(|t| (i, t)))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+    if let Some(pb) = pb.as_ref() {
+        pb.finish_and_clear();
+    }
+
+    // GGUF fused-expert rejection — same constraint as moe-diff.
+    for (shard_idx, tensors) in &headers {
+        if matches!(fmts[*shard_idx], SourceFormat::Gguf)
+            && tensors
+                .iter()
+                .any(|t| crate::format::moe::is_fused_gguf_expert(&t.name))
+        {
+            anyhow::bail!(
+                "--moe-summary: GGUF fused expert tensors are not yet supported \
+                 (found `ffn_*_exps.weight` in {}).",
+                file_names
+                    .get(*shard_idx)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>"),
+            );
+        }
+    }
+
+    // === Group per-expert + router tensors ================================
+    use crate::format::moe::{parse_hf_expert, parse_hf_router, ExpertWeight as EW};
+    use std::collections::BTreeMap;
+    type LayerKey = (u32, EW);
+    let mut expert_groups: BTreeMap<LayerKey, BTreeMap<u32, (usize, format::TensorMeta)>> =
+        BTreeMap::new();
+    let mut routers: BTreeMap<u32, (usize, format::TensorMeta)> = BTreeMap::new();
+    for (shard_idx, tensors) in &headers {
+        for t in tensors {
+            if let Some(r) = parse_hf_expert(&t.name) {
+                expert_groups
+                    .entry((r.layer_idx, r.weight))
+                    .or_default()
+                    .insert(r.expert_idx, (*shard_idx, t.clone()));
+            } else if let Some(layer_idx) = parse_hf_router(&t.name) {
+                routers.insert(layer_idx, (*shard_idx, t.clone()));
+            }
+        }
+    }
+
+    if expert_groups.is_empty() {
+        anyhow::bail!(
+            "--moe-summary: no per-expert tensors found in {input} \
+             (expected `model.layers.{{L}}.mlp.experts.{{E}}.{{gate|up|down}}_proj.weight`)"
+        );
+    }
+
+    // === Determine canvas dimensions ======================================
+    let layer_ids: Vec<u32> = {
+        let mut set: std::collections::BTreeSet<u32> = expert_groups
+            .keys()
+            .map(|(l, _)| *l)
+            .collect();
+        // Include router-only layers so the canvas covers them too — but in
+        // practice every MoE layer with a router also has experts, so this
+        // is belt-and-braces.
+        for l in routers.keys() {
+            set.insert(*l);
+        }
+        set.into_iter().collect()
+    };
+    let n_experts: u32 = expert_groups
+        .values()
+        .flat_map(|m| m.keys().copied())
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+    let n_layers = layer_ids.len() as u32;
+    if n_layers == 0 || n_experts == 0 {
+        anyhow::bail!("--moe-summary: derived n_layers=0 or n_experts=0 from {input}");
+    }
+    // layer_idx → row index in the output matrix (layer ids may be sparse).
+    let layer_row: BTreeMap<u32, usize> = layer_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (l, i))
+        .collect();
+
+    // === Compute per-(layer,weight,expert) scalars ========================
+    // For each panel, walk experts sequentially per layer and stream the
+    // whole tensor through `scalar_from_buf` (single pass, dtype-aware).
+    // Experts within one layer are independent → parallelised per panel
+    // via `buffer_unordered`.
+    type ScalarKey = (u32, EW, u32); // (layer, weight, expert)
+    type ScalarJob = (ScalarKey, usize, u64, u64, format::Dtype);
+    let mut jobs: Vec<ScalarJob> = Vec::new();
+    for ((layer_idx, weight), experts) in &expert_groups {
+        for (&expert_idx, (shard, meta)) in experts {
+            let bytes_len = meta.file_end.saturating_sub(meta.file_start);
+            jobs.push((
+                (*layer_idx, *weight, expert_idx),
+                *shard,
+                meta.file_start,
+                bytes_len,
+                meta.dtype,
+            ));
+        }
+    }
+    let pb = setup_progress("moe-summary expert scalars", jobs.len() as u64);
+    let datas_ref = &datas;
+    let pb_for_workers = pb.clone();
+    let expert_results: Vec<(ScalarKey, f32)> = stream::iter(jobs)
+        .map(|(key, shard, start, len, dtype)| {
+            let d = Arc::clone(&datas_ref[shard]);
+            let pb = pb_for_workers.clone();
+            async move {
+                let v = if len == 0 {
+                    0.0
+                } else {
+                    match d.fetch_range(start, len as usize).await {
+                        Ok(bytes) => scalar_from_buf(stat, dtype, &bytes),
+                        Err(e) => {
+                            log::warn!(
+                                "moe-summary: tensor fetch failed for layer {} {} expert {} ({e}); using 0.0",
+                                key.0, key.1.label(), key.2,
+                            );
+                            0.0
+                        }
+                    }
+                };
+                if let Some(pb) = pb.as_ref() {
+                    pb.inc(1);
+                }
+                (key, v)
+            }
+        })
+        .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+    if let Some(pb) = pb.as_ref() {
+        pb.finish_and_clear();
+    }
+
+    // === Per-row router slicing ===========================================
+    // For each layer's `mlp.gate.weight` (shape `[n_experts, hidden_dim]`),
+    // fetch the whole tensor once then slice each row as one expert's gate
+    // vector. Skip layers whose router shape doesn't match the inferred
+    // n_experts (defensive: a mis-shaped router would mis-index the heatmap).
+    let mut router_scalars: BTreeMap<(u32, u32), f32> = BTreeMap::new();
+    if !routers.is_empty() {
+        let pb = setup_progress("moe-summary router scalars", routers.len() as u64);
+        let pb_for_workers = pb.clone();
+        let router_jobs: Vec<(u32, usize, format::TensorMeta)> = routers
+            .iter()
+            .map(|(l, (shard, meta))| (*l, *shard, meta.clone()))
+            .collect();
+        let results: Vec<(u32, Vec<(u32, f32)>)> = stream::iter(router_jobs)
+            .map(|(layer_idx, shard, meta)| {
+                let d = Arc::clone(&datas_ref[shard]);
+                let pb = pb_for_workers.clone();
+                async move {
+                    let mut out: Vec<(u32, f32)> = Vec::new();
+                    if meta.shape.len() != 2 {
+                        log::warn!(
+                            "moe-summary: router at layer {} has rank {} (expected 2); skipping",
+                            layer_idx,
+                            meta.shape.len(),
+                        );
+                    } else if meta.shape[0] as u32 != n_experts {
+                        log::warn!(
+                            "moe-summary: router at layer {} has shape[0]={} but inferred \
+                             n_experts={}; skipping (likely a router for a different \
+                             expert count)",
+                            layer_idx, meta.shape[0], n_experts,
+                        );
+                    } else {
+                        let cols = meta.shape[1];
+                        let elem = meta.dtype.element_size() as u64;
+                        let row_bytes = cols.saturating_mul(elem);
+                        let total = meta.file_end.saturating_sub(meta.file_start);
+                        match d.fetch_range(meta.file_start, total as usize).await {
+                            Ok(bytes) => {
+                                for e in 0..n_experts as u64 {
+                                    let off = (e * row_bytes) as usize;
+                                    let end = off + row_bytes as usize;
+                                    if end > bytes.len() {
+                                        log::warn!(
+                                            "moe-summary: router row {} of layer {} out of \
+                                             bounds (off={} end={} len={}); padding with 0",
+                                            e, layer_idx, off, end, bytes.len(),
+                                        );
+                                        out.push((e as u32, 0.0));
+                                    } else {
+                                        out.push((
+                                            e as u32,
+                                            scalar_from_buf(stat, meta.dtype, &bytes[off..end]),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "moe-summary: router fetch failed for layer {} ({e}); \
+                                     padding with 0",
+                                    layer_idx,
+                                );
+                            }
+                        }
+                    }
+                    if let Some(pb) = pb.as_ref() {
+                        pb.inc(1);
+                    }
+                    (layer_idx, out)
+                }
+            })
+            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        if let Some(pb) = pb.as_ref() {
+            pb.finish_and_clear();
+        }
+        for (layer, rows) in results {
+            for (e, v) in rows {
+                router_scalars.insert((layer, e), v);
+            }
+        }
+    }
+
+    // === Build per-panel U8 heatmaps + emit Sources =======================
+    // One source per panel. Each panel's bytes are (n_layers × n_experts)
+    // U8 row-major, normalised so the panel's max scalar maps to 255 and
+    // 0 maps to 0. Per-panel scaling means a quiet panel doesn't get
+    // crushed by a noisy one — each colormap gradient occupies its own
+    // dynamic range.
+    let panels: Vec<EW> = {
+        let mut v = vec![EW::GateProj, EW::UpProj, EW::DownProj];
+        if !routers.is_empty() {
+            v.push(EW::Router);
+        }
+        v
+    };
+    let mut sources: Vec<Source> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for weight in panels {
+        let panel_size = (n_layers as usize) * (n_experts as usize);
+        let mut scalars: Vec<f32> = vec![0.0; panel_size];
+        if matches!(weight, EW::Router) {
+            for (&(layer, expert), &v) in &router_scalars {
+                if let (Some(&row), col) = (layer_row.get(&layer), expert as usize) {
+                    if col < n_experts as usize {
+                        scalars[row * n_experts as usize + col] = v;
+                    }
+                }
+            }
+        } else {
+            for &((layer, w, expert), v) in &expert_results {
+                if w != weight {
+                    continue;
+                }
+                if let (Some(&row), col) = (layer_row.get(&layer), expert as usize) {
+                    if col < n_experts as usize {
+                        scalars[row * n_experts as usize + col] = v;
+                    }
+                }
+            }
+        }
+        let max = scalars.iter().copied().fold(0.0_f32, f32::max).max(1e-12);
+        let bytes_u8: Vec<u8> = scalars
+            .iter()
+            .map(|&s| ((s / max).clamp(0.0, 1.0) * 255.0) as u8)
+            .collect();
+        let nbytes = bytes_u8.len() as u64;
+        let label = match weight {
+            EW::Router => format!("MoE summary · router ({} layers × {} experts)", n_layers, n_experts),
+            _ => format!(
+                "MoE summary · {} ({} layers × {} experts)",
+                weight.label(), n_layers, n_experts,
+            ),
+        };
+        let synthetic = format::TensorMeta {
+            name: format!("moe-summary::{}", weight.label()),
+            dtype: format::Dtype::U8,
+            shape: vec![n_layers as u64, n_experts as u64],
+            file_start: 0,
+            file_end: nbytes,
+            packed_sidecars: None,
+        };
+        let mut extensions = Extensions::default();
+        extensions.insert(ModelInfo {
+            format: SourceFormat::Safetensors,
+            tensors: vec![synthetic],
+            color_ranges: Vec::new(),
+        });
+        extensions.insert(MoeSummaryPanel {
+            weight,
+            n_layers,
+            n_experts,
+        });
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::Buffered(bytes_u8),
+            byte_size: nbytes,
+            name_override: Some(label),
+            xet_terms: None,
+            extensions,
+        });
+        total_bytes += nbytes;
+    }
+
+    log::info!(
+        "moe-summary: {} layer(s) × {} expert(s), {} panel(s) emitted, {} total byte(s); stat = {:?}",
+        n_layers,
+        n_experts,
+        sources.len(),
+        total_bytes,
+        stat,
+    );
+
+    Ok((sources, total_bytes))
+}
+
+/// Dispatch a [`format::SummaryStat`] over a contiguous tensor byte slice.
+/// Single-pass, dtype-aware. Used by [`prepare_moe_summary_sources`].
+fn scalar_from_buf(stat: format::SummaryStat, dtype: format::Dtype, bytes: &[u8]) -> f32 {
+    match stat {
+        format::SummaryStat::Rms => format::rms_from_buf(dtype, bytes),
+        format::SummaryStat::Frobenius => format::frobenius_from_buf(dtype, bytes),
+        format::SummaryStat::MeanAbs => format::mean_abs_from_buf(dtype, bytes),
+        // 1e-6 is well above bf16 underflow but small enough to catch
+        // "essentially zero" entries. Hardcoded for now — promote to a CLI
+        // knob if a user reports it being wrong for their dtype mix.
+        format::SummaryStat::Sparsity => format::sparsity_from_buf(dtype, bytes, 1e-6),
+    }
 }
 
 /// Build per-tensor diff Sources from two single .safetensors files.

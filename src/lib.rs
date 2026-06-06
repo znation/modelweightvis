@@ -36,9 +36,9 @@ pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{
     ArchSingleImageHook, HfModelCardFinetuneDetect, SourceMetaSidecarHook, TensorDirectoryDiffPrep,
-    TensorMoeDiffPrep, TensorRepoDiffPrep,
+    TensorMoeDiffPrep, TensorMoeSummaryPrep, TensorRepoDiffPrep,
 };
-pub use layout::{ArchLayoutPlugin, MoeDiffLayoutPlugin};
+pub use layout::{ArchLayoutPlugin, MoeDiffLayoutPlugin, MoeSummaryLayoutPlugin};
 pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
 
 use std::sync::Arc;
@@ -66,10 +66,13 @@ pub fn register_all(registry: &mut Registry) {
     // it wins over the JSON / plain-byte fallbacks for matching pairs.
     registry.diffs.push(Arc::new(TensorDiffBuilder));
 
-    // Architectural + MoE-diff layouts. Priority 200 / 100; `select_layout`
-    // sorts by `priority()` descending.
+    // Architectural + MoE-diff + MoE-summary layouts. Priority 200 / 200 / 100;
+    // `select_layout` sorts by `priority()` descending. The two MoE plugins
+    // can't collide — they look for different per-source extension tags
+    // (`MoeCell` vs `MoeSummaryPanel`), set by different CLI dispatches.
     registry.layouts.push(Arc::new(ArchLayoutPlugin));
     registry.layouts.push(Arc::new(MoeDiffLayoutPlugin));
+    registry.layouts.push(Arc::new(MoeSummaryLayoutPlugin));
 
     // Tile loader+renderer pair for the `"arch"` layout id.
     registry.leaf.register_loader(Arc::new(ArchRegionsLoader));
@@ -79,6 +82,7 @@ pub fn register_all(registry: &mut Registry) {
 
     // Option-slot hooks — each one taps a single CLI dispatch.
     registry.moe_diff = Some(Arc::new(TensorMoeDiffPrep));
+    registry.moe_summary = Some(Arc::new(TensorMoeSummaryPrep));
     registry.repo_diff = Some(Arc::new(TensorRepoDiffPrep));
     registry.dir_tensor_diff = Some(Arc::new(TensorDirectoryDiffPrep));
     registry.finetune_detect = Some(Arc::new(HfModelCardFinetuneDetect));

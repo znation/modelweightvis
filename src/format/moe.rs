@@ -20,13 +20,20 @@
 //! live in [`crate::data::prepare_moe_diff_sources`] and
 //! [`crate::layout::arch::ArchLayout::try_build_moe_diff`].
 
-/// Which of the three FFN weights of a single expert.
+/// Which weight matrix of a single expert. `GateProj` / `UpProj` /
+/// `DownProj` are the three per-expert FFN matrices; `Router` is the
+/// layer-level router gate (`model.layers.{L}.mlp.gate.weight`) whose
+/// rows are per-expert gate vectors — included so `--moe-summary` can
+/// surface routing-side specialization alongside the FFN signal.
+/// `Router` is not used by `--moe-diff` (the pairwise expert layout
+/// only consumes the per-expert FFN slots).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(clippy::enum_variant_names)]
 pub enum ExpertWeight {
     GateProj,
     UpProj,
     DownProj,
+    Router,
 }
 
 impl ExpertWeight {
@@ -35,6 +42,7 @@ impl ExpertWeight {
             ExpertWeight::GateProj => "gate_proj",
             ExpertWeight::UpProj => "up_proj",
             ExpertWeight::DownProj => "down_proj",
+            ExpertWeight::Router => "router",
         }
     }
 }
@@ -76,6 +84,26 @@ pub fn parse_hf_expert(name: &str) -> Option<ExpertRef> {
         expert_idx,
         weight,
     })
+}
+
+/// Parse an HF-style router-gate tensor name. Returns the layer index when
+/// `name` matches `model.layers.{L}.mlp.gate.weight` — the per-layer
+/// MoE router whose rows are per-expert gate vectors. Returns `None` for
+/// anything else (including the per-expert `gate_proj.weight`, which
+/// [`parse_hf_expert`] handles).
+///
+/// The router and per-expert tensors don't collide: this fn looks for
+/// `mlp.gate.weight` exactly, while [`parse_hf_expert`] requires
+/// `mlp.experts.{E}.…` (the `experts.` prefix is the discriminator).
+pub fn parse_hf_router(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let (layer_str, rest) = rest.split_once('.')?;
+    let layer_idx: u32 = layer_str.parse().ok()?;
+    if rest == "mlp.gate.weight" {
+        Some(layer_idx)
+    } else {
+        None
+    }
 }
 
 /// Whether `name` is a GGUF fused-expert tensor (`ffn_{gate|up|down}_exps.weight`,
@@ -169,6 +197,35 @@ mod tests {
             parse_hf_expert("model.layers.0.mlp.experts.y.gate_proj.weight"),
             None,
         );
+    }
+
+    #[test]
+    fn parses_router_gate() {
+        assert_eq!(parse_hf_router("model.layers.0.mlp.gate.weight"), Some(0));
+        assert_eq!(parse_hf_router("model.layers.31.mlp.gate.weight"), Some(31));
+    }
+
+    #[test]
+    fn router_rejects_expert_tensors() {
+        // The per-expert `gate_proj.weight` lives under `mlp.experts.{E}.` —
+        // not the same as the layer-level `mlp.gate.weight`. The two
+        // parsers must not overlap.
+        assert_eq!(
+            parse_hf_router("model.layers.0.mlp.experts.0.gate_proj.weight"),
+            None,
+        );
+        // Dense MLPs (non-MoE layers in a mixed-arch model) also use
+        // `mlp.gate_proj.weight` — that's not the router either.
+        assert_eq!(parse_hf_router("model.layers.0.mlp.gate_proj.weight"), None);
+        // Biases / norms / attention.
+        assert_eq!(parse_hf_router("model.layers.0.mlp.gate.bias"), None);
+        assert_eq!(parse_hf_router("model.layers.0.input_layernorm.weight"), None);
+        assert_eq!(parse_hf_router("model.layers.0.self_attn.q_proj.weight"), None);
+    }
+
+    #[test]
+    fn router_rejects_unparseable_indices() {
+        assert_eq!(parse_hf_router("model.layers.x.mlp.gate.weight"), None);
     }
 
     #[test]

@@ -860,22 +860,17 @@ impl<'a> TensorElementReader<'a> {
     }
 }
 
-/// Estimate RMS over a contiguous tensor byte slice. Convenience wrapper
-/// around [`TensorElementReader::rms_estimate`] for call sites that don't
-/// already hold a reader.
-///
-/// `sample_elements` is the *logical* element count, not bytes — for plain
-/// dtypes that's `bytes.len() / element_size`; for quantized it's
-/// `(bytes.len() / block_bytes) * block_elements`.
-pub fn rms_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
-    let mut reader = TensorElementReader::new(dtype, bytes);
-    let n = match dtype.stride() {
-        ElementStride::Fixed(bpe) => bytes.len().checked_div(bpe).unwrap_or(0),
+/// Logical element count addressable from `bytes` at this dtype's stride.
+/// Plain dtypes: `bytes.len() / element_size`. Quantized block dtypes:
+/// `(bytes.len() / block_bytes) * block_elements`. Packed (e.g. Q4_K)
+/// dtypes: slots * (pack_bits / bits).
+fn element_count_for_buf(dtype: Dtype, bytes_len: usize) -> usize {
+    match dtype.stride() {
+        ElementStride::Fixed(bpe) => bytes_len.checked_div(bpe).unwrap_or(0),
         ElementStride::Block {
             block_bytes,
             block_elements,
-        } => bytes
-            .len()
+        } => bytes_len
             .checked_div(block_bytes)
             .map(|nb| nb * block_elements)
             .unwrap_or(0),
@@ -888,15 +883,92 @@ pub fn rms_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
                 0
             } else {
                 let elems_per_slot = (pack_dtype_bytes as usize * 8) / bits as usize;
-                bytes
-                    .len()
+                bytes_len
                     .checked_div(pack_dtype_bytes as usize)
                     .map(|slots| slots * elems_per_slot)
                     .unwrap_or(0)
             }
         }
-    };
+    }
+}
+
+/// Estimate RMS over a contiguous tensor byte slice. Convenience wrapper
+/// around [`TensorElementReader::rms_estimate`] for call sites that don't
+/// already hold a reader.
+///
+/// `sample_elements` is the *logical* element count, not bytes — for plain
+/// dtypes that's `bytes.len() / element_size`; for quantized it's
+/// `(bytes.len() / block_bytes) * block_elements`.
+pub fn rms_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
+    let n = element_count_for_buf(dtype, bytes.len());
+    let mut reader = TensorElementReader::new(dtype, bytes);
     reader.rms_estimate(n)
+}
+
+/// Frobenius norm: `sqrt(sum(x²))` over every element in the buffer.
+/// Single pass, skips non-finite values. Honest about total magnitude
+/// (varies with tensor size, unlike [`rms_from_buf`]). Returns `0.0` for
+/// an empty buffer or one with no finite elements.
+pub fn frobenius_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
+    let n = element_count_for_buf(dtype, bytes.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut reader = TensorElementReader::new(dtype, bytes);
+    let mut sum_sq = 0.0f64;
+    for k in 0..n {
+        let v = reader.element(k);
+        if v.is_finite() {
+            sum_sq += (v as f64) * (v as f64);
+        }
+    }
+    (sum_sq.sqrt()) as f32
+}
+
+/// Mean absolute value: `mean(|x|)` over every element in the buffer.
+/// Single pass, skips non-finite values. Stable across tensor sizes;
+/// dominated by typical-magnitude entries rather than extreme outliers
+/// the way [`frobenius_from_buf`] is. Returns `0.0` for an empty buffer
+/// or one with no finite elements.
+pub fn mean_abs_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
+    let n = element_count_for_buf(dtype, bytes.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut reader = TensorElementReader::new(dtype, bytes);
+    let mut sum_abs = 0.0f64;
+    let mut count = 0u64;
+    for k in 0..n {
+        let v = reader.element(k);
+        if v.is_finite() {
+            sum_abs += (v as f64).abs();
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        (sum_abs / count as f64) as f32
+    }
+}
+
+/// Fraction of entries with `|x| < eps`. Single pass; non-finite values
+/// count as non-sparse (they're not "near zero"). Returns `0.0` for an
+/// empty buffer. Useful for spotting dead / near-dead experts.
+pub fn sparsity_from_buf(dtype: Dtype, bytes: &[u8], eps: f32) -> f32 {
+    let n = element_count_for_buf(dtype, bytes.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut reader = TensorElementReader::new(dtype, bytes);
+    let mut near_zero = 0u64;
+    for k in 0..n {
+        let v = reader.element(k);
+        if v.is_finite() && v.abs() < eps {
+            near_zero += 1;
+        }
+    }
+    (near_zero as f64 / n as f64) as f32
 }
 
 /// Convenience: given a GGUF `TensorInfo`, the in-file byte range
@@ -1014,6 +1086,105 @@ mod tests {
     fn rms_from_buf_empty_is_zero() {
         let r = rms_from_buf(Dtype::F32, &[]);
         assert_eq!(r, 0.0);
+    }
+
+    #[test]
+    fn frobenius_from_buf_matches_naive() {
+        let b = f32_bytes(&[3.0, 4.0]);
+        let r = frobenius_from_buf(Dtype::F32, &b);
+        assert!((r - 5.0).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn frobenius_from_buf_skips_non_finite() {
+        let b = f32_bytes(&[3.0, f32::NAN, 4.0, f32::INFINITY]);
+        let r = frobenius_from_buf(Dtype::F32, &b);
+        assert!((r - 5.0).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn frobenius_from_buf_empty_is_zero() {
+        assert_eq!(frobenius_from_buf(Dtype::F32, &[]), 0.0);
+    }
+
+    #[test]
+    fn mean_abs_from_buf_basic() {
+        let b = f32_bytes(&[1.0, -3.0, 2.0, -2.0]);
+        let r = mean_abs_from_buf(Dtype::F32, &b);
+        // mean(|1|, |-3|, |2|, |-2|) = 8/4 = 2.0
+        assert!((r - 2.0).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn mean_abs_from_buf_skips_non_finite() {
+        // Non-finite values are excluded from both numerator and count, so
+        // the mean is over the remaining 3 finite entries.
+        let b = f32_bytes(&[1.0, f32::NAN, -3.0, 2.0, f32::INFINITY]);
+        let r = mean_abs_from_buf(Dtype::F32, &b);
+        assert!((r - 2.0).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn mean_abs_from_buf_empty_is_zero() {
+        assert_eq!(mean_abs_from_buf(Dtype::F32, &[]), 0.0);
+    }
+
+    #[test]
+    fn sparsity_from_buf_counts_near_zero() {
+        // 3 of 5 entries have |x| < 1e-6.
+        let b = f32_bytes(&[0.0, 1.0, 1e-9, -1e-12, 2.0]);
+        let r = sparsity_from_buf(Dtype::F32, &b, 1e-6);
+        assert!((r - 0.6).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn sparsity_from_buf_non_finite_not_sparse() {
+        // NaN/Inf are not "near zero" — they don't contribute to the
+        // sparsity count. Denominator stays the full element count
+        // (sparsity is a fraction of all entries, not just finite ones —
+        // otherwise a tensor of all-NaN would report 100% sparse, which is
+        // misleading).
+        let b = f32_bytes(&[0.0, f32::NAN, f32::INFINITY, 1.0]);
+        let r = sparsity_from_buf(Dtype::F32, &b, 1e-6);
+        // 1 near-zero out of 4 entries.
+        assert!((r - 0.25).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn sparsity_from_buf_empty_is_zero() {
+        assert_eq!(sparsity_from_buf(Dtype::F32, &[], 1e-6), 0.0);
+    }
+
+    fn f16_bytes(vs: &[f32]) -> Vec<u8> {
+        use half::f16;
+        vs.iter()
+            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+            .collect()
+    }
+
+    fn bf16_bytes(vs: &[f32]) -> Vec<u8> {
+        use half::bf16;
+        vs.iter()
+            .flat_map(|&v| bf16::from_f32(v).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn scalar_helpers_handle_f16_bf16() {
+        // Same expected values as the F32 cases — half-precision rounds but
+        // the assertion thresholds are loose enough to absorb it.
+        for (name, bytes_fn) in [
+            ("f16", f16_bytes as fn(&[f32]) -> Vec<u8>),
+            ("bf16", bf16_bytes as fn(&[f32]) -> Vec<u8>),
+        ] {
+            let dt = if name == "f16" { Dtype::F16 } else { Dtype::BF16 };
+            let r_rms = rms_from_buf(dt, &bytes_fn(&[1.0, -1.0, 1.0, -1.0]));
+            assert!((r_rms - 1.0).abs() < 1e-2, "{name} rms: {r_rms}");
+            let r_fro = frobenius_from_buf(dt, &bytes_fn(&[3.0, 4.0]));
+            assert!((r_fro - 5.0).abs() < 1e-2, "{name} frobenius: {r_fro}");
+            let r_ma = mean_abs_from_buf(dt, &bytes_fn(&[1.0, -3.0, 2.0, -2.0]));
+            assert!((r_ma - 2.0).abs() < 1e-2, "{name} mean_abs: {r_ma}");
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use arbvis::{DiffMetric, LayoutMode, ModelOpts};
+use arbvis::{DiffMetric, LayoutMode, ModelOpts, SummaryStat};
 use clap::{Parser, ValueEnum};
 
 /// CLI mirror of [`arbvis::DiffMetric`]. Kept separate from the core type so
@@ -43,6 +43,33 @@ impl From<DiffMetricArg> for DiffMetric {
             DiffMetricArg::Rms => DiffMetric::Rms,
             DiffMetricArg::AbsLog => DiffMetric::AbsLog,
             DiffMetricArg::Exact => DiffMetric::Exact,
+        }
+    }
+}
+
+/// CLI mirror of [`arbvis::SummaryStat`]. Kept separate from the core type
+/// for the same reason as [`DiffMetricArg`] — the clap derive's
+/// variant-doc strings shouldn't leak into the library API.
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum SummaryStatArg {
+    /// √(mean(x²)). Default — comparable across tensors of different scale.
+    #[default]
+    Rms,
+    /// √(sum(x²)). Honest about total magnitude; varies with tensor size.
+    Frobenius,
+    /// mean(|x|). Stable, dominated by typical-magnitude entries.
+    MeanAbs,
+    /// Fraction of |x| < 1e-6. Surfaces dead / near-dead experts.
+    Sparsity,
+}
+
+impl From<SummaryStatArg> for SummaryStat {
+    fn from(a: SummaryStatArg) -> Self {
+        match a {
+            SummaryStatArg::Rms => SummaryStat::Rms,
+            SummaryStatArg::Frobenius => SummaryStat::Frobenius,
+            SummaryStatArg::MeanAbs => SummaryStat::MeanAbs,
+            SummaryStatArg::Sparsity => SummaryStat::Sparsity,
         }
     }
 }
@@ -90,12 +117,30 @@ pub struct Args {
     /// rendered (the raw diff is antisymmetric). Currently supports HF-style
     /// per-expert safetensors (Mixtral / Qwen3-MoE / OLMoE / DeepSeek routed
     /// experts); GGUF fused-expert tensors are not yet supported.
+    ///
+    /// Note: element-wise expert diff produces near-Gaussian noise on real
+    /// models because expert positions have no functional correspondence.
+    /// Prefer `--moe-summary` for a per-expert scalar heatmap that actually
+    /// reveals signal (outliers, dead experts, layer-wise trends).
     #[arg(
         long,
         value_name = "MODEL",
-        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs"]
+        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_summary"]
     )]
     pub moe_diff: Option<PathBuf>,
+
+    /// Visualize per-expert scalar heatmaps for each MoE layer of a single
+    /// model. MODEL is a local path or hf:// URL. Each panel is one weight
+    /// (gate_proj / up_proj / down_proj / router) rendered as a layers × experts
+    /// heatmap, with one colored cell per expert. The scalar is chosen by
+    /// `--summary-stat`. Reveals signal that `--moe-diff` can't: outlier
+    /// experts, layer-wise magnitude trends, dead experts.
+    #[arg(
+        long,
+        value_name = "MODEL",
+        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_diff"]
+    )]
+    pub moe_summary: Option<PathBuf>,
 
     /// Force-treat the second --diff argument as a finetune of the first.
     /// In finetune mode, tensors present only on the base side are rendered
@@ -118,6 +163,14 @@ pub struct Args {
     /// (applies to `--diff` and `--moe-diff`).
     #[arg(long, value_enum, default_value_t = DiffMetricArg::Rms)]
     pub diff_metric: DiffMetricArg,
+
+    /// Which per-expert scalar `--moe-summary` computes from each FFN
+    /// weight. `rms` (default) is comparable across tensors of different
+    /// scale; `frobenius` is honest about total magnitude; `mean-abs` is
+    /// stable and dominated by typical entries; `sparsity` surfaces dead
+    /// experts.
+    #[arg(long, value_enum, default_value_t = SummaryStatArg::Rms)]
+    pub summary_stat: SummaryStatArg,
 
     /// Layout strategy for arranging tensors on the canvas.
     ///
@@ -143,9 +196,11 @@ impl Args {
     pub fn split(self) -> (arbvis::Args, ModelOpts) {
         let opts = ModelOpts {
             moe_diff: self.moe_diff,
+            moe_summary: self.moe_summary,
             finetune: self.finetune,
             no_finetune: self.no_finetune,
             diff_metric: self.diff_metric.into(),
+            summary_stat: self.summary_stat.into(),
             layout_mode: self.layout.into(),
         };
         (self.arbvis, opts)

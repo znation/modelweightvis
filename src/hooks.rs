@@ -12,14 +12,14 @@ use std::path::{Path, PathBuf};
 
 use arbvis::hf_url::RemoteFileSpec;
 use arbvis::{
-    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeDiffPrep,
-    PrepareSourcesExtension, RepoDiffPrep, SingleImageArchHook, Source,
+    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeDiffPrep, MoeSummaryPrep,
+    PrepareSourcesExtension, RepoDiffPrep, SingleImageArchHook, Source, SummaryStat,
 };
 use async_trait::async_trait;
 
 use crate::data::{
     build_multi_safetensors_diff_sources, load_meta_for_sources, prepare_diff_sources_from_http,
-    prepare_moe_diff_sources,
+    prepare_moe_diff_sources, prepare_moe_summary_sources,
 };
 use crate::format::SourceFormat;
 
@@ -38,6 +38,24 @@ impl MoeDiffPrep for TensorMoeDiffPrep {
         stream: bool,
     ) -> anyhow::Result<(Vec<Source>, u64)> {
         prepare_moe_diff_sources(input, metric, stream).await
+    }
+}
+
+/// `--moe-summary <model>` source preparer. Delegates to
+/// [`prepare_moe_summary_sources`], which builds one in-memory U8 heatmap
+/// per per-weight panel (gate / up / down / router) plus `MoeSummaryPanel`
+/// extension tags that [`crate::MoeSummaryLayoutPlugin`] reads back.
+pub struct TensorMoeSummaryPrep;
+
+#[async_trait(?Send)]
+impl MoeSummaryPrep for TensorMoeSummaryPrep {
+    async fn prepare(
+        &self,
+        input: &str,
+        stat: SummaryStat,
+        stream: bool,
+    ) -> anyhow::Result<(Vec<Source>, u64)> {
+        prepare_moe_summary_sources(input, stat, stream).await
     }
 }
 

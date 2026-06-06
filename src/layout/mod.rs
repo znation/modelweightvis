@@ -12,7 +12,7 @@ use std::any::Any;
 
 use arbvis::{CanvasGeom, LayoutBuildCtx, LayoutMode, LayoutPlugin, LayoutShape};
 
-use crate::data::{MoeCell, SourceMeta};
+use crate::data::{MoeCell, MoeSummaryPanel, SourceMeta};
 use crate::format::{Dtype, ModelInfo};
 pub use arch::ArchLayout;
 
@@ -259,6 +259,35 @@ impl LayoutPlugin for MoeDiffLayoutPlugin {
     }
     fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
         ArchLayout::try_build_moe_diff(ctx.sources, ctx.cumulative_offsets)
+            .map(|l| Box::new(l) as Box<dyn LayoutShape>)
+    }
+}
+
+/// MoE-summary plugin — applies when any source carries a `MoeSummaryPanel`
+/// tag (set by [`crate::data::prepare_moe_summary_sources`]).
+///
+/// Can't collide with [`MoeDiffLayoutPlugin`]: the two are mutually
+/// exclusive at the CLI layer (`--moe-diff` vs `--moe-summary`) and use
+/// different per-source extension tags.
+pub struct MoeSummaryLayoutPlugin;
+
+impl LayoutPlugin for MoeSummaryLayoutPlugin {
+    fn id(&self) -> &'static str {
+        "moe-summary"
+    }
+    fn priority(&self) -> i32 {
+        200
+    }
+    fn applicable(&self, ctx: &LayoutBuildCtx<'_>) -> bool {
+        if matches!(ctx.mode, LayoutMode::Hilbert) {
+            return false;
+        }
+        ctx.sources
+            .iter()
+            .any(|s| s.extensions.get::<MoeSummaryPanel>().is_some())
+    }
+    fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
+        ArchLayout::try_build_moe_summary(ctx.sources, ctx.cumulative_offsets)
             .map(|l| Box::new(l) as Box<dyn LayoutShape>)
     }
 }
