@@ -31,7 +31,7 @@ mod layout;
 mod single_arch;
 mod tiled;
 
-pub use args::{Args, DiffMetricArg, LayoutArg};
+pub use args::{DiffMetricArg, LayoutArg, ModelArgs};
 pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{

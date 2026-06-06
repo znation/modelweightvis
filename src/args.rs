@@ -102,11 +102,16 @@ impl From<LayoutArg> for LayoutMode {
 /// Tensor-aware visualization built on `arbvis`.
 ///
 /// Flattens [`arbvis::Args`] (the byte-only CLI surface) and adds four
-/// tensor-aware flags. Use [`Args::split`] to peel out the inner
+/// tensor-aware flags. Use [`ModelArgs::split`] to peel out the inner
 /// `arbvis::Args` + `arbvis::ModelOpts` for the call into `arbvis::run`.
+///
+/// Named `ModelArgs` rather than `Args` because clap's `#[command(flatten)]`
+/// creates an implicit `ArgGroup` keyed on the inner struct's type name.
+/// Two structs both named `Args` on the same `Command` collide on that
+/// group name and trip a debug-build assertion in clap.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-pub struct Args {
+pub struct ModelArgs {
     #[command(flatten)]
     pub arbvis: arbvis::Args,
 
@@ -190,7 +195,7 @@ pub struct Args {
     pub layout: LayoutArg,
 }
 
-impl Args {
+impl ModelArgs {
     /// Peel the flattened struct into the two halves `arbvis::run` takes:
     /// the byte-only `arbvis::Args` and the tensor-aware `ModelOpts`.
     pub fn split(self) -> (arbvis::Args, ModelOpts) {

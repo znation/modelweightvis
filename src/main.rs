@@ -1,7 +1,7 @@
 //! Thin binary entrypoint for `modelweightvis`.
 //!
 //! Diverges from the byte-only `arbvis` binary on two axes:
-//! - Uses `modelweightvis::Args` (clap-flatten of `arbvis::Args` + the
+//! - Uses `modelweightvis::ModelArgs` (clap-flatten of `arbvis::Args` + the
 //!   four tensor-aware flags `--moe-diff`, `--finetune` / `--no-finetune`,
 //!   `--diff-metric`, `--layout`) instead of `arbvis::Args` directly.
 //! - Registers tensor-aware plugins (format parsers, arch + MoE-diff
@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
     // Bind to a named local so the run-flag stays alive for the process
     // lifetime (drop stops the monitor). See `perf_monitor::spawn_if_enabled`.
     let _perf_monitor_stop = arbvis::perf_monitor_spawn_if_enabled();
-    let (args, opts) = modelweightvis::Args::parse().split();
+    let (args, opts) = modelweightvis::ModelArgs::parse().split();
     let mut registry = arbvis::Registry::with_defaults();
     modelweightvis::register_all(&mut registry);
     rt.block_on(arbvis::run(args, opts, registry))
