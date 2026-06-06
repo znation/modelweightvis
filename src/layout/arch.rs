@@ -147,6 +147,10 @@ pub struct LayerBounds {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct ArchLayout {
+    /// Padded canvas width in pixels at `max_zoom`. Tile grid is
+    /// `width_tiles × height_tiles` (both powers of two; required for the
+    /// pyramid accumulator to drain). May be larger than the actual placed-
+    /// tensor extent — see [`content_w`].
     pub width: u32,
     pub height: u32,
     pub width_tiles: u32,
@@ -167,6 +171,15 @@ pub struct ArchLayout {
     /// Tensor placements sorted by canvas_y then canvas_x — for fast
     /// `regions_in_tile` overlap queries via binary search.
     sorted_idx: Vec<usize>,
+    /// Actual on-canvas content extent in pixels (max `tensor.canvas_x +
+    /// tensor.disp_w`). Used by [`crate::layout::canvas_geom`] as the
+    /// leaflet world bounds so `map.fitBounds(...)` zooms onto the matrix
+    /// instead of the next-pow2-padded canvas. Differs from [`width`] only
+    /// when next-pow2 padding adds significant empty area — most prominent
+    /// for the MoE-diff layout, where a 5272×37792-pixel matrix gets padded
+    /// to an 8192×65536-pixel tile grid.
+    pub content_w: u32,
+    pub content_h: u32,
 }
 
 impl ArchLayout {
@@ -444,6 +457,11 @@ impl ArchLayout {
         // Round canvas dimensions UP to tile-size multiples so the tile grid
         // covers all of the content rectangle…
         let raw_h = cursor_y.saturating_sub(PAD);
+        // Snapshot the unpadded content extent before tile/pow2 alignment —
+        // surfaced via `content_w`/`content_h` so the viewer fits the matrix
+        // instead of the padded tile grid.
+        let content_w = canvas_w.max(1);
+        let content_h = raw_h.max(1);
         let raw_canvas_h = align_up(raw_h.max(1), TILE);
         let raw_canvas_w = align_up(canvas_w, TILE);
         let raw_width_tiles = (raw_canvas_w / TILE).max(1);
@@ -486,6 +504,8 @@ impl ArchLayout {
         Some(Self {
             width: canvas_w,
             height: canvas_h,
+            content_w,
+            content_h,
             width_tiles,
             height_tiles,
             total_tiles: width_tiles as u64 * height_tiles as u64,
@@ -586,23 +606,29 @@ impl ArchLayout {
         out
     }
 
-    /// Build an architectural canvas of per-MoE-layer N×N expert-vs-expert
-    /// matrices. Triggered by [`crate::layout::select_layout`] when any
+    /// Build an architectural canvas with a single top-level N×N expert-pair
+    /// matrix. Each cell (i, j) shows expert i vs expert j *across the whole
+    /// model* — every transformer layer's three FFN weights stacked inside
+    /// the cell. Triggered by [`crate::layout::select_layout`] when any
     /// source carries a `MoeCell` tag (set by
     /// [`crate::data::prepare_moe_diff_sources`]).
     ///
-    /// Inside each cell the three weights `{gate_proj, up_proj, down_proj}`
-    /// sit side-by-side at a uniform per-weight footprint sized so the
-    /// longest tensor axis lands near [`MOE_SUB_AXIS_TARGET`]. Lower-triangle
-    /// cells (`j < i`) are skipped — the raw diff is antisymmetric, so
-    /// they'd just mirror the upper triangle.
+    /// Cell layout: K rows (one per MoE layer, ascending) × 3 columns
+    /// `{gate_proj, up_proj, down_proj}`. Each per-weight sub-tile has a
+    /// uniform footprint sized so the longest tensor axis lands near
+    /// [`MOE_SUB_AXIS_TARGET`]. Lower-triangle cells (`j < i`) are skipped —
+    /// the raw diff is antisymmetric, so they'd just mirror the upper
+    /// triangle. Diagonal cells (`i == j`) stay; they read identical bytes
+    /// for both sides so every metric reduces to zero, producing a solid
+    /// colour that's cheap to render and acts as a structural anchor.
     ///
     /// Returns `None` if no source carries an MoE tag (let the caller fall
     /// through to [`ArchLayout::try_build`] or hilbert).
     pub fn try_build_moe_diff(sources: &[Source], cumulative_offsets: &[u64]) -> Option<Self> {
         use crate::format::moe::ExpertWeight;
 
-        // (layer, i, j, weight) → (source_idx, &TensorMeta, base_off)
+        // (i, j, layer, weight) → (source_idx, &TensorMeta, base_off).
+        // Keyed expert-pair-first so iteration order traces the new layout.
         let mut cells: BTreeMap<(u32, u32, u32, ExpertWeight), (usize, &TensorMeta, u64)> =
             BTreeMap::new();
         for (sidx, s) in sources.iter().enumerate() {
@@ -616,98 +642,68 @@ impl ArchLayout {
                 continue;
             };
             let off = cumulative_offsets.get(sidx).copied().unwrap_or(0);
-            cells.insert((cell.layer, cell.i, cell.j, cell.weight), (sidx, t, off));
+            cells.insert((cell.i, cell.j, cell.layer, cell.weight), (sidx, t, off));
         }
         if cells.is_empty() {
             return None;
         }
 
-        // Distinct layer indices, ascending.
+        // Distinct layer indices (ascending) and expert count, derived from
+        // the parsed MoeCell tags. Every layer carries the same 0..N expert
+        // range in the formats we target (Mixtral / Qwen / OLMoE / DeepSeek),
+        // so N taken across all cells is consistent per layer.
         let layer_ids: Vec<u32> = {
-            let set: std::collections::BTreeSet<u32> = cells.keys().map(|(l, ..)| *l).collect();
+            let set: std::collections::BTreeSet<u32> = cells.keys().map(|(_, _, l, _)| *l).collect();
             set.into_iter().collect()
         };
-
-        // Per-layer: determine N (max expert idx + 1) and a uniform per-weight
-        // sub-cell footprint, large enough to hold any of the three weights.
-        struct LayerGeom {
-            n_experts: u32,
-            sub_w: u32, // per-weight footprint width
-            sub_h: u32, // per-weight footprint height
-            scale: f32, // uniform scale applied to every per-weight tensor
-            cell_w: u32,
-            cell_h: u32,
+        let n_experts: u32 = cells
+            .keys()
+            .map(|(i, j, _, _)| (*i).max(*j) + 1)
+            .max()
+            .unwrap_or(0);
+        if n_experts == 0 || layer_ids.is_empty() {
+            return None;
         }
-        let geoms: BTreeMap<u32, LayerGeom> = layer_ids
-            .iter()
-            .map(|&l| {
-                let mut max_axis: u64 = 1;
-                let mut max_rows: u64 = 1;
-                let mut max_cols: u64 = 1;
-                let mut n_experts: u32 = 0;
-                for ((cl, i, j, _w), (_, t, _)) in cells.range(
-                    (l, 0u32, 0u32, ExpertWeight::GateProj)
-                        ..(l + 1, 0u32, 0u32, ExpertWeight::GateProj),
-                ) {
-                    debug_assert_eq!(*cl, l);
-                    let (rows, cols) = t.element_shape();
-                    max_rows = max_rows.max(rows);
-                    max_cols = max_cols.max(cols);
-                    max_axis = max_axis.max(rows.max(cols));
-                    n_experts = n_experts.max(*i + 1).max(*j + 1);
-                }
-                // Per-weight scale: shrink so the long axis lands at
-                // MOE_SUB_AXIS_TARGET. Never up-scale (sub_axis_target is
-                // smaller than every realistic expert dim).
-                let scale = (MOE_SUB_AXIS_TARGET as f32 / max_axis as f32).min(1.0);
-                let (sub_w, sub_h) = disp_dims(max_rows, max_cols, scale);
-                let sub_w = align_up(sub_w, 4);
-                let sub_h = align_up(sub_h, 4);
-                let cell_w = 3 * sub_w + 2 * MOE_INNER_PAD;
-                let cell_h = sub_h;
-                (
-                    l,
-                    LayerGeom {
-                        n_experts,
-                        sub_w,
-                        sub_h,
-                        scale,
-                        cell_w,
-                        cell_h,
-                    },
-                )
-            })
-            .collect();
+        let n_layers = layer_ids.len() as u32;
 
-        // Canvas-wide tensors and layer bounds. One matrix per layer, stacked
-        // vertically with MOE_LAYER_GAP between.
+        // Single shared cell geometry: every expert-pair cell has the same
+        // size. Compute one uniform scale from the global max element shape,
+        // so per-weight sub-tiles align column-for-column across every layer
+        // row inside a cell, and across every cell on the canvas.
+        let mut max_rows: u64 = 1;
+        let mut max_cols: u64 = 1;
+        let mut max_axis: u64 = 1;
+        for (_, t, _) in cells.values() {
+            let (rows, cols) = t.element_shape();
+            max_rows = max_rows.max(rows);
+            max_cols = max_cols.max(cols);
+            max_axis = max_axis.max(rows.max(cols));
+        }
+        let scale = (MOE_SUB_AXIS_TARGET as f32 / max_axis as f32).min(1.0);
+        let (raw_sub_w, raw_sub_h) = disp_dims(max_rows, max_cols, scale);
+        let sub_w = align_up(raw_sub_w, 4);
+        let sub_h = align_up(raw_sub_h, 4);
+        let cell_w = 3u32.saturating_mul(sub_w).saturating_add(2 * MOE_INNER_PAD);
+        let cell_h = n_layers
+            .saturating_mul(sub_h)
+            .saturating_add(n_layers.saturating_sub(1).saturating_mul(MOE_LAYER_GAP_INNER));
+
+        // One top-level N×N upper-triangle matrix.
         let mut tensors: Vec<PlacedTensor> = Vec::new();
-        let mut layer_bounds: Vec<LayerBounds> = Vec::new();
-        let mut cursor_y: u32 = 0;
-        let mut canvas_w: u32 = 1;
+        let matrix_w = n_experts
+            .saturating_mul(cell_w)
+            .saturating_add(n_experts.saturating_sub(1).saturating_mul(MOE_CELL_PAD));
+        let matrix_h = n_experts
+            .saturating_mul(cell_h)
+            .saturating_add(n_experts.saturating_sub(1).saturating_mul(MOE_CELL_PAD));
 
-        for &l in &layer_ids {
-            let g = &geoms[&l];
-            let n = g.n_experts;
-            if n == 0 {
-                continue;
-            }
-            let matrix_w = n
-                .saturating_mul(g.cell_w)
-                .saturating_add(n.saturating_sub(1).saturating_mul(MOE_CELL_PAD));
-            let matrix_h = n
-                .saturating_mul(g.cell_h)
-                .saturating_add(n.saturating_sub(1).saturating_mul(MOE_CELL_PAD));
-            canvas_w = canvas_w.max(matrix_w);
-            let matrix_x = 0u32;
-            let matrix_y = cursor_y;
-
-            for i in 0..n {
-                for j in i..n {
-                    let cell_x = matrix_x
-                        .saturating_add(j.saturating_mul(g.cell_w.saturating_add(MOE_CELL_PAD)));
-                    let cell_y = matrix_y
-                        .saturating_add(i.saturating_mul(g.cell_h.saturating_add(MOE_CELL_PAD)));
+        for i in 0..n_experts {
+            for j in i..n_experts {
+                let cell_x = j.saturating_mul(cell_w.saturating_add(MOE_CELL_PAD));
+                let cell_y = i.saturating_mul(cell_h.saturating_add(MOE_CELL_PAD));
+                for (row_idx, &layer) in layer_ids.iter().enumerate() {
+                    let row_y = cell_y
+                        .saturating_add((row_idx as u32) * (sub_h + MOE_LAYER_GAP_INNER));
                     for (w_idx, weight) in [
                         ExpertWeight::GateProj,
                         ExpertWeight::UpProj,
@@ -716,18 +712,14 @@ impl ArchLayout {
                     .iter()
                     .enumerate()
                     {
-                        let Some((sidx, t, base_off)) = cells.get(&(l, i, j, *weight)) else {
+                        let Some((sidx, t, base_off)) = cells.get(&(i, j, layer, *weight)) else {
                             continue;
                         };
                         let (rows, cols) = t.element_shape();
-                        let (dw, dh) = disp_dims(rows, cols, g.scale);
-                        // Centre each tensor inside its sub_w × sub_h sub-cell
-                        // (shapes may differ slightly between gate/up vs down).
-                        let sub_x =
-                            cell_x.saturating_add((w_idx as u32) * (g.sub_w + MOE_INNER_PAD));
-                        let sub_y = cell_y;
-                        let inset_x = g.sub_w.saturating_sub(dw) / 2;
-                        let inset_y = g.sub_h.saturating_sub(dh) / 2;
+                        let (dw, dh) = disp_dims(rows, cols, scale);
+                        let sub_x = cell_x.saturating_add((w_idx as u32) * (sub_w + MOE_INNER_PAD));
+                        let inset_x = sub_w.saturating_sub(dw) / 2;
+                        let inset_y = sub_h.saturating_sub(dh) / 2;
                         tensors.push(PlacedTensor {
                             source_idx: *sidx,
                             tensor_id: 0,
@@ -738,26 +730,15 @@ impl ArchLayout {
                             tensor_cols: cols,
                             disp_w: dw,
                             disp_h: dh,
-                            scale: g.scale,
+                            scale,
                             canvas_x: sub_x.saturating_add(inset_x),
-                            canvas_y: sub_y.saturating_add(inset_y),
+                            canvas_y: row_y.saturating_add(inset_y),
                             hue: name_hue(weight.label()),
-                            layer_idx: Some(l),
+                            layer_idx: Some(layer),
                         });
                     }
                 }
             }
-
-            layer_bounds.push(LayerBounds {
-                layer_idx: l,
-                canvas_x: matrix_x,
-                canvas_y: matrix_y,
-                width: matrix_w,
-                height: matrix_h,
-            });
-            cursor_y = matrix_y
-                .saturating_add(matrix_h)
-                .saturating_add(MOE_LAYER_GAP);
         }
 
         if tensors.is_empty() {
@@ -769,9 +750,10 @@ impl ArchLayout {
             t.tensor_id = i;
         }
 
-        let raw_h = cursor_y.saturating_sub(MOE_LAYER_GAP).max(1);
-        let raw_canvas_h = align_up(raw_h, TILE);
-        let raw_canvas_w = align_up(canvas_w, TILE);
+        let canvas_w_raw = matrix_w.max(1);
+        let canvas_h_raw = matrix_h.max(1);
+        let raw_canvas_w = align_up(canvas_w_raw, TILE);
+        let raw_canvas_h = align_up(canvas_h_raw, TILE);
         let raw_width_tiles = (raw_canvas_w / TILE).max(1);
         let raw_height_tiles = (raw_canvas_h / TILE).max(1);
         let width_tiles = next_pow2(raw_width_tiles);
@@ -780,11 +762,27 @@ impl ArchLayout {
         let canvas_h = height_tiles * TILE;
         let max_zoom = (width_tiles.min(height_tiles).max(1) as f64).log2().round() as u32;
 
-        let detail_depth = tensors
+        let observed_detail_depth = tensors
             .iter()
             .map(|t| detail_depth_for_scale(t.scale))
             .max()
             .unwrap_or(0);
+        // Belt-and-braces cap: `prepare_moe_diff_sources` already downsamples
+        // every per-cell source to a fixed `SIDE × SIDE` view, which lands at
+        // `scale = 1.0` and so `observed_detail_depth = 0` in the runtime path.
+        // The clamp stays so tests that bypass the prep step (passing un-
+        // downsampled synthetic sources straight to `try_build_moe_diff`)
+        // still get the cap applied. Clippy flags the `.min()` because the
+        // constant is 0 — allow.
+        #[allow(clippy::unnecessary_min_or_max)]
+        let detail_depth = observed_detail_depth.min(MOE_MAX_DETAIL_DEPTH);
+        if observed_detail_depth > detail_depth {
+            log::info!(
+                "moe-diff layout: capping detail pyramid at {detail_depth} levels (would have requested {observed_detail_depth}); \
+                 element-level zoom is unreachable but the {n} source tensor(s) would otherwise blow up the tile count",
+                n = tensors.len(),
+            );
+        }
 
         let mut sorted_idx: Vec<usize> = (0..tensors.len()).collect();
         sorted_idx.sort_by_key(|&i| {
@@ -792,20 +790,40 @@ impl ArchLayout {
             (t.canvas_y, t.canvas_x)
         });
 
+        log::info!(
+            "moe-diff layout: {} expert(s) × {} expert(s) upper-triangle, {} layer(s) × 3 weight(s) per cell; \
+             canvas {}×{} ({} × {} tiles, max_zoom={}, detail_depth={})",
+            n_experts,
+            n_experts,
+            n_layers,
+            canvas_w,
+            canvas_h,
+            width_tiles,
+            height_tiles,
+            max_zoom,
+            detail_depth,
+        );
+
         Some(Self {
             width: canvas_w,
             height: canvas_h,
+            // The matrix only occupies the upper-left `matrix_w × matrix_h`
+            // of the padded canvas. Reporting the unpadded extent as content
+            // bounds gets `map.fitBounds` to zoom onto the matrix at first
+            // load instead of the much-larger padded tile grid.
+            content_w: matrix_w.max(1),
+            content_h: matrix_h.max(1),
             width_tiles,
             height_tiles,
             total_tiles: width_tiles as u64 * height_tiles as u64,
             max_zoom,
             detail_depth,
             tensors,
-            layer_bounds,
+            layer_bounds: Vec::new(),
             architecture: format!(
-                "MoE expert diff ({} layer(s), {} expert(s)/layer)",
-                layer_ids.len(),
-                geoms.values().map(|g| g.n_experts).max().unwrap_or(0),
+                "MoE expert-pair diff ({n}×{n} matrix, {k} layer(s) × 3 weight(s) per cell)",
+                n = n_experts,
+                k = n_layers,
             ),
             sorted_idx,
         })
@@ -813,18 +831,39 @@ impl ArchLayout {
 }
 
 /// Target longest-axis size, in overview pixels, for a single per-weight
-/// tensor inside an MoE-diff cell. Picked so a 64-expert × 64-expert matrix
-/// of 3-weight cells lands in a comfortable few-thousand-pixel canvas at the
-/// overview zoom; the variable-depth pyramid recovers element-level detail
+/// tensor inside an MoE-diff cell. The layout stacks every layer × 3 weights
+/// inside one expert-pair cell, so this is one row-slice of a tall column —
+/// kept small so a 60-expert × 60-expert matrix (Qwen1.5-MoE) doesn't blow up
+/// the tile count. The variable-depth pyramid recovers element-level detail
 /// on zoom-in.
-const MOE_SUB_AXIS_TARGET: u32 = 64;
-/// Gutter between the three per-weight sub-cells (gate/up/down) inside one
-/// matrix cell.
+const MOE_SUB_AXIS_TARGET: u32 = 24;
+/// Gutter between the three per-weight sub-cells (gate/up/down) on a single
+/// per-layer row inside one expert-pair cell.
 const MOE_INNER_PAD: u32 = 4;
-/// Gutter between adjacent matrix cells.
+/// Gutter between adjacent expert-pair cells in the top-level matrix.
 const MOE_CELL_PAD: u32 = 8;
-/// Gap between stacked per-layer matrices.
-const MOE_LAYER_GAP: u32 = 32;
+/// Vertical gutter between stacked per-layer rows inside one expert-pair cell.
+const MOE_LAYER_GAP_INNER: u32 = 2;
+/// Hard cap on the variable-depth pyramid for the MoE-diff layout. The
+/// pyramid renders extra tiles at `zoom = max_zoom + 1 ..= max_zoom + depth`
+/// (each level is a 2× finer sampling on the way zoomed *in* past the
+/// overview), so shrunk tensors can resolve all the way to one display-pixel
+/// per element.
+///
+/// For MoE-diff that's not a useful affordance: the visualization is a
+/// pattern-level comparison of expert pairs, not element-level inspection of
+/// any single per-weight tensor inside one cell. Carrying the pyramid would
+/// quadruple the detail-tile count per level — with
+/// `detail_depth_for_scale(~0.012) = 7` for Qwen-sized experts that's millions
+/// of pyramid tiles, enough to OOM the render pipeline.
+///
+/// Setting the cap to 0 means the renderer only emits overview tiles
+/// (`zoom 0..=max_zoom`) and the leaflet viewer caps `viewer_max_zoom` at
+/// `max_zoom + 3` (3 levels of digital scroll-zoom upscaling). That brings
+/// the user near the data-bearing zoom by default, instead of starting them
+/// in the middle of a 14-level pyramid where everything reads as aggregate
+/// noise until they scroll way in.
+const MOE_MAX_DETAIL_DEPTH: u32 = 0;
 
 /// Order key for sub-paths within a layer: attention, then MLP, then norms,
 /// then "other". Within attention, q/k/v/o; within MLP, gate/up/down.
@@ -1546,5 +1585,199 @@ mod tests {
         assert!(detail_depth_for_scale(embed.scale) > 1);
         // Layout-wide depth == the embedding's (the max).
         assert_eq!(layout.detail_depth, detail_depth_for_scale(embed.scale));
+    }
+
+    /// Build a synthetic MoE-diff source for `(layer, weight, i, j)`.
+    /// Mirrors what `prepare_moe_diff_sources` emits: a Source carrying a
+    /// `MoeCell` extension + a `ModelInfo` extension with a single tensor.
+    fn synthetic_moe_source(
+        sidx: usize,
+        layer: u32,
+        weight: crate::format::moe::ExpertWeight,
+        i: u32,
+        j: u32,
+        shape: Vec<u64>,
+    ) -> Source {
+        let n: u64 = shape.iter().product();
+        let t = TensorMeta {
+            name: format!(
+                "moe::L{layer}::{w}::E{i}-E{j}",
+                w = weight.label(),
+            ),
+            dtype: Dtype::U8,
+            shape,
+            file_start: 0,
+            file_end: n,
+            packed_sidecars: None,
+        };
+        let mut extensions = Extensions::default();
+        extensions.insert(crate::format::ModelInfo {
+            format: crate::format::SourceFormat::Safetensors,
+            tensors: vec![t],
+            color_ranges: Vec::new(),
+        });
+        extensions.insert(crate::data::MoeCell {
+            layer,
+            weight,
+            i,
+            j,
+        });
+        Source {
+            file_idx: sidx,
+            kind: SourceKind::Buffered(Vec::new()),
+            byte_size: n,
+            name_override: None,
+            xet_terms: None,
+            extensions,
+        }
+    }
+
+    /// Expert-pair-major MoE layout: a 4-expert × 2-layer × 3-weight fixture
+    /// must produce ONE 4×4 upper-triangle matrix (not 2 stacked matrices),
+    /// with every cell holding `2 layers × 3 weights = 6` placed tensors.
+    /// Diagonal cells are kept (cheap to render, anchor the grid); lower
+    /// triangle is skipped (antisymmetric).
+    #[test]
+    fn moe_diff_one_top_level_matrix_with_layers_inside_each_cell() {
+        use crate::format::moe::ExpertWeight;
+        const N_EXPERTS: u32 = 4;
+        const N_LAYERS: u32 = 2;
+        let weights = [
+            ExpertWeight::GateProj,
+            ExpertWeight::UpProj,
+            ExpertWeight::DownProj,
+        ];
+        let mut sources: Vec<Source> = Vec::new();
+        let mut cumulative: Vec<u64> = Vec::new();
+        for layer in 0..N_LAYERS {
+            for &w in &weights {
+                for i in 0..N_EXPERTS {
+                    for j in i..N_EXPERTS {
+                        cumulative.push(0);
+                        sources.push(synthetic_moe_source(
+                            sources.len(),
+                            layer,
+                            w,
+                            i,
+                            j,
+                            vec![64, 64],
+                        ));
+                    }
+                }
+            }
+        }
+
+        let layout =
+            ArchLayout::try_build_moe_diff(&sources, &cumulative).expect("moe layout built");
+
+        // Upper triangle of a 4×4 = 10 cells; each cell holds 2 layers × 3
+        // weights = 6 placed tensors → 60 total.
+        let upper_tri = (N_EXPERTS * (N_EXPERTS + 1) / 2) as usize;
+        let per_cell = (N_LAYERS as usize) * weights.len();
+        assert_eq!(layout.tensors.len(), upper_tri * per_cell);
+
+        // No per-layer bounds — the new layout is one matrix, not K stacked.
+        assert!(layout.layer_bounds.is_empty());
+
+        // Architecture string reflects the new structure.
+        assert!(
+            layout.architecture.contains("expert-pair"),
+            "architecture string should mention expert-pair structure; got {:?}",
+            layout.architecture,
+        );
+        assert!(layout.architecture.contains("4×4"));
+        assert!(layout.architecture.contains("2 layer"));
+
+        // One top-level matrix, not N stacked: every placed tensor's
+        // canvas_y must fit within a single matrix-height span derived from
+        // n_experts cells, not a stack of n_layers matrices. The previous
+        // layout would have placed half the tensors below
+        // `n_experts * cell_h + MOE_LAYER_GAP`. Confirm the canvas height is
+        // close to a single-matrix height (≤ 2× of upper-bound single-matrix
+        // estimate); the stacked-matrices alternative would be ≥ K×.
+        use std::collections::BTreeSet;
+        let max_y = layout.tensors.iter().map(|t| t.canvas_y).max().unwrap();
+        // Per the layout: matrix_h = N_EXPERTS * cell_h + (N_EXPERTS - 1) * MOE_CELL_PAD.
+        // cell_h = N_LAYERS * sub_h + (N_LAYERS - 1) * MOE_LAYER_GAP_INNER.
+        // Bounded tightly above by 4 * (2 * sub_h_max + ...) — we just assert
+        // it's well under what the old K-stacked layout would have produced
+        // (which would have been ≥ N_LAYERS * single_matrix_h plus the gap).
+        let stacked_matrix_lower_bound = N_LAYERS * (N_EXPERTS * 64 /* sub_h ceiling */);
+        assert!(
+            max_y < stacked_matrix_lower_bound,
+            "max canvas_y {max_y} should be much smaller than the stacked-matrices \
+             lower bound {stacked_matrix_lower_bound} — the new layout fits in one matrix",
+        );
+
+        // Every layer that's placed must surface a layer_idx in the
+        // `Some(layer)` form (positional metadata for downstream display).
+        for t in &layout.tensors {
+            assert!(
+                t.layer_idx.is_some(),
+                "MoE-diff placements should record their source layer; got None for {}",
+                t.name,
+            );
+        }
+        let observed_layers: BTreeSet<u32> = layout
+            .tensors
+            .iter()
+            .filter_map(|t| t.layer_idx)
+            .collect();
+        assert_eq!(observed_layers.len(), N_LAYERS as usize);
+    }
+
+    /// MoE-diff layout must clamp the variable-depth pyramid at
+    /// `MOE_MAX_DETAIL_DEPTH`, otherwise large-tensor MoE checkpoints would
+    /// blow up the detail-tile count: each level quadruples the per-tensor
+    /// tile count, so an uncapped depth of 7 (which `MOE_SUB_AXIS_TARGET = 24`
+    /// against 2048-element axes would naturally request) produces millions
+    /// of pyramid tiles and OOMs the render pipeline.
+    #[test]
+    fn moe_diff_caps_detail_pyramid_depth() {
+        use crate::format::moe::ExpertWeight;
+        // 2×2 experts, 1 layer, 3 weights — minimum cell set. Tensors big
+        // enough that `detail_depth_for_scale` would request well over
+        // MOE_MAX_DETAIL_DEPTH if uncapped: at 2048×2048 elements and
+        // sub_axis_target = 24, scale ≈ 0.012 → detail_depth_for_scale = 7.
+        let mut sources: Vec<Source> = Vec::new();
+        let mut cumulative: Vec<u64> = Vec::new();
+        for w in [
+            ExpertWeight::GateProj,
+            ExpertWeight::UpProj,
+            ExpertWeight::DownProj,
+        ] {
+            for i in 0..2u32 {
+                for j in i..2u32 {
+                    cumulative.push(0);
+                    sources.push(synthetic_moe_source(
+                        sources.len(),
+                        0,
+                        w,
+                        i,
+                        j,
+                        vec![2048, 2048],
+                    ));
+                }
+            }
+        }
+        let layout =
+            ArchLayout::try_build_moe_diff(&sources, &cumulative).expect("moe layout built");
+
+        // Per-tensor uncapped depth would be ≥ 6 for 2048×2048 at this
+        // sub-axis target. Confirm the cap actually bit.
+        let uncapped: u32 = layout
+            .tensors
+            .iter()
+            .map(|t| detail_depth_for_scale(t.scale))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            uncapped > MOE_MAX_DETAIL_DEPTH,
+            "fixture too small to exercise the cap: uncapped depth {uncapped} ≤ cap {MOE_MAX_DETAIL_DEPTH}",
+        );
+        assert_eq!(
+            layout.detail_depth, MOE_MAX_DETAIL_DEPTH,
+            "MoE detail pyramid must be capped at {MOE_MAX_DETAIL_DEPTH}",
+        );
     }
 }

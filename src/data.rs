@@ -1417,6 +1417,14 @@ async fn build_multi_safetensors_diff_sources_from_http(
 /// otherwise. (A future enhancement could swap diagonals for a self-render
 /// of the expert; v1 keeps the source-kind surface untouched.)
 ///
+/// Source tensors keep their natural element shape (e.g. 1408×2048 for
+/// Qwen1.5-MoE), so the rendered output preserves a 1:1 tensor-element-to-
+/// display-pixel mapping at any pyramid level the leaf renderer chooses to
+/// sample. The per-tile fetch path in [`crate::tiled::leaf_arch`] detects
+/// heavily-shrunk regions and uses a sparse row-batched compact fetch so
+/// the renderer doesn't allocate the full element bounding box per region —
+/// see `load_arch_tile_regions` for the threshold and the compact layout.
+///
 /// `input` is a local path or `hf://` URL. Repo-level `hf://` URLs are listed
 /// over the HF API. When `stream` is false (the default), every shard is
 /// downloaded to the local hf-hub cache and mmapped before any source is
@@ -1737,10 +1745,13 @@ pub async fn prepare_moe_diff_sources(
         }
     }
 
-    // Emit one Source per upper-triangle cell (including diagonal). The
-    // diff Source carries both `orig` and `mod_` pointing at the same
-    // checkpoint's `Arc<Data>`, just at different file_start offsets — the
-    // existing TensorDiff render path handles the rest.
+    // Emit one Source per upper-triangle cell (including diagonal). The diff
+    // Source carries both `orig` and `mod_` pointing at the same checkpoint's
+    // `Arc<Data>`, just at different file_start offsets — the leaf renderer's
+    // load stage (`load_arch_tile_regions`) issues per-region byte ranges via
+    // the existing `TensorDiff` path, with a sparse compact path for heavily-
+    // shrunk regions so a 24×24 sub-tile of a 1408×2048 expert doesn't read
+    // the full element bounding box.
     let mut sources: Vec<Source> = Vec::new();
     let mut total: u64 = 0;
     for ((layer_idx, weight), experts) in &groups {

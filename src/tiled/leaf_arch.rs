@@ -11,6 +11,29 @@
 //! region_width` extra bytes per row) — the bandwidth waste is bounded and
 //! beats issuing 100s of small per-row requests over HTTP. For local mmap
 //! sources the gap is a free `memcpy` slice.
+//!
+//! Sparse compact path: when the renderer is sampling at heavy shrink
+//! (e.g. a 24 px sub-tile of a 1408×2048 tensor at MoE-diff overview), the
+//! coalesced bounding-box span is multi-MB per region but only the
+//! `paint_w × paint_h` sampled elements are actually painted. Per region
+//! that means allocating ~2.8 MB and computing ~2.8 M diff bytes to use ~600
+//! of them; multiplied across ~300 regions per tile and ~100 in-flight
+//! workers this OOMs the render pipeline. For `Fixed(1)`-stride regions
+//! (i.e. the `U8` diff buffers emitted by `prepare_moe_diff_sources`) where
+//! the bounding-box span exceeds the painted area by [`SPARSE_WASTE_THRESHOLD`],
+//! the loader takes a compact path: one `fetch_range` per *sampled* source
+//! row (≪ all rows in the bounding box), packed into a `paint_w × paint_h`
+//! byte buffer. The matching `iter_region_pixels_compact` indexes that
+//! buffer by `dy * paint_w + dx` instead of the full-stride `row_rel * cols
+//! + col_rel`.
+
+/// Trigger the sparse compact load path when the bounding-box byte span
+/// exceeds the painted pixel area by this factor. `8` is a soft heuristic:
+/// at exactly the threshold the full path still wins on async overhead;
+/// past it the compact path's row-batched reads pay back the extra fetches.
+/// MoE-diff overview regions blow past this by ~5000× — the trigger is
+/// essentially "any heavy shrink".
+const SPARSE_WASTE_THRESHOLD: u64 = 8;
 
 use image::Rgb;
 
@@ -29,12 +52,17 @@ type TileResult = Result<(image::ImageBuffer<Rgb<u8>, Vec<u8>>, Vec<u8>), String
 /// Bytes loaded for one tile in architectural mode: one buffer per region.
 #[derive(Default)]
 pub struct LoadedArchTile {
-    /// Per-region tuple: `(region, fetched_bytes, leading_elem_offset)`.
-    /// `leading_elem_offset` is the element index inside `fetched_bytes`
-    /// where this region's first painted pixel lives — always 0 for fixed-
-    /// stride dtypes, non-zero for block-quantised tensors whose `col_first`
-    /// doesn't fall on a block boundary.
-    pub regions: Vec<(TileRegion, Vec<u8>, usize)>,
+    /// Per-region tuple: `(region, fetched_bytes, leading_elem_offset, is_compact)`.
+    /// * `leading_elem_offset` is the element index inside `fetched_bytes`
+    ///   where this region's first painted pixel lives — always 0 for fixed-
+    ///   stride dtypes, non-zero for block-quantised tensors whose `col_first`
+    ///   doesn't fall on a block boundary.
+    /// * `is_compact` is `true` when the buffer is laid out as the
+    ///   `paint_w × paint_h` painted-pixel grid (one byte per pixel, row
+    ///   stride = `paint_w`); the render path must use
+    ///   `iter_region_pixels_compact` in that case. `false` is the default
+    ///   element-bounding-box layout consumed by `iter_region_pixels`.
+    pub regions: Vec<(TileRegion, Vec<u8>, usize, bool)>,
 }
 
 /// Compute the absolute byte span of `region` inside the source plus the
@@ -111,7 +139,9 @@ fn region_byte_span(r: &TileRegion) -> (u64, usize, usize) {
 }
 
 /// Async load stage for architectural mode: fetch one coalesced byte range
-/// per region in this tile.
+/// per region in this tile. Heavily-shrunk `Fixed(1)`-stride regions take
+/// the [`fetch_compact_region_u8`] path so the per-region buffer never
+/// allocates the full element bounding box.
 pub async fn load_arch_tile_regions(
     zoom: u32,
     tx: u32,
@@ -131,14 +161,77 @@ pub async fn load_arch_tile_regions(
             .copied()
             .unwrap_or(0);
         let (abs_start, len, leading) = region_byte_span(&region);
-        let local_off = abs_start - src_off;
-        let bytes = source_data[region.source_idx]
-            .fetch_range(local_off, len)
-            .await?;
-        out.regions.push((region, bytes, leading));
+        let painted = (region.tile_x1 - region.tile_x0) as u64
+            * (region.tile_y1 - region.tile_y0) as u64;
+        // The compact path's row-batched fetch + per-pixel sub-sample only
+        // makes sense for single-byte-per-element regions; block and packed
+        // dtypes have alignment requirements that the compact layout doesn't
+        // respect. In practice the only regions that hit this branch are the
+        // U8 diff buffers from `prepare_moe_diff_sources` — which is exactly
+        // where heavy shrink (and the OOM it caused) lives.
+        let fixed_one = matches!(region.dtype.stride(), ElementStride::Fixed(1));
+        let use_compact =
+            fixed_one && painted > 0 && (len as u64) > painted * SPARSE_WASTE_THRESHOLD;
+
+        if use_compact {
+            let compact =
+                fetch_compact_region_u8(&source_data[region.source_idx], &region, src_off)
+                    .await?;
+            out.regions.push((region, compact, 0, true));
+        } else {
+            let local_off = abs_start - src_off;
+            let bytes = source_data[region.source_idx]
+                .fetch_range(local_off, len)
+                .await?;
+            out.regions.push((region, bytes, leading, false));
+        }
     }
     let _ = (tx, ty); // keep params for symmetry with the byte-mode signature
     Ok(out)
+}
+
+/// Row-batched compact fetch for `Fixed(1)`-stride regions under heavy shrink.
+/// Returns a `paint_w * paint_h`-byte buffer where pixel `(dy, dx)` lives at
+/// `compact[dy * paint_w + dx]` — matches `iter_region_pixels_compact`.
+///
+/// Per region this issues `paint_h` `fetch_range` calls, each spanning
+/// exactly one source row (`cols` bytes). The full element bounding box
+/// would be `(row_last - row_first) * cols` bytes — for a 24-px sub-tile of
+/// a 1408×2048 tensor that's ~2.8 MB; the compact path reads
+/// `24 * 2048 = 48 KB` instead (a ~60× reduction) and the returned buffer is
+/// `24 * 24 = 576` bytes (a ~5000× reduction). The inter-column gaps inside
+/// each fetched row are still read but never copied into `compact`, so the
+/// post-load working set is bounded by the painted area, not the source
+/// shape.
+async fn fetch_compact_region_u8(
+    data: &Data,
+    region: &TileRegion,
+    src_off: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let paint_w = (region.tile_x1 - region.tile_x0) as u64;
+    let paint_h = (region.tile_y1 - region.tile_y0) as u64;
+    let cols = region.tensor_cols.max(1);
+    let rows = region.tensor_rows.max(1);
+    let fw = region.footprint_w.max(1);
+    let fh = region.footprint_h.max(1);
+
+    let mut compact = vec![0u8; (paint_w * paint_h) as usize];
+
+    for dy in 0..paint_h {
+        let er = (region.samp_y0 + dy) * rows / fh; // absolute source row
+        // Fixed(1) stride: each row is `cols` bytes.
+        let row_byte_abs = region.tensor_byte_start + er * cols;
+        let row_byte_local = row_byte_abs.saturating_sub(src_off);
+        let row_bytes = data.fetch_range(row_byte_local, cols as usize).await?;
+        for dx in 0..paint_w {
+            let ec = (region.samp_x0 + dx) * cols / fw; // absolute source col
+            // Defensive: clamp to row bounds. The render's mid-grey-on-miss
+            // (`unwrap_or(127)`) matches diff_to_u8's "no change" byte.
+            let byte = row_bytes.get(ec as usize).copied().unwrap_or(127);
+            compact[(dy * paint_w + dx) as usize] = byte;
+        }
+    }
+    Ok(compact)
 }
 
 /// Iterate every pixel in `region`'s tile-local rectangle, calling
@@ -182,6 +275,23 @@ fn iter_region_pixels(region: &TileRegion, leading: usize, mut paint: impl FnMut
     }
 }
 
+/// Compact-buffer counterpart of [`iter_region_pixels`]: each painted pixel
+/// `(px, py)` maps to `dy * paint_w + dx` in the compact buffer (row stride =
+/// `paint_w`, one byte per pixel). Used when the loader took the
+/// [`fetch_compact_region_u8`] sparse path.
+#[inline]
+fn iter_region_pixels_compact(region: &TileRegion, mut paint: impl FnMut(u32, u32, usize)) {
+    let paint_w = (region.tile_x1 - region.tile_x0) as u64;
+    for py in region.tile_y0..region.tile_y1 {
+        let dy = (py - region.tile_y0) as u64;
+        let row_base = (dy * paint_w) as usize;
+        for px in region.tile_x0..region.tile_x1 {
+            let dx = (px - region.tile_x0) as u64;
+            paint(px, py, row_base + dx as usize);
+        }
+    }
+}
+
 fn blank_tile() -> image::ImageBuffer<Rgb<u8>, Vec<u8>> {
     let mut img = image::ImageBuffer::<Rgb<u8>, Vec<u8>>::new(TILE, TILE);
     for p in img.pixels_mut() {
@@ -197,12 +307,19 @@ pub fn render_arch_tile_plain(
     fmt: TileFormat,
 ) -> TileResult {
     let mut img = blank_tile();
-    for (region, bytes, leading) in &tile.regions {
+    for (region, bytes, leading, is_compact) in &tile.regions {
         let dtype = region.dtype;
-        iter_region_pixels(region, *leading, |px, py, elem_off| {
-            let color = plain_element_color(dtype, bytes, elem_off, pixel_lut);
-            img.put_pixel(px, py, color);
-        });
+        if *is_compact {
+            iter_region_pixels_compact(region, |px, py, elem_off| {
+                let byte = bytes.get(elem_off).copied().unwrap_or(127);
+                img.put_pixel(px, py, pixel_lut[byte as usize]);
+            });
+        } else {
+            iter_region_pixels(region, *leading, |px, py, elem_off| {
+                let color = plain_element_color(dtype, bytes, elem_off, pixel_lut);
+                img.put_pixel(px, py, color);
+            });
+        }
     }
     encode_tile(img, fmt)
 }
@@ -213,7 +330,10 @@ pub fn render_arch_tile_plain(
 /// color flat" — there are no inter-tensor bytes, the gaps are padding.
 pub fn render_arch_tile_dtype(tile: &LoadedArchTile, fmt: TileFormat) -> TileResult {
     let mut img = blank_tile();
-    for (region, _bytes, _leading) in &tile.regions {
+    // The compact-vs-full distinction doesn't matter here — this renderer
+    // never reads the buffer, it just paints a flat dtype color across the
+    // region's tile rectangle.
+    for (region, _bytes, _leading, _is_compact) in &tile.regions {
         let color = region.dtype.to_color();
         for py in region.tile_y0..region.tile_y1 {
             for px in region.tile_x0..region.tile_x1 {
@@ -235,25 +355,34 @@ pub fn render_arch_tile_diff(
     fmt: TileFormat,
 ) -> TileResult {
     let mut img = blank_tile();
-    for (region, bytes, leading) in &tile.regions {
+    for (region, bytes, leading, is_compact) in &tile.regions {
         let dtype = region.dtype;
-        iter_region_pixels(region, *leading, |px, py, elem_off| {
-            // `TensorDiff` produces one byte per *element pair* (not per
-            // element of the source dtype). For diff buffers `dtype` is U8
-            // and `stride` is `Fixed(1)`, so the per-pixel byte index is
-            // exactly `elem_off`. Non-diff regions inside a diff run fall
-            // through to the plain-element path.
-            let stride = dtype.stride();
-            let byte = match stride {
-                ElementStride::Fixed(1) => bytes.get(elem_off).copied().unwrap_or(127),
-                _ => {
-                    let plain = plain_element_color(dtype, bytes, elem_off, pixel_lut);
-                    img.put_pixel(px, py, plain);
-                    return;
-                }
-            };
-            img.put_pixel(px, py, pixel_lut[byte as usize]);
-        });
+        if *is_compact {
+            // Compact buffer is one byte per painted pixel — exactly the
+            // U8-diff happy path.
+            iter_region_pixels_compact(region, |px, py, elem_off| {
+                let byte = bytes.get(elem_off).copied().unwrap_or(127);
+                img.put_pixel(px, py, pixel_lut[byte as usize]);
+            });
+        } else {
+            iter_region_pixels(region, *leading, |px, py, elem_off| {
+                // `TensorDiff` produces one byte per *element pair* (not per
+                // element of the source dtype). For diff buffers `dtype` is U8
+                // and `stride` is `Fixed(1)`, so the per-pixel byte index is
+                // exactly `elem_off`. Non-diff regions inside a diff run fall
+                // through to the plain-element path.
+                let stride = dtype.stride();
+                let byte = match stride {
+                    ElementStride::Fixed(1) => bytes.get(elem_off).copied().unwrap_or(127),
+                    _ => {
+                        let plain = plain_element_color(dtype, bytes, elem_off, pixel_lut);
+                        img.put_pixel(px, py, plain);
+                        return;
+                    }
+                };
+                img.put_pixel(px, py, pixel_lut[byte as usize]);
+            });
+        }
     }
     encode_tile(img, fmt)
 }
@@ -267,7 +396,7 @@ pub fn render_arch_tile_xet(
     fmt: TileFormat,
 ) -> TileResult {
     let mut img = blank_tile();
-    for (region, bytes, leading) in &tile.regions {
+    for (region, bytes, leading, is_compact) in &tile.regions {
         let dtype = region.dtype;
         // xet xorb coloring keys off absolute byte position. For fixed-stride
         // dtypes the byte address of element K is at a known offset; for
@@ -276,11 +405,24 @@ pub fn render_arch_tile_xet(
         let tbs = region.tensor_byte_start
             + region.row_first * region.tensor_cols * dtype.element_size() as u64
             + region.col_first * dtype.element_size() as u64;
-        iter_region_pixels(region, *leading, |px, py, elem_off| {
-            let color =
-                xet_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut);
-            img.put_pixel(px, py, color);
-        });
+        if *is_compact {
+            // Compact only fires for Fixed(1); xet_element_color reads one
+            // byte at `elem_off` and the byte-address proxy still keys off
+            // `tbs` (the region's anchor), which is fine for xorb hue lookup.
+            iter_region_pixels_compact(region, |px, py, elem_off| {
+                let color = xet_element_color(
+                    dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut,
+                );
+                img.put_pixel(px, py, color);
+            });
+        } else {
+            iter_region_pixels(region, *leading, |px, py, elem_off| {
+                let color = xet_element_color(
+                    dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut,
+                );
+                img.put_pixel(px, py, color);
+            });
+        }
     }
     encode_tile(img, fmt)
 }
@@ -294,15 +436,24 @@ pub fn render_arch_tile_xet_dtype(
     fmt: TileFormat,
 ) -> TileResult {
     let mut img = blank_tile();
-    for (region, bytes, leading) in &tile.regions {
+    for (region, bytes, leading, is_compact) in &tile.regions {
         let dtype = region.dtype;
         let tbs = region.tensor_byte_start
             + region.row_first * region.tensor_cols * dtype.element_size() as u64
             + region.col_first * dtype.element_size() as u64;
-        iter_region_pixels(region, *leading, |px, py, elem_off| {
-            let color = xet_dtype_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau);
-            img.put_pixel(px, py, color);
-        });
+        if *is_compact {
+            iter_region_pixels_compact(region, |px, py, elem_off| {
+                let color =
+                    xet_dtype_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau);
+                img.put_pixel(px, py, color);
+            });
+        } else {
+            iter_region_pixels(region, *leading, |px, py, elem_off| {
+                let color =
+                    xet_dtype_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau);
+                img.put_pixel(px, py, color);
+            });
+        }
     }
     encode_tile(img, fmt)
 }
@@ -322,14 +473,16 @@ pub fn render_arch_tile_diff_paired(
     let mut img = blank_tile();
     // Pair regions by tensor_id; assume parallel layouts (same canvas, same
     // tensor placement). Mismatches fall back to padding.
-    let mut by_id_b: std::collections::HashMap<usize, &(TileRegion, Vec<u8>, usize)> =
+    let mut by_id_b: std::collections::HashMap<usize, &(TileRegion, Vec<u8>, usize, bool)> =
         std::collections::HashMap::new();
     for r in &tile_b.regions {
         by_id_b.insert(r.0.tensor_id, r);
     }
 
-    for (region_a, bytes_a, leading_a) in &tile_a.regions {
-        let Some((_region_b, bytes_b, leading_b)) = by_id_b.get(&region_a.tensor_id) else {
+    for (region_a, bytes_a, leading_a, _is_compact_a) in &tile_a.regions {
+        let Some((_region_b, bytes_b, leading_b, _is_compact_b)) =
+            by_id_b.get(&region_a.tensor_id)
+        else {
             continue;
         };
         let dtype = region_a.dtype;

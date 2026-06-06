@@ -24,21 +24,40 @@ impl LayoutShape for ArchLayout {
         "arch"
     }
     fn canvas_geom(&self) -> CanvasGeom {
+        // Use the unpadded content extent for the viewer's world bounds, so
+        // `map.fitBounds(...)` in the leaflet HTML zooms onto the matrix
+        // instead of the next-pow2-padded tile grid. The padded canvas is
+        // typically much larger than the placed-tensor extent — most starkly
+        // for the MoE-diff layout where a 5272×37792-pixel matrix is padded
+        // to an 8192×65536-pixel canvas (raw 11×74 tiles → next_pow2 16×128).
+        // Without this override the initial view fits the padded canvas and
+        // the matrix becomes a tiny strip in a sea of empty padding tiles.
+        //
+        // Tile coords still operate on the padded grid (`width_tiles`,
+        // `height_tiles` unchanged) — the pyramid accumulator needs a
+        // power-of-two tile count to drain. Padding tiles outside the world
+        // bounds are still generated (they render as empty padding); leaflet
+        // simply doesn't fetch the ones fully outside the bounds.
+        //
+        // The JS label-coord conversion (`canvas_x = lng * WIDTH / WORLD_W`)
+        // stays consistent: both halves of the ratio derive from the same
+        // content extent, so a tensor at `canvas_x = content_w` maps to
+        // `lng = world_w` (the right edge of the world bounds).
         let two_pow_mz = 1u32 << self.max_zoom;
-        let world_w = (self.width_tiles / two_pow_mz.max(1)).max(1) * TILE;
-        let world_h = (self.height_tiles / two_pow_mz.max(1)).max(1) * TILE;
+        let world_w = (self.content_w / two_pow_mz.max(1)).max(1);
+        let world_h = (self.content_h / two_pow_mz.max(1)).max(1);
         CanvasGeom {
             kh: 0,
             width_tiles: self.width_tiles,
             height_tiles: self.height_tiles,
             world_w,
             world_h,
-            width: self.width,
-            height: self.height,
+            width: self.content_w,
+            height: self.content_h,
             max_zoom: self.max_zoom,
             total_tiles: self.total_tiles,
             square_pixels: 1,
-            total: self.width as u64 * self.height as u64,
+            total: self.content_w as u64 * self.content_h as u64,
         }
     }
     fn detail_depth(&self) -> u32 {
