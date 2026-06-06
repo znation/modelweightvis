@@ -21,6 +21,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod args;
+mod cka;
 mod data;
 mod diff;
 mod finetune;
@@ -36,9 +37,9 @@ pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{
     ArchSingleImageHook, HfModelCardFinetuneDetect, SourceMetaSidecarHook, TensorDirectoryDiffPrep,
-    TensorMoeDiffPrep, TensorMoeSummaryPrep, TensorRepoDiffPrep,
+    TensorMoeCkaPrep, TensorMoeDiffPrep, TensorMoeSummaryPrep, TensorRepoDiffPrep,
 };
-pub use layout::{ArchLayoutPlugin, MoeDiffLayoutPlugin, MoeSummaryLayoutPlugin};
+pub use layout::{ArchLayoutPlugin, MoeCkaLayoutPlugin, MoeDiffLayoutPlugin, MoeSummaryLayoutPlugin};
 pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
 
 use std::sync::Arc;
@@ -73,6 +74,7 @@ pub fn register_all(registry: &mut Registry) {
     registry.layouts.push(Arc::new(ArchLayoutPlugin));
     registry.layouts.push(Arc::new(MoeDiffLayoutPlugin));
     registry.layouts.push(Arc::new(MoeSummaryLayoutPlugin));
+    registry.layouts.push(Arc::new(MoeCkaLayoutPlugin));
 
     // Tile loader+renderer pair for the `"arch"` layout id.
     registry.leaf.register_loader(Arc::new(ArchRegionsLoader));
@@ -83,6 +85,7 @@ pub fn register_all(registry: &mut Registry) {
     // Option-slot hooks — each one taps a single CLI dispatch.
     registry.moe_diff = Some(Arc::new(TensorMoeDiffPrep));
     registry.moe_summary = Some(Arc::new(TensorMoeSummaryPrep));
+    registry.moe_cka = Some(Arc::new(TensorMoeCkaPrep));
     registry.repo_diff = Some(Arc::new(TensorRepoDiffPrep));
     registry.dir_tensor_diff = Some(Arc::new(TensorDirectoryDiffPrep));
     registry.finetune_detect = Some(Arc::new(HfModelCardFinetuneDetect));

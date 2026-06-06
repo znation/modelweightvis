@@ -143,9 +143,23 @@ pub struct ModelArgs {
     #[arg(
         long,
         value_name = "MODEL",
-        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_diff"]
+        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_diff", "moe_cka"]
     )]
     pub moe_summary: Option<PathBuf>,
+
+    /// Visualize per-(layer, weight) expert-vs-expert linear CKA similarity
+    /// matrices for a single MoE model. MODEL is a local path or hf:// URL.
+    /// Each panel is one `(layer, weight)` rendered as an `n_experts × n_experts`
+    /// heatmap of pairwise CKA scores in `[0, 1]`; the diagonal is `1.0`
+    /// (every expert is self-identical) and off-diagonal blocks reveal expert
+    /// clusters / redundancy. Uses Gaussian random projection on the input
+    /// axis (see `--cka-sample`) so a 60-expert × 24-layer model is tractable.
+    #[arg(
+        long,
+        value_name = "MODEL",
+        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_diff", "moe_summary"]
+    )]
+    pub moe_cka: Option<PathBuf>,
 
     /// Force-treat the second --diff argument as a finetune of the first.
     /// In finetune mode, tensors present only on the base side are rendered
@@ -177,6 +191,15 @@ pub struct ModelArgs {
     #[arg(long, value_enum, default_value_t = SummaryStatArg::Rms)]
     pub summary_stat: SummaryStatArg,
 
+    /// Random-projection dimension for `--moe-cka`. Trades CKA estimation
+    /// accuracy for compute: smaller is faster (per-pair cost is O(k² · d_out)),
+    /// larger preserves CKA more accurately (the projection becomes lossless
+    /// as k approaches d_in). Default 128 lands the full 24-layer × 3-weight
+    /// Qwen MoE compute under a minute on a laptop and produces visually
+    /// stable heatmaps. Range: 16..=4096.
+    #[arg(long, value_name = "K", default_value_t = 128, value_parser = clap::value_parser!(u32).range(16..=4096))]
+    pub cka_sample: u32,
+
     /// Layout strategy for arranging tensors on the canvas.
     ///
     /// `auto` (default): structure-aware layout when every input is
@@ -202,10 +225,12 @@ impl ModelArgs {
         let opts = ModelOpts {
             moe_diff: self.moe_diff,
             moe_summary: self.moe_summary,
+            moe_cka: self.moe_cka,
             finetune: self.finetune,
             no_finetune: self.no_finetune,
             diff_metric: self.diff_metric.into(),
             summary_stat: self.summary_stat.into(),
+            cka_sample: self.cka_sample,
             layout_mode: self.layout.into(),
         };
         (self.arbvis, opts)

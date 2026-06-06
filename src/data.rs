@@ -268,6 +268,18 @@ pub struct MoeSummaryPanel {
     pub n_experts: u32,
 }
 
+/// Per-panel tag attached to each `--moe-cka` source. One source per
+/// `(layer, weight)` pair present in the model; the source's bytes
+/// are an `n_experts × n_experts` U8 CKA-similarity heatmap, row-major,
+/// values in `0..=255` (`255` = CKA 1.0). Presence of this extension
+/// on any source routes `select_layout` to the MoE-CKA layout plugin.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeCkaPanel {
+    pub layer: u32,
+    pub weight: ExpertWeight,
+    pub n_experts: u32,
+}
+
 // === extracted from arbvis::data (load_model_info,fetch_model_header) ===
 /// Read just the header of a recognised model file and return parsed
 /// metadata. Dispatches on `format`.
@@ -2372,6 +2384,452 @@ fn scalar_from_buf(stat: format::SummaryStat, dtype: format::Dtype, bytes: &[u8]
         // knob if a user reports it being wrong for their dtype mix.
         format::SummaryStat::Sparsity => format::sparsity_from_buf(dtype, bytes, 1e-6),
     }
+}
+
+/// Decode `bytes` (one expert's whole weight tensor, dtype `dtype`) to
+/// a fresh `Vec<f32>` of length `n_elements`. Non-finite values are
+/// preserved (caller's projection / inner-product loops happen to be
+/// finite-safe — the random projection of a NaN row stays NaN, but
+/// the only way to hit one is a malformed checkpoint, in which case
+/// CKA polluted by NaN is still a useful diagnostic).
+fn decode_tensor_to_f32(dtype: format::Dtype, bytes: &[u8], n_elements: usize) -> Vec<f32> {
+    let mut reader = format::TensorElementReader::new(dtype, bytes);
+    let mut out = vec![0.0f32; n_elements];
+    for k in 0..n_elements {
+        out[k] = reader.element(k);
+    }
+    out
+}
+
+/// Build per-`(layer, weight)` similarity Sources for `--moe-cka`.
+/// Emits one `Source` per panel carrying a [`MoeCkaPanel`] extension
+/// tag and an in-memory `n_experts × n_experts` U8 heatmap of linear
+/// CKA between every expert pair. The [`crate::MoeCkaLayoutPlugin`]
+/// reads the tags back and lays out the panels in a `n_layers × 3`
+/// grid (one row per layer, three columns for gate / up / down).
+///
+/// Uses Gaussian random projection on the input dim (controlled by
+/// `sample`, defaulting to 128 via the CLI) so the per-pair compute
+/// drops from `O(d_in² · d_out)` to `O(k² · d_out)` — see
+/// [`crate::cka`] for the math and accuracy notes.
+///
+/// Router weights are intentionally excluded: CKA needs a shared
+/// input space, and the router maps tokens → expert logits (different
+/// space from the FFN weights). A per-row stat for the router is
+/// available via `--moe-summary`; pairwise router-row CKA would be
+/// well-defined but doesn't fit the per-`(layer, weight)` panel
+/// shape, so it's deferred.
+pub async fn prepare_moe_cka_sources(
+    input: &str,
+    sample: u32,
+    stream: bool,
+) -> anyhow::Result<(Vec<Source>, u64)> {
+    // === File opening — identical to the other two MoE prep helpers ======
+    let (datas, fmts, file_names) = if hf_url::is_repo_level(input)? {
+        let listed = hf_url::list_repo_as_http_specs(input)
+            .await
+            .with_context(|| format!("listing files in {input}"))?;
+        let st_specs: Vec<&(String, hf_url::RemoteFileSpec)> = listed
+            .iter()
+            .filter(|(n, _)| SourceFormat::from_name(n).is_some())
+            .collect();
+        if st_specs.is_empty() {
+            anyhow::bail!("--moe-cka: no .safetensors / .gguf files in {input}");
+        }
+        let fmts: Vec<SourceFormat> = st_specs
+            .iter()
+            .map(|(n, _)| SourceFormat::from_name(n).unwrap_or(SourceFormat::Safetensors))
+            .collect();
+        let names: Vec<String> = st_specs.iter().map(|(n, _)| n.clone()).collect();
+        let specs_owned: Vec<RemoteFileSpec> = st_specs.iter().map(|(_, s)| s.clone()).collect();
+        let mut datas: Vec<Arc<Data>> = if stream {
+            let pb = setup_progress(
+                "source files (xet reconstruction for moe-cka)",
+                specs_owned.len() as u64,
+            );
+            let pb_for_workers = pb.clone();
+            let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> =
+                stream::iter(specs_owned.iter().cloned().enumerate())
+                    .map(|(i, spec)| {
+                        let pb = pb_for_workers.clone();
+                        async move {
+                            let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
+                                match XetReader::new(&spec).await {
+                                    Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
+                                    Err(e) => {
+                                        log::warn!(
+                                    "{}: XetReader build failed ({e}); falling back to Data::Http",
+                                    spec.filename,
+                                );
+                                        Ok(Arc::new(Data::Http {
+                                            repo: spec.repo.clone(),
+                                            filename: Arc::clone(&spec.filename),
+                                            revision: Arc::clone(&spec.revision),
+                                        }))
+                                    }
+                                }
+                            } else {
+                                Ok(Arc::new(Data::Http {
+                                    repo: spec.repo.clone(),
+                                    filename: Arc::clone(&spec.filename),
+                                    revision: Arc::clone(&spec.revision),
+                                }))
+                            };
+                            if let Some(pb) = pb.as_ref() {
+                                pb.inc(1);
+                            }
+                            (i, r)
+                        }
+                    })
+                    .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+                    .collect()
+                    .await;
+            if let Some(pb) = pb.as_ref() {
+                pb.finish_and_clear();
+            }
+            out.sort_by_key(|(i, _)| *i);
+            out.into_iter()
+                .map(|(_, r)| r)
+                .collect::<anyhow::Result<Vec<_>>>()?
+        } else {
+            specs_owned
+                .iter()
+                .map(|spec| {
+                    Arc::new(Data::Http {
+                        repo: spec.repo.clone(),
+                        filename: Arc::clone(&spec.filename),
+                        revision: Arc::clone(&spec.revision),
+                    })
+                })
+                .collect()
+        };
+        if !stream {
+            materialize_remote_arcs(
+                &mut datas,
+                &specs_owned,
+                "source files (downloading for moe-cka)",
+            )
+            .await?;
+        }
+        (datas, fmts, names)
+    } else {
+        let resolved = hf_url::resolve(Path::new(input))
+            .await
+            .with_context(|| format!("resolving {input}"))?;
+        let files: Vec<PathBuf> = if resolved.is_dir() {
+            collect_files_recursive(&resolved)
+                .into_iter()
+                .filter(|p| SourceFormat::from_path(p).is_some())
+                .collect()
+        } else {
+            vec![resolved]
+        };
+        if files.is_empty() {
+            anyhow::bail!(
+                "--moe-cka: no recognised model files (.safetensors / .gguf) in {input}"
+            );
+        }
+        let mut datas = Vec::with_capacity(files.len());
+        let mut fmts = Vec::with_capacity(files.len());
+        let mut names = Vec::with_capacity(files.len());
+        for p in &files {
+            let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
+            datas.push(Arc::new(Data::Mapped(unsafe { Mmap::map(&f) }?)));
+            fmts.push(SourceFormat::from_path(p).unwrap_or(SourceFormat::Safetensors));
+            names.push(
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+        }
+        (datas, fmts, names)
+    };
+
+    // === Header fetch + expert grouping ===================================
+    let total_headers = datas.len() as u64;
+    let pb = setup_progress("source files (model headers)", total_headers);
+    let headers: Vec<(usize, Vec<format::TensorMeta>)> = {
+        let pb = pb.clone();
+        let items: Vec<(usize, Arc<Data>, SourceFormat)> = datas
+            .iter()
+            .zip(fmts.iter())
+            .enumerate()
+            .map(|(i, (d, fmt))| (i, Arc::clone(d), *fmt))
+            .collect();
+        let mut out: Vec<(usize, anyhow::Result<Vec<format::TensorMeta>>)> = stream::iter(items)
+            .map(|(i, d, fmt)| {
+                let pb = pb.clone();
+                async move {
+                    let r = fetch_model_header(&d, fmt)
+                        .await
+                        .map(|(t, _)| t)
+                        .with_context(|| format!("reading {fmt:?} header for moe-cka file {i}"));
+                    if let Some(pb) = pb.as_ref() {
+                        pb.inc(1);
+                    }
+                    (i, r)
+                }
+            })
+            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        out.sort_by_key(|(i, _)| *i);
+        out.into_iter()
+            .map(|(i, r)| r.map(|t| (i, t)))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+    if let Some(pb) = pb.as_ref() {
+        pb.finish_and_clear();
+    }
+
+    for (shard_idx, tensors) in &headers {
+        if matches!(fmts[*shard_idx], SourceFormat::Gguf)
+            && tensors
+                .iter()
+                .any(|t| crate::format::moe::is_fused_gguf_expert(&t.name))
+        {
+            anyhow::bail!(
+                "--moe-cka: GGUF fused expert tensors are not yet supported \
+                 (found `ffn_*_exps.weight` in {}).",
+                file_names
+                    .get(*shard_idx)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>"),
+            );
+        }
+    }
+
+    use crate::format::moe::{parse_hf_expert, ExpertWeight as EW};
+    use std::collections::BTreeMap;
+    type LayerKey = (u32, EW);
+    let mut groups: BTreeMap<LayerKey, BTreeMap<u32, (usize, format::TensorMeta)>> =
+        BTreeMap::new();
+    for (shard_idx, tensors) in &headers {
+        for t in tensors {
+            if let Some(r) = parse_hf_expert(&t.name) {
+                groups
+                    .entry((r.layer_idx, r.weight))
+                    .or_default()
+                    .insert(r.expert_idx, (*shard_idx, t.clone()));
+            }
+        }
+    }
+    if groups.is_empty() {
+        anyhow::bail!(
+            "--moe-cka: no per-expert tensors found in {input} \
+             (expected `model.layers.{{L}}.mlp.experts.{{E}}.{{gate|up|down}}_proj.weight`)"
+        );
+    }
+
+    let n_experts: u32 = groups
+        .values()
+        .flat_map(|m| m.keys().copied())
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+    if n_experts == 0 {
+        anyhow::bail!("--moe-cka: derived n_experts=0 from {input}");
+    }
+
+    // === Per-(layer, weight): project all experts, then pair CKA ==========
+    // Process groups serially so peak memory stays bounded — each group
+    // peaks at `n_experts × d_out × k × 4 bytes` of f32 projected matrices
+    // (~43 MB for Qwen at d_out=1408, k=128, n_experts=60). Within a
+    // group, expert projection is parallel (rayon over experts), and
+    // pair-CKA is parallel (rayon over the upper-triangle index set).
+    //
+    // Random projection seed is fixed at module level (per-group seed
+    // derives from layer + weight) so reruns produce identical heatmaps.
+    let datas_ref = &datas;
+    let pb = setup_progress(
+        "moe-cka panels",
+        groups.len() as u64,
+    );
+    let pb_for_groups = pb.clone();
+    let panel_results: Vec<((u32, EW), anyhow::Result<Vec<u8>>)> =
+        stream::iter(groups.iter().map(|(k, v)| (*k, v.clone())))
+            .map(|((layer_idx, weight), experts)| {
+                let pb = pb_for_groups.clone();
+                async move {
+                    let r = compute_cka_panel(
+                        layer_idx,
+                        weight,
+                        &experts,
+                        datas_ref,
+                        n_experts,
+                        sample as usize,
+                    )
+                    .await;
+                    if let Some(pb) = pb.as_ref() {
+                        pb.inc(1);
+                    }
+                    ((layer_idx, weight), r)
+                }
+            })
+            // Serial — one group at a time. Within each group the heavy
+            // lifting (projection + pair loop) is multi-threaded via rayon;
+            // running multiple groups concurrently would oversubscribe the
+            // CPU and blow peak memory.
+            .buffered(1)
+            .collect()
+            .await;
+    if let Some(pb) = pb.as_ref() {
+        pb.finish_and_clear();
+    }
+
+    // Materialise sources in stable `(layer, weight)` order.
+    let mut sources: Vec<Source> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for ((layer_idx, weight), result) in panel_results {
+        let bytes_u8 = result.with_context(|| {
+            format!("computing CKA panel for layer {layer_idx} {}", weight.label())
+        })?;
+        let nbytes = bytes_u8.len() as u64;
+        let synthetic = format::TensorMeta {
+            name: format!("moe-cka::L{layer_idx}::{}", weight.label()),
+            dtype: format::Dtype::U8,
+            shape: vec![n_experts as u64, n_experts as u64],
+            file_start: 0,
+            file_end: nbytes,
+            packed_sidecars: None,
+        };
+        let label = format!(
+            "MoE CKA · layer {layer_idx} · {} ({n_experts}×{n_experts})",
+            weight.label(),
+        );
+        let mut extensions = Extensions::default();
+        extensions.insert(ModelInfo {
+            format: SourceFormat::Safetensors,
+            tensors: vec![synthetic],
+            color_ranges: Vec::new(),
+        });
+        extensions.insert(MoeCkaPanel {
+            layer: layer_idx,
+            weight,
+            n_experts,
+        });
+        sources.push(Source {
+            file_idx: sources.len(),
+            kind: SourceKind::Buffered(bytes_u8),
+            byte_size: nbytes,
+            name_override: Some(label),
+            xet_terms: None,
+            extensions,
+        });
+        total_bytes += nbytes;
+    }
+
+    log::info!(
+        "moe-cka: {} panel(s) emitted, {} total byte(s); sample = {}",
+        sources.len(),
+        total_bytes,
+        sample,
+    );
+
+    Ok((sources, total_bytes))
+}
+
+/// One panel of CKA: project every expert in `experts` and compute the
+/// pairwise similarity matrix. Returns the row-major `n_experts × n_experts`
+/// U8 heatmap. CKA values in `[0, 1]` map to `0..=255` linearly.
+async fn compute_cka_panel(
+    layer_idx: u32,
+    weight: crate::format::moe::ExpertWeight,
+    experts: &std::collections::BTreeMap<u32, (usize, format::TensorMeta)>,
+    datas: &[Arc<Data>],
+    n_experts: u32,
+    k: usize,
+) -> anyhow::Result<Vec<u8>> {
+    use rayon::prelude::*;
+
+    // Pick d_out, d_in from the first expert's shape — all experts of one
+    // (layer, weight) share shape by construction.
+    let Some(first) = experts.values().next() else {
+        return Ok(vec![0u8; (n_experts as usize) * (n_experts as usize)]);
+    };
+    let meta = &first.1;
+    if meta.shape.len() != 2 {
+        anyhow::bail!(
+            "moe-cka: layer {} {} expects rank-2 weights, got shape {:?}",
+            layer_idx,
+            weight.label(),
+            meta.shape,
+        );
+    }
+    let d_out = meta.shape[0] as usize;
+    let d_in = meta.shape[1] as usize;
+    let dtype = meta.dtype;
+    let n_elements = d_out * d_in;
+
+    // Seed: layer × big-prime + weight discriminant. Stable across
+    // reruns, distinct across panels.
+    let weight_idx: u64 = match weight {
+        crate::format::moe::ExpertWeight::GateProj => 0,
+        crate::format::moe::ExpertWeight::UpProj => 1,
+        crate::format::moe::ExpertWeight::DownProj => 2,
+        crate::format::moe::ExpertWeight::Router => 3,
+    };
+    let seed = (layer_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ weight_idx;
+    let r = crate::cka::gaussian_projection(k, d_in, seed);
+
+    // Fetch + decode + project per expert. Serial fetch (mmap is free;
+    // HTTP would need awaiting) but the per-expert project_rows is
+    // already rayon-parallel internally.
+    //
+    // Result: `projections[e] = Some((d_out × k row-major, self_norm_sq))`
+    // for present experts, `None` for sparse holes in the expert id
+    // sequence (shouldn't happen for well-formed checkpoints, but we
+    // pad with zero-similarity rather than failing).
+    let mut projections: Vec<Option<(Vec<f32>, f64)>> =
+        (0..n_experts as usize).map(|_| None).collect();
+    for (&expert_idx, (shard, meta)) in experts {
+        let nbytes = meta.file_end.saturating_sub(meta.file_start) as usize;
+        let bytes = datas[*shard].fetch_range(meta.file_start, nbytes).await?;
+        let w = decode_tensor_to_f32(dtype, &bytes, n_elements);
+        let w_proj = crate::cka::project_rows(&w, d_out, d_in, &r, k);
+        let self_sq = crate::cka::at_b_frobenius_sq(&w_proj, &w_proj, d_out, k);
+        if (expert_idx as usize) < projections.len() {
+            projections[expert_idx as usize] = Some((w_proj, self_sq));
+        }
+    }
+
+    // Pairwise CKA over the upper triangle, parallelised. We materialise
+    // pair indices into a flat vec so rayon can chunk over them; each pair
+    // writes its result to two symmetric positions of `matrix` (a single
+    // assignment per cell — disjoint writes, no synchronization needed).
+    //
+    // Use `par_iter` with an indexed output Vec held inside an UnsafeCell-
+    // like wrapper? Simpler: compute into a `Vec<(i, j, score)>` then
+    // materialise the heatmap in a second pass.
+    let n = n_experts as usize;
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(n * (n + 1) / 2);
+    for i in 0..n {
+        for j in i..n {
+            pairs.push((i, j));
+        }
+    }
+    let scores: Vec<f32> = pairs
+        .par_iter()
+        .map(|&(i, j)| {
+            let a = projections[i].as_ref();
+            let b = projections[j].as_ref();
+            match (a, b) {
+                (Some((ap, asq)), Some((bp, bsq))) => {
+                    crate::cka::linear_cka(ap, bp, d_out, k, *asq, *bsq)
+                }
+                _ => 0.0,
+            }
+        })
+        .collect();
+
+    let mut matrix = vec![0u8; n * n];
+    for (idx, &(i, j)) in pairs.iter().enumerate() {
+        // CKA already in [0, 1]; scale into 0..=255.
+        let v = (scores[idx].clamp(0.0, 1.0) * 255.0) as u8;
+        matrix[i * n + j] = v;
+        matrix[j * n + i] = v;
+    }
+    Ok(matrix)
 }
 
 /// Build per-tensor diff Sources from two single .safetensors files.

@@ -979,6 +979,175 @@ impl ArchLayout {
             sorted_idx,
         })
     }
+
+    /// Build the per-`(layer, weight)` CKA-similarity canvas. Each panel
+    /// is one synthetic U8 tensor of shape `(n_experts, n_experts)`
+    /// rendered at `MOE_CKA_CELL_PX` pixels per cell. Panels are arranged
+    /// in a `n_layers × 3` grid: rows ascending by layer index, columns
+    /// gate_proj | up_proj | down_proj.
+    ///
+    /// Triggered by [`crate::layout::select_layout`] when any source
+    /// carries a `MoeCkaPanel` tag (set by
+    /// [`crate::data::prepare_moe_cka_sources`]). Returns `None` if no
+    /// source carries the tag.
+    pub fn try_build_moe_cka(
+        sources: &[Source],
+        cumulative_offsets: &[u64],
+    ) -> Option<Self> {
+        use crate::format::moe::ExpertWeight as EW;
+
+        // Collect (layer, weight, source_idx, &TensorMeta, base_off, n_experts).
+        let mut panels: Vec<(u32, EW, usize, &TensorMeta, u64, u32)> = Vec::new();
+        for (sidx, s) in sources.iter().enumerate() {
+            let Some(tag) = s.extensions.get::<crate::data::MoeCkaPanel>().copied() else {
+                continue;
+            };
+            let Some(st) = s.extensions.get::<crate::format::ModelInfo>() else {
+                continue;
+            };
+            let Some(t) = st.tensors.first() else {
+                continue;
+            };
+            let off = cumulative_offsets.get(sidx).copied().unwrap_or(0);
+            panels.push((tag.layer, tag.weight, sidx, t, off, tag.n_experts));
+        }
+        if panels.is_empty() {
+            return None;
+        }
+
+        // Inferred grid dims: layers (ascending) × weights ordered by the
+        // enum's natural ordering (gate / up / down — Router never reaches
+        // this layout, the CKA prep skips it).
+        let layer_ids: Vec<u32> = {
+            let set: std::collections::BTreeSet<u32> =
+                panels.iter().map(|(l, _, _, _, _, _)| *l).collect();
+            set.into_iter().collect()
+        };
+        let weight_ids: Vec<EW> = {
+            let set: std::collections::BTreeSet<EW> =
+                panels.iter().map(|(_, w, _, _, _, _)| *w).collect();
+            set.into_iter().collect()
+        };
+        let n_layers = layer_ids.len() as u32;
+        let n_weights = weight_ids.len() as u32;
+        if n_layers == 0 || n_weights == 0 {
+            return None;
+        }
+
+        // All panels must share `n_experts` — derived from the same
+        // grouping in source prep.
+        let n_experts = panels[0].5;
+        if panels.iter().any(|p| p.5 != n_experts) {
+            log::warn!(
+                "moe-cka layout: panels disagree on n_experts; refusing to lay out",
+            );
+            return None;
+        }
+        if n_experts == 0 {
+            return None;
+        }
+
+        // Lookup: (layer, weight) → panel index.
+        let panel_at: std::collections::BTreeMap<(u32, EW), usize> = panels
+            .iter()
+            .enumerate()
+            .map(|(i, (l, w, _, _, _, _))| ((*l, *w), i))
+            .collect();
+        let layer_row: std::collections::BTreeMap<u32, usize> = layer_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (l, i))
+            .collect();
+        let weight_col: std::collections::BTreeMap<EW, usize> = weight_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| (w, i))
+            .collect();
+
+        let cell_px = MOE_CKA_CELL_PX;
+        let panel_side = n_experts.saturating_mul(cell_px);
+        let canvas_w_raw = n_weights
+            .saturating_mul(panel_side)
+            .saturating_add(n_weights.saturating_sub(1).saturating_mul(MOE_CKA_PANEL_PAD));
+        let canvas_h_raw = n_layers
+            .saturating_mul(panel_side)
+            .saturating_add(n_layers.saturating_sub(1).saturating_mul(MOE_CKA_PANEL_PAD));
+
+        let mut tensors: Vec<PlacedTensor> = Vec::new();
+        for layer in &layer_ids {
+            for weight in &weight_ids {
+                let Some(&pidx) = panel_at.get(&(*layer, *weight)) else {
+                    continue;
+                };
+                let (_, _, sidx, t, base_off, _) = &panels[pidx];
+                let row = layer_row[layer];
+                let col = weight_col[weight];
+                let canvas_x = (col as u32) * (panel_side + MOE_CKA_PANEL_PAD);
+                let canvas_y = (row as u32) * (panel_side + MOE_CKA_PANEL_PAD);
+                tensors.push(PlacedTensor {
+                    source_idx: *sidx,
+                    tensor_id: tensors.len(),
+                    name: t.name.clone(),
+                    dtype: t.dtype,
+                    tensor_byte_start: base_off + t.file_start,
+                    tensor_rows: n_experts as u64,
+                    tensor_cols: n_experts as u64,
+                    disp_w: panel_side,
+                    disp_h: panel_side,
+                    scale: cell_px as f32,
+                    canvas_x,
+                    canvas_y,
+                    hue: name_hue(weight.label()),
+                    layer_idx: Some(*layer),
+                });
+            }
+        }
+        if tensors.is_empty() {
+            return None;
+        }
+
+        let raw_canvas_w = align_up(canvas_w_raw.max(1), TILE);
+        let raw_canvas_h = align_up(canvas_h_raw.max(1), TILE);
+        let raw_width_tiles = (raw_canvas_w / TILE).max(1);
+        let raw_height_tiles = (raw_canvas_h / TILE).max(1);
+        let width_tiles = next_pow2(raw_width_tiles);
+        let height_tiles = next_pow2(raw_height_tiles);
+        let canvas_w = width_tiles * TILE;
+        let canvas_h = height_tiles * TILE;
+        let max_zoom = (width_tiles.min(height_tiles).max(1) as f64).log2().round() as u32;
+        let detail_depth = 0u32;
+
+        let mut sorted_idx: Vec<usize> = (0..tensors.len()).collect();
+        sorted_idx.sort_by_key(|&i| {
+            let t = &tensors[i];
+            (t.canvas_y, t.canvas_x)
+        });
+
+        log::info!(
+            "moe-cka layout: {} layer(s) × {} weight(s) = {} panel(s); {n_experts}×{n_experts} per panel @ {cell_px}px/cell; \
+             canvas {canvas_w}×{canvas_h} ({width_tiles} × {height_tiles} tiles, max_zoom={max_zoom})",
+            n_layers, n_weights, tensors.len(),
+        );
+
+        Some(Self {
+            width: canvas_w,
+            height: canvas_h,
+            content_w: canvas_w_raw.max(1),
+            content_h: canvas_h_raw.max(1),
+            width_tiles,
+            height_tiles,
+            total_tiles: width_tiles as u64 * height_tiles as u64,
+            max_zoom,
+            detail_depth,
+            tensors,
+            layer_bounds: Vec::new(),
+            architecture: format!(
+                "MoE CKA similarity ({} layer(s) × {} weight(s), {n_experts}×{n_experts} per panel)",
+                n_layers, n_weights,
+            ),
+            sorted_idx,
+        })
+    }
 }
 
 /// Display pixels per scalar cell in the MoE-summary heatmaps. Big enough
@@ -991,6 +1160,17 @@ const MOE_SUMMARY_CELL_PX: u32 = 16;
 /// layout. Matches `MOE_CELL_PAD` for visual consistency with the diff
 /// layout's outer gutters.
 const MOE_SUMMARY_PANEL_PAD: u32 = 16;
+
+/// Display pixels per CKA cell in the per-`(layer, weight)` similarity
+/// heatmaps. Smaller than `MOE_SUMMARY_CELL_PX` because CKA panels are
+/// `n_experts × n_experts` — a 60-expert model with 16 px/cell would be
+/// 960 px on a side per panel, and we stack 24 layers × 3 weights = 72
+/// of those. At 8 px/cell each panel is 480 px on a side; the full grid
+/// fits in ~5800 × 11600 px, which is large but tractable.
+const MOE_CKA_CELL_PX: u32 = 8;
+/// Gutter between adjacent CKA panels (both horizontally between weights
+/// and vertically between layers).
+const MOE_CKA_PANEL_PAD: u32 = 12;
 
 /// Target longest-axis size, in overview pixels, for a single per-weight
 /// tensor inside an MoE-diff cell. The layout stacks every layer × 3 weights
@@ -2074,5 +2254,97 @@ mod tests {
         // Inconsistent panel dimensions: refuse rather than render a
         // jagged canvas. (Function logs a warning and returns None.)
         assert!(ArchLayout::try_build_moe_summary(&sources, &cumulative).is_none());
+    }
+
+    /// Build a synthetic CKA-panel `Source`: one U8 tensor of shape
+    /// `[n_experts, n_experts]` plus a `MoeCkaPanel` extension. Used by
+    /// the CKA layout tests below.
+    fn synthetic_cka_source(
+        layer: u32,
+        weight: crate::format::moe::ExpertWeight,
+        n_experts: u32,
+    ) -> Source {
+        use crate::data::MoeCkaPanel;
+        let nbytes = (n_experts as u64) * (n_experts as u64);
+        let t = TensorMeta {
+            name: format!("moe-cka::L{layer}::{}", weight.label()),
+            dtype: Dtype::U8,
+            shape: vec![n_experts as u64, n_experts as u64],
+            file_start: 0,
+            file_end: nbytes,
+            packed_sidecars: None,
+        };
+        let mut extensions = Extensions::default();
+        extensions.insert(crate::format::ModelInfo {
+            format: crate::format::SourceFormat::Safetensors,
+            tensors: vec![t],
+            color_ranges: Vec::new(),
+        });
+        extensions.insert(MoeCkaPanel {
+            layer,
+            weight,
+            n_experts,
+        });
+        Source {
+            file_idx: 0,
+            kind: SourceKind::Buffered(vec![0u8; nbytes as usize]),
+            byte_size: nbytes,
+            name_override: None,
+            xet_terms: None,
+            extensions,
+        }
+    }
+
+    #[test]
+    fn moe_cka_layout_places_grid_layers_by_weights() {
+        use crate::format::moe::ExpertWeight as EW;
+        let n_layers = 4u32;
+        let n_experts = 8u32;
+        // 4 layers × 3 weights = 12 panels.
+        let mut sources = Vec::new();
+        for l in 0..n_layers {
+            for w in [EW::GateProj, EW::UpProj, EW::DownProj] {
+                sources.push(synthetic_cka_source(l, w, n_experts));
+            }
+        }
+        let cumulative = vec![0u64; sources.len()];
+        let layout = ArchLayout::try_build_moe_cka(&sources, &cumulative)
+            .expect("moe-cka layout built");
+        assert_eq!(layout.tensors.len(), 12);
+
+        let panel_side = n_experts * MOE_CKA_CELL_PX;
+        // First panel (layer 0, gate) at (0, 0).
+        // Down-proj of layer 3 at (col=2, row=3).
+        let last = layout.tensors.iter().find(|t| t.name == "moe-cka::L3::down_proj").unwrap();
+        assert_eq!(last.canvas_x, 2 * (panel_side + MOE_CKA_PANEL_PAD));
+        assert_eq!(last.canvas_y, 3 * (panel_side + MOE_CKA_PANEL_PAD));
+        assert_eq!(last.disp_w, panel_side);
+        assert_eq!(last.disp_h, panel_side);
+        assert_eq!(last.tensor_rows, n_experts as u64);
+        assert_eq!(last.tensor_cols, n_experts as u64);
+
+        // Content extent reflects 3 wide × 4 tall panels with gutters.
+        let expected_w = 3 * panel_side + 2 * MOE_CKA_PANEL_PAD;
+        let expected_h = 4 * panel_side + 3 * MOE_CKA_PANEL_PAD;
+        assert_eq!(layout.content_w, expected_w);
+        assert_eq!(layout.content_h, expected_h);
+    }
+
+    #[test]
+    fn moe_cka_layout_rejects_mismatched_n_experts() {
+        use crate::format::moe::ExpertWeight as EW;
+        let sources = vec![
+            synthetic_cka_source(0, EW::GateProj, 8),
+            synthetic_cka_source(0, EW::UpProj, 16),
+        ];
+        let cumulative = vec![0u64; sources.len()];
+        assert!(ArchLayout::try_build_moe_cka(&sources, &cumulative).is_none());
+    }
+
+    #[test]
+    fn moe_cka_layout_returns_none_without_any_panel() {
+        let sources = vec![synthetic_source(vec![])];
+        let cumulative = vec![0u64];
+        assert!(ArchLayout::try_build_moe_cka(&sources, &cumulative).is_none());
     }
 }

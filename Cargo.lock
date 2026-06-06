@@ -2305,6 +2305,7 @@ dependencies = [
  "log",
  "memmap2",
  "minifb",
+ "rayon",
  "regex",
  "reqwest",
  "serde",

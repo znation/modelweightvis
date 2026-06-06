@@ -12,14 +12,15 @@ use std::path::{Path, PathBuf};
 
 use arbvis::hf_url::RemoteFileSpec;
 use arbvis::{
-    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeDiffPrep, MoeSummaryPrep,
-    PrepareSourcesExtension, RepoDiffPrep, SingleImageArchHook, Source, SummaryStat,
+    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeCkaPrep, MoeDiffPrep,
+    MoeSummaryPrep, PrepareSourcesExtension, RepoDiffPrep, SingleImageArchHook, Source,
+    SummaryStat,
 };
 use async_trait::async_trait;
 
 use crate::data::{
     build_multi_safetensors_diff_sources, load_meta_for_sources, prepare_diff_sources_from_http,
-    prepare_moe_diff_sources, prepare_moe_summary_sources,
+    prepare_moe_cka_sources, prepare_moe_diff_sources, prepare_moe_summary_sources,
 };
 use crate::format::SourceFormat;
 
@@ -56,6 +57,24 @@ impl MoeSummaryPrep for TensorMoeSummaryPrep {
         stream: bool,
     ) -> anyhow::Result<(Vec<Source>, u64)> {
         prepare_moe_summary_sources(input, stat, stream).await
+    }
+}
+
+/// `--moe-cka <model>` source preparer. Delegates to
+/// [`prepare_moe_cka_sources`], which builds one in-memory U8 CKA-
+/// similarity heatmap per `(layer, weight)` panel plus `MoeCkaPanel`
+/// extension tags that [`crate::MoeCkaLayoutPlugin`] reads back.
+pub struct TensorMoeCkaPrep;
+
+#[async_trait(?Send)]
+impl MoeCkaPrep for TensorMoeCkaPrep {
+    async fn prepare(
+        &self,
+        input: &str,
+        sample: u32,
+        stream: bool,
+    ) -> anyhow::Result<(Vec<Source>, u64)> {
+        prepare_moe_cka_sources(input, sample, stream).await
     }
 }
 
