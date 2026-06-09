@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use arbvis::{DiffMetric, LayoutMode, ModelOpts, SummaryStat};
+use arbvis::{DiffMetric, LayoutMode, ModelOpts, ProbeOpts, ProbeSource, SummaryStat};
 use clap::{Parser, ValueEnum};
 
 /// CLI mirror of [`arbvis::DiffMetric`]. Kept separate from the core type so
@@ -200,6 +200,32 @@ pub struct ModelArgs {
     #[arg(long, value_name = "K", default_value_t = 128, value_parser = clap::value_parser!(u32).range(16..=4096))]
     pub cka_sample: u32,
 
+    /// Run a routing-faithful forward pass on a probe input and add a
+    /// per-`(layer, expert)` routing-frequency heatmap to `--moe-summary`.
+    /// Without `--probe-text` / `--probe-file` / `--probe-url`, uses a
+    /// small bundled default snippet of varied prose / code / dialogue.
+    /// Supported architectures: `Qwen2MoeForCausalLM`, `MixtralForCausalLM`.
+    #[arg(long, requires = "moe_summary")]
+    pub probe: bool,
+
+    /// Override the bundled probe with literal text. Mutually exclusive with
+    /// `--probe-file` and `--probe-url`. Implies `--probe`.
+    #[arg(long, value_name = "TEXT", requires = "moe_summary", conflicts_with_all = ["probe_file", "probe_url"])]
+    pub probe_text: Option<String>,
+
+    /// Override the bundled probe with the contents of a local UTF-8 text
+    /// file. Mutually exclusive with `--probe-text` and `--probe-url`.
+    /// Implies `--probe`.
+    #[arg(long, value_name = "PATH", requires = "moe_summary", conflicts_with_all = ["probe_text", "probe_url"])]
+    pub probe_file: Option<PathBuf>,
+
+    /// Override the bundled probe with text fetched from a URL. Accepts
+    /// plain HTTPS URLs (returns the response body as UTF-8 text) or
+    /// `hf://...` URLs (downloads via the HF Hub). Mutually exclusive with
+    /// `--probe-text` and `--probe-file`. Implies `--probe`.
+    #[arg(long, value_name = "URL", requires = "moe_summary", conflicts_with_all = ["probe_text", "probe_file"])]
+    pub probe_url: Option<String>,
+
     /// Layout strategy for arranging tensors on the canvas.
     ///
     /// `auto` (default): structure-aware layout when every input is
@@ -222,6 +248,25 @@ impl ModelArgs {
     /// Peel the flattened struct into the two halves `arbvis::run` takes:
     /// the byte-only `arbvis::Args` and the tensor-aware `ModelOpts`.
     pub fn split(self) -> (arbvis::Args, ModelOpts) {
+        // The `--probe-*` flags imply `--probe`. The bare `--probe` falls
+        // through to `ProbeSource::Default`.
+        let probe_source = if let Some(text) = self.probe_text {
+            ProbeSource::Text(text)
+        } else if let Some(file) = self.probe_file {
+            ProbeSource::File(file)
+        } else if let Some(url) = self.probe_url {
+            ProbeSource::Url(url)
+        } else {
+            ProbeSource::Default
+        };
+        // `--probe` plus any source override turns it on; without any of
+        // them `probe.enabled = self.probe` (false unless the bare flag was
+        // explicitly passed).
+        let probe_enabled = self.probe
+            || matches!(
+                probe_source,
+                ProbeSource::Text(_) | ProbeSource::File(_) | ProbeSource::Url(_)
+            );
         let opts = ModelOpts {
             moe_diff: self.moe_diff,
             moe_summary: self.moe_summary,
@@ -231,6 +276,10 @@ impl ModelArgs {
             diff_metric: self.diff_metric.into(),
             summary_stat: self.summary_stat.into(),
             cka_sample: self.cka_sample,
+            probe: ProbeOpts {
+                enabled: probe_enabled,
+                source: probe_source,
+            },
             layout_mode: self.layout.into(),
         };
         (self.arbvis, opts)

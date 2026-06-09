@@ -453,6 +453,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-nn"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9317a09d6530b758990ed7f625ac69ff43653bc9ee28b0464644ad1169ada87"
+dependencies = [
+ "candle-core",
+ "half",
+ "libc",
+ "num-traits",
+ "rayon",
+ "safetensors",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2297,6 +2313,7 @@ dependencies = [
  "arbvis",
  "async-trait",
  "candle-core",
+ "candle-nn",
  "clap",
  "futures",
  "half",
@@ -2311,6 +2328,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokenizers",
  "tokio",
  "zip",
 ]

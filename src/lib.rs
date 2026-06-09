@@ -29,6 +29,7 @@ mod format;
 mod format_plugin;
 mod hooks;
 mod layout;
+mod probe;
 mod single_arch;
 mod tiled;
 

@@ -9,7 +9,7 @@ description = "Tensor-format-aware visualization built on arbvis"
 # `rev` when picking up arbvis changes. For local co-development against
 # a sibling arbvis checkout, add a `[patch]` block in `.cargo/config.toml`
 # (gitignored) — see README's "Local arbvis co-development" section.
-arbvis = { git = "https://github.com/znation/arbvis", rev = "80a218d06" }
+arbvis = { git = "https://github.com/znation/arbvis", rev = "eaa1508ef" }
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
@@ -21,6 +21,18 @@ tokio = { version = "1", features = ["full"] }
 # the direct entry lets the new `cka` module use it without a feature
 # flag dance.
 rayon = "1"
+# HF tokenizers — for `--probe`, converts probe text to token IDs via the
+# model's `tokenizer.json` sidecar. Already in `Cargo.lock` transitively;
+# the direct dep lets `src/probe/text.rs` use it.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# `candle-nn` provides the transformer primitives (Embedding, Linear,
+# RmsNorm, rotary helpers) that `src/probe/*` builds the routing-faithful
+# forward pass on top of, without depending on `candle-transformers`'
+# sealed Model structs.
+candle-nn = { version = "0.10", default-features = false }
+# `--probe-url` HTTPS fetching reuses the existing `reqwest` entry below
+# (originally pulled in for HF Hub API calls). The shared dep stays at
+# 0.13 with `["json"]` features.
 
 # Tensor-format parsing + dtype decode. Moved here from arbvis as part of
 # the workspace split: arbvis is byte-only, modelweightvis owns everything

@@ -29,7 +29,8 @@ use crate::format::gguf::{metadata_array_len, metadata_string, metadata_u64};
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelConfig {
-    /// `["LlamaForCausalLM", …]` etc. Used for display only.
+    /// `["LlamaForCausalLM", …]` etc. Used for display only and for
+    /// probe-forward arch dispatch.
     #[serde(default)]
     pub architectures: Vec<String>,
     pub num_hidden_layers: Option<u32>,
@@ -38,6 +39,35 @@ pub struct ModelConfig {
     pub num_key_value_heads: Option<u32>,
     pub intermediate_size: Option<u32>,
     pub vocab_size: Option<u64>,
+    /// === MoE-specific fields (used by `--probe` to instantiate the routing-
+    /// faithful forward pass). Not every architecture spells these the
+    /// same way — Mixtral uses `num_local_experts`, Qwen2-MoE uses
+    /// `num_experts`; serde picks up either. The other knobs are common.
+    pub head_dim: Option<u32>,
+    pub rms_norm_eps: Option<f64>,
+    pub rope_theta: Option<f64>,
+    pub sliding_window: Option<u32>,
+    pub max_position_embeddings: Option<u32>,
+    pub num_experts_per_tok: Option<u32>,
+    /// Qwen2-MoE name.
+    pub num_experts: Option<u32>,
+    /// Mixtral name (semantically identical to `num_experts`).
+    pub num_local_experts: Option<u32>,
+    /// Qwen2-MoE FFN intermediate dim per routed expert. Distinct from
+    /// `intermediate_size`, which is the shared-expert dim on Qwen.
+    pub moe_intermediate_size: Option<u32>,
+    /// Qwen2-MoE shared-expert FFN intermediate dim (the "always-on"
+    /// expert that runs in parallel with the routed top-k).
+    pub shared_expert_intermediate_size: Option<u32>,
+}
+
+impl ModelConfig {
+    /// Number of routed experts, taking the architecture-specific naming
+    /// into account (`num_experts` for Qwen2-MoE, `num_local_experts` for
+    /// Mixtral). Returns `None` if neither field is set.
+    pub fn n_experts(&self) -> Option<u32> {
+        self.num_experts.or(self.num_local_experts)
+    }
 }
 
 impl ModelConfig {
@@ -110,6 +140,19 @@ impl ModelConfig {
             num_key_value_heads,
             intermediate_size,
             vocab_size,
+            // GGUF metadata doesn't carry the MoE / probe-forward extras
+            // — these are populated only when a real HF `config.json`
+            // is loaded. None is the inert default.
+            head_dim: None,
+            rms_norm_eps: None,
+            rope_theta: None,
+            sliding_window: None,
+            max_position_embeddings: None,
+            num_experts_per_tok: None,
+            num_experts: None,
+            num_local_experts: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
         }
     }
 }

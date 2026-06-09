@@ -1,0 +1,36 @@
+The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. How vexingly quick daft zebras jump! Sphinx of black quartz, judge my vow. The five boxing wizards jump quickly.
+
+In the beginning was the Word, and the Word was with God, and the Word was God. He was in the beginning with God. All things came into being through him, and without him not one thing came into being.
+
+def fibonacci(n: int) -> int:
+    """Return the n-th Fibonacci number."""
+    if n < 2:
+        return n
+    a, b = 0, 1
+    for _ in range(n - 1):
+        a, b = b, a + b
+    return b
+
+print(fibonacci(10))
+
+The Schrödinger equation describes how the quantum state of a physical system changes with time. For a non-relativistic particle, the time-dependent equation is i*ħ ∂Ψ/∂t = Ĥ Ψ, where Ĥ is the Hamiltonian operator and Ψ is the wave function.
+
+"Where are you going?" she asked. He paused at the threshold, considering. "I don't know yet," he said, "but I'll know when I get there." She laughed, soft and unsurprised. "You always say that."
+
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_id = "Qwen/Qwen2.5-7B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+
+To prove that √2 is irrational, suppose for contradiction that √2 = p/q in lowest terms. Then 2q² = p², so p² is even, hence p is even. Write p = 2k. Then 2q² = 4k², so q² = 2k², which means q is also even — contradicting "lowest terms."
+
+東京の朝は早い。人々は急いで地下鉄の駅に向かう。コーヒーの香りが街角に漂う。
+
+Le café était vide à cette heure-ci. Elle commanda un espresso et ouvrit son carnet. Dehors, la pluie tombait doucement sur les pavés.
+
+Climate forcing from CO2 doubles the equilibrium temperature response when feedbacks from water vapor and ice-albedo are included. The transient climate response, however, is constrained by ocean heat uptake.
+
+Q: How many cores does a typical M-series Mac have? A: It depends on the model — the base M1 had 8 cores, with 4 performance and 4 efficiency. Later chips like the M2 Pro added more performance cores.
