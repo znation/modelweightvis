@@ -280,6 +280,39 @@ pub struct MoeCkaPanel {
     pub n_experts: u32,
 }
 
+/// Which behavioral stat a `MoeProbePanel` carries. Drives the panel's
+/// label and (later) colormap choices in the layout. For Phase 3 we
+/// only ship `RoutingFreq`; the enum variant keeps the door open for
+/// `RoutingWeightMean`, `ExpertOutputNorm`, etc. in follow-ups without
+/// re-shuffling the extension type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeStat {
+    /// Fraction of probe tokens routed to this expert by the router's
+    /// top-k decision in this layer. Range: `[0, k / n_experts]` in
+    /// expectation under uniform routing; real MoEs concentrate.
+    RoutingFreq,
+}
+
+impl ProbeStat {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProbeStat::RoutingFreq => "routing_freq",
+        }
+    }
+}
+
+/// Per-panel tag attached to each `--moe-summary --probe` behavioral
+/// source. One source per `ProbeStat`; the source's bytes are an
+/// `n_layers × n_experts` U8 heatmap of the stat (per-panel
+/// normalised to `0..=255`). The layout plugin merges these panels
+/// alongside the static `MoeSummaryPanel` columns.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeProbePanel {
+    pub stat: ProbeStat,
+    pub n_layers: u32,
+    pub n_experts: u32,
+}
+
 // === extracted from arbvis::data (load_model_info,fetch_model_header) ===
 /// Read just the header of a recognised model file and return parsed
 /// metadata. Dispatches on `format`.
@@ -1905,6 +1938,7 @@ pub async fn prepare_moe_summary_sources(
     input: &str,
     stat: format::SummaryStat,
     stream: bool,
+    probe: &arbvis::ProbeOpts,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     // === File opening — identical to prepare_moe_diff_sources ============
     let (datas, fmts, file_names) = if hf_url::is_repo_level(input)? {
@@ -2360,6 +2394,30 @@ pub async fn prepare_moe_summary_sources(
         total_bytes += nbytes;
     }
 
+    // === Optional probe forward pass =====================================
+    // When `--probe` is set, run a routing-faithful forward on the
+    // resolved probe text and emit one extra Source per ProbeStat
+    // tagged with `MoeProbePanel`. The layout merges these alongside
+    // the static panels.
+    if probe.enabled {
+        match attach_probe_panel(input, probe, n_layers, n_experts).await {
+            Ok(Some(source)) => {
+                total_bytes += source.byte_size;
+                sources.push(source);
+            }
+            Ok(None) => {
+                log::warn!(
+                    "moe-summary: --probe requested but no panel produced (unsupported arch?)"
+                );
+            }
+            Err(e) => {
+                // Probe failures are non-fatal: log and skip the panel
+                // so the static summary still renders.
+                log::warn!("moe-summary: --probe forward failed ({e:#}); skipping probe panel");
+            }
+        }
+    }
+
     log::info!(
         "moe-summary: {} layer(s) × {} expert(s), {} panel(s) emitted, {} total byte(s); stat = {:?}",
         n_layers,
@@ -2370,6 +2428,142 @@ pub async fn prepare_moe_summary_sources(
     );
 
     Ok((sources, total_bytes))
+}
+
+/// Resolve the probe input, run the routing-faithful forward, and
+/// package the resulting routing-frequency capture as one `Source`
+/// tagged with `MoeProbePanel`. Returns `Ok(None)` only when the
+/// model's architecture isn't supported by the probe (and we want
+/// the caller to log a warning rather than fail).
+async fn attach_probe_panel(
+    input: &str,
+    probe: &arbvis::ProbeOpts,
+    n_layers: u32,
+    n_experts: u32,
+) -> anyhow::Result<Option<Source>> {
+    // Currently only local-directory inputs are supported for the probe:
+    // we need tokenizer.json + per-shard paths to hand to candle's
+    // VarBuilder. hf:// inputs go via the HF cache, but threading those
+    // cache paths through the prep function is left for a follow-up —
+    // surface a clear error.
+    if hf_url::is_repo_level(input)? {
+        anyhow::bail!(
+            "--probe: hf:// repo inputs not yet supported; resolve to a local dir first \
+             (`hf download …`) and pass that path."
+        );
+    }
+    let model_dir = hf_url::resolve(Path::new(input))
+        .await
+        .with_context(|| format!("--probe: resolving {input}"))?;
+    if !model_dir.is_dir() {
+        anyhow::bail!(
+            "--probe: input {input} resolved to {} (expected a directory containing \
+             tokenizer.json + safetensors shards)",
+            model_dir.display(),
+        );
+    }
+
+    // Architecture detection from config.json. Skip probe with a None
+    // (caller logs) if the arch isn't supported.
+    let config = crate::layout::model_config::ModelConfig::try_from_dir(&model_dir)
+        .ok_or_else(|| anyhow::anyhow!("--probe: missing or unparseable config.json in {}", model_dir.display()))?;
+    let Some(arch) = crate::probe::detect_arch(&config) else {
+        log::warn!(
+            "--probe: architecture {:?} not supported (need Qwen2MoeForCausalLM or MixtralForCausalLM)",
+            config.architectures,
+        );
+        return Ok(None);
+    };
+
+    // List safetensors shards in `model_dir`. Sorted for deterministic
+    // VarBuilder loading order.
+    let mut weight_paths: Vec<PathBuf> = collect_files_recursive(&model_dir)
+        .into_iter()
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors"))
+        .collect();
+    weight_paths.sort();
+    if weight_paths.is_empty() {
+        anyhow::bail!(
+            "--probe: no .safetensors shards in {}",
+            model_dir.display(),
+        );
+    }
+
+    // Resolve probe text.
+    let probe_text = crate::probe::text::resolve(&probe.source).await?;
+    if probe_text.trim().is_empty() {
+        anyhow::bail!("--probe: resolved probe text is empty");
+    }
+
+    // Forward pass. May take a couple of minutes on a real-sized MoE.
+    let capture = tokio::task::spawn_blocking({
+        let model_dir = model_dir.clone();
+        let weight_paths = weight_paths.clone();
+        let config = config.clone();
+        let probe_text = probe_text.clone();
+        move || crate::probe::run(arch, &model_dir, &weight_paths, &config, &probe_text)
+    })
+    .await
+    .with_context(|| "--probe: forward pass panicked")??;
+
+    // Normalize freq to U8 per-panel (same convention as the static
+    // summary panels): max → 255, 0 → 0.
+    let max = capture.freq.iter().copied().fold(0.0_f32, f32::max).max(1e-12);
+    let bytes_u8: Vec<u8> = capture
+        .freq
+        .iter()
+        .map(|&v| ((v / max).clamp(0.0, 1.0) * 255.0) as u8)
+        .collect();
+    let nbytes = bytes_u8.len() as u64;
+    log::info!(
+        "--probe: routing-frequency capture from {} tokens ({} layers × {} experts), \
+         max_freq = {max:.3}",
+        capture.n_tokens,
+        capture.n_layers,
+        capture.n_experts,
+    );
+
+    // Refuse to attach if dimensions don't match the static summary
+    // panels — would mis-render the heatmap.
+    if capture.n_layers != n_layers || capture.n_experts != n_experts {
+        anyhow::bail!(
+            "--probe: capture dims ({}×{}) differ from summary dims ({}×{}); refusing to attach",
+            capture.n_layers, capture.n_experts, n_layers, n_experts,
+        );
+    }
+
+    let synthetic = format::TensorMeta {
+        name: format!("moe-summary::probe::{}", ProbeStat::RoutingFreq.label()),
+        dtype: format::Dtype::U8,
+        shape: vec![n_layers as u64, n_experts as u64],
+        file_start: 0,
+        file_end: nbytes,
+        packed_sidecars: None,
+    };
+    let label = format!(
+        "MoE probe · routing_freq ({} layers × {} experts, {} tokens)",
+        n_layers, n_experts, capture.n_tokens,
+    );
+    let mut extensions = Extensions::default();
+    extensions.insert(ModelInfo {
+        format: SourceFormat::Safetensors,
+        tensors: vec![synthetic],
+        color_ranges: Vec::new(),
+    });
+    extensions.insert(MoeProbePanel {
+        stat: ProbeStat::RoutingFreq,
+        n_layers,
+        n_experts,
+    });
+    Ok(Some(Source {
+        // file_idx is overwritten by the caller before push.
+        file_idx: 0,
+        kind: SourceKind::Buffered(bytes_u8),
+        byte_size: nbytes,
+        name_override: Some(label),
+        xet_terms: None,
+        extensions,
+    }))
 }
 
 /// Dispatch a [`format::SummaryStat`] over a contiguous tensor byte slice.

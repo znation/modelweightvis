@@ -847,16 +847,20 @@ impl ArchLayout {
     ) -> Option<Self> {
         use crate::format::moe::ExpertWeight as EW;
 
-        // Collect (weight, source_idx, &TensorMeta, base_off, n_layers, n_experts)
-        // for every source carrying a MoeSummaryPanel. Sources are emitted in
-        // a stable order by `prepare_moe_summary_sources` (gate, up, down,
-        // router) and each has exactly one synthetic tensor of shape
+        // Collect (panel_kind, source_idx, &TensorMeta, base_off, n_layers, n_experts, hue_key)
+        // for every source carrying a MoeSummaryPanel OR a MoeProbePanel.
+        // Static (gate/up/down/router) panels come first in stable enum
+        // order; probe panels (routing_freq, etc.) come after as additional
+        // columns. Each source has exactly one synthetic tensor of shape
         // [n_layers, n_experts] U8.
-        let mut panels: Vec<(EW, usize, &TensorMeta, u64, u32, u32)> = Vec::new();
+        //
+        // `kind = (rank: u8, label_for_hue: &'static str)` — `rank` sorts
+        // static panels (rank 0) before probe panels (rank 1); within each
+        // rank, secondary keys keep the order stable (gate < up < down <
+        // router for static; for now there's only one probe panel).
+        type PanelKey<'a> = (u8, u8, &'a str);
+        let mut panels: Vec<(PanelKey, usize, &TensorMeta, u64, u32, u32)> = Vec::new();
         for (sidx, s) in sources.iter().enumerate() {
-            let Some(tag) = s.extensions.get::<crate::data::MoeSummaryPanel>().copied() else {
-                continue;
-            };
             let Some(st) = s.extensions.get::<crate::format::ModelInfo>() else {
                 continue;
             };
@@ -864,16 +868,42 @@ impl ArchLayout {
                 continue;
             };
             let off = cumulative_offsets.get(sidx).copied().unwrap_or(0);
-            panels.push((tag.weight, sidx, t, off, tag.n_layers, tag.n_experts));
+            if let Some(tag) = s.extensions.get::<crate::data::MoeSummaryPanel>().copied() {
+                let secondary = match tag.weight {
+                    EW::GateProj => 0,
+                    EW::UpProj => 1,
+                    EW::DownProj => 2,
+                    EW::Router => 3,
+                };
+                panels.push((
+                    (0, secondary, tag.weight.label()),
+                    sidx,
+                    t,
+                    off,
+                    tag.n_layers,
+                    tag.n_experts,
+                ));
+            } else if let Some(tag) = s.extensions.get::<crate::data::MoeProbePanel>().copied() {
+                let (secondary, label) = match tag.stat {
+                    crate::data::ProbeStat::RoutingFreq => (0, "routing_freq"),
+                };
+                panels.push((
+                    (1, secondary, label),
+                    sidx,
+                    t,
+                    off,
+                    tag.n_layers,
+                    tag.n_experts,
+                ));
+            }
         }
         if panels.is_empty() {
             return None;
         }
 
-        // Sort panels into a stable display order: gate, up, down, router.
-        // The variant order in `ExpertWeight` already gives this — `Router`
-        // is the last variant — so we sort by the enum's natural ordering.
-        panels.sort_by_key(|(w, _, _, _, _, _)| *w);
+        // Sort by (rank, secondary): static gate/up/down/router first, then
+        // probe panels in their own stable order.
+        panels.sort_by_key(|p| p.0);
 
         // All panels must share `n_layers` and `n_experts` (they're derived
         // from the same expert grouping in source prep). If they differ,
@@ -902,8 +932,11 @@ impl ArchLayout {
 
         // Place one PlacedTensor per panel, left-to-right.
         let mut tensors: Vec<PlacedTensor> = Vec::new();
-        for (idx, (weight, sidx, t, base_off, _, _)) in panels.iter().enumerate() {
+        for (idx, (key, sidx, t, base_off, _, _)) in panels.iter().enumerate() {
             let panel_x = (idx as u32) * (panel_w + MOE_SUMMARY_PANEL_PAD);
+            // `key.2` is a stable label string per panel — gate_proj /
+            // up_proj / down_proj / router for static, routing_freq for
+            // probe. Drives the entity hue.
             tensors.push(PlacedTensor {
                 source_idx: *sidx,
                 tensor_id: idx,
@@ -917,7 +950,7 @@ impl ArchLayout {
                 scale,
                 canvas_x: panel_x,
                 canvas_y: 0,
-                hue: name_hue(weight.label()),
+                hue: name_hue(key.2),
                 layer_idx: None,
             });
         }

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use arbvis::hf_url::RemoteFileSpec;
 use arbvis::{
     DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeCkaPrep, MoeDiffPrep,
-    MoeSummaryPrep, PrepareSourcesExtension, RepoDiffPrep, SingleImageArchHook, Source,
+    MoeSummaryPrep, PrepareSourcesExtension, ProbeOpts, RepoDiffPrep, SingleImageArchHook, Source,
     SummaryStat,
 };
 use async_trait::async_trait;
@@ -55,8 +55,9 @@ impl MoeSummaryPrep for TensorMoeSummaryPrep {
         input: &str,
         stat: SummaryStat,
         stream: bool,
+        probe: &ProbeOpts,
     ) -> anyhow::Result<(Vec<Source>, u64)> {
-        prepare_moe_summary_sources(input, stat, stream).await
+        prepare_moe_summary_sources(input, stat, stream, probe).await
     }
 }
 

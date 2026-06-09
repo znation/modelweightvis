@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod common;
+pub mod qwen2_moe;
 pub mod text;
 
 use crate::layout::model_config::ModelConfig;
@@ -125,12 +126,7 @@ pub fn run(
     );
 
     match arch {
-        Arch::Qwen2Moe => {
-            // Will be implemented in src/probe/qwen2_moe.rs.
-            anyhow::bail!(
-                "probe: Qwen2-MoE forward not yet wired (Phase 3 implementation in progress)"
-            )
-        }
+        Arch::Qwen2Moe => qwen2_moe::run(config, weight_paths, model_dir, &token_ids),
         Arch::Mixtral => {
             anyhow::bail!(
                 "probe: Mixtral forward not yet wired (Phase 3 implementation in progress)"
