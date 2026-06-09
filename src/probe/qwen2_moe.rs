@@ -137,29 +137,38 @@ pub fn run(
 
     // candle-nn VarBuilder over the model shards. The model was saved
     // in bf16, but candle's CPU matmul doesn't accept bf16 operands so
-    // we load as f32. Memory hit is real (~2× the on-disk size — for
-    // Qwen1.5-MoE-A2.7B that's ~28 GB in working set) but tractable on
-    // 32 GB machines; the alternative (cast-on-use per matmul) duplicates
-    // activation buffers per layer and isn't actually cheaper in practice.
+    // we load as f32. Naively materialising all layers up front blows
+    // past the memory budget (~50 GB of routed-expert weights alone on
+    // Qwen1.5-MoE-A2.7B in f32). Instead, we load one layer at a time
+    // inside the forward loop — peak working set is bounded by a single
+    // layer's f32 weights (~2 GB) plus the embedding table and activations.
     let dtype = DType::F32;
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(weight_paths, dtype, &device)
             .context("Qwen2-MoE: opening safetensors shards via VarBuilder")?
     };
 
-    let model = Model::load(&vb, &cfg)?;
+    let embed_tokens = candle_nn::embedding(
+        cfg.vocab_size,
+        cfg.hidden_size,
+        vb.pp("model.embed_tokens"),
+    )?;
     let rope = RotaryEmbedding::new(cfg.head_dim, cfg.max_pos, cfg.rope_theta, &device)?;
 
-    let mut hidden = model.embed_tokens.forward(&input_ids)?;
+    let mut hidden = embed_tokens.forward(&input_ids)?;
 
     // Per-layer routing-decision counts. `counts[layer * n_experts + expert]`
     // increments each time `expert` appears in top-k for any token in that
     // layer. Divide by `n_tokens` at the end for frequencies.
     let mut counts = vec![0u32; cfg.n_layers * cfg.n_experts];
 
+    let layers_vb = vb.pp("model.layers");
     let pb = indicatif::ProgressBar::new(cfg.n_layers as u64);
     pb.set_message("probe: layer forward");
-    for (layer_idx, layer) in model.layers.iter().enumerate() {
+    for layer_idx in 0..cfg.n_layers {
+        // Materialise this layer's weights on entry; they drop at the end
+        // of the iteration so the next layer doesn't pile on top.
+        let layer = Layer::load(&layers_vb.pp(layer_idx), &cfg)?;
         // --- Attention ----------------------------------------------------
         let residual = hidden.clone();
         let x = rms_norm(&hidden, &layer.input_layernorm, cfg.rms_norm_eps)?;
@@ -377,30 +386,6 @@ impl Layer {
             experts,
             shared_expert,
             shared_expert_gate,
-        })
-    }
-}
-
-struct Model {
-    embed_tokens: candle_nn::Embedding,
-    layers: Vec<Layer>,
-}
-
-impl Model {
-    fn load(vb: &VarBuilder, cfg: &Cfg) -> anyhow::Result<Self> {
-        let embed_tokens = candle_nn::embedding(
-            cfg.vocab_size,
-            cfg.hidden_size,
-            vb.pp("model.embed_tokens"),
-        )?;
-        let mut layers = Vec::with_capacity(cfg.n_layers);
-        let layers_vb = vb.pp("model.layers");
-        for layer_idx in 0..cfg.n_layers {
-            layers.push(Layer::load(&layers_vb.pp(layer_idx), cfg)?);
-        }
-        Ok(Self {
-            embed_tokens,
-            layers,
         })
     }
 }
