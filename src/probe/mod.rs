@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod common;
+pub mod mixtral;
 pub mod qwen2_moe;
 pub mod text;
 
@@ -79,21 +80,6 @@ pub struct RoutingCapture {
     pub freq: Vec<f32>,
 }
 
-impl RoutingCapture {
-    /// Empty capture matching the model's MoE dimensions but with all
-    /// zero frequencies. Used as the inert fallback when the probe
-    /// fails non-fatally (e.g. tokenizer.json missing) — caller can
-    /// emit an empty panel rather than aborting the whole render.
-    pub fn empty(n_layers: u32, n_experts: u32) -> Self {
-        Self {
-            n_layers,
-            n_experts,
-            n_tokens: 0,
-            freq: vec![0.0; (n_layers as usize) * (n_experts as usize)],
-        }
-    }
-}
-
 /// Run the routing-faithful forward pass on `probe_text`, returning
 /// per-`(layer, expert)` routing frequency.
 ///
@@ -119,7 +105,8 @@ pub fn run(
         anyhow::bail!("probe: tokenizer produced 0 tokens from the probe input");
     }
     log::info!(
-        "probe: arch={:?}, probe text → {} tokens, {} shard(s)",
+        "probe: arch={} ({:?}), probe text → {} tokens, {} shard(s)",
+        arch.label(),
         arch,
         token_ids.len(),
         weight_paths.len(),
@@ -127,10 +114,6 @@ pub fn run(
 
     match arch {
         Arch::Qwen2Moe => qwen2_moe::run(config, weight_paths, model_dir, &token_ids),
-        Arch::Mixtral => {
-            anyhow::bail!(
-                "probe: Mixtral forward not yet wired (Phase 3 implementation in progress)"
-            )
-        }
+        Arch::Mixtral => mixtral::run(config, weight_paths, model_dir, &token_ids),
     }
 }

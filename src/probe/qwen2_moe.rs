@@ -37,7 +37,10 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::layout::model_config::ModelConfig;
-use crate::probe::common::{causal_sdpa, repeat_kv, rms_norm, RotaryEmbedding};
+use crate::probe::common::{
+    dispatch_experts, renormalize_topk, rms_norm, topk_per_row, GqaAttention, RotaryEmbedding,
+    SwiGluExpert,
+};
 use crate::probe::RoutingCapture;
 
 /// Hyperparameters extracted from `config.json` and frozen per run.
@@ -172,7 +175,7 @@ pub fn run(
         // --- Attention ----------------------------------------------------
         let residual = hidden.clone();
         let x = rms_norm(&hidden, &layer.input_layernorm, cfg.rms_norm_eps)?;
-        let attn_out = layer.self_attn.forward(&x, &rope, &cfg)?;
+        let attn_out = layer.self_attn.forward(&x, &rope)?;
         hidden = (&residual + attn_out)?;
 
         // --- MoE ----------------------------------------------------------
@@ -252,98 +255,13 @@ pub fn run(
 // Per-layer modules
 // ============================================================================
 
-struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-}
-
-impl Attention {
-    fn load(vb: &VarBuilder, cfg: &Cfg) -> anyhow::Result<Self> {
-        let h = cfg.hidden_size;
-        let nh = cfg.n_heads;
-        let nkv = cfg.n_kv_heads;
-        let d = cfg.head_dim;
-        // Qwen has biases on Q/K/V but NOT on O.
-        Ok(Self {
-            q_proj: candle_nn::linear(h, nh * d, vb.pp("q_proj"))?,
-            k_proj: candle_nn::linear(h, nkv * d, vb.pp("k_proj"))?,
-            v_proj: candle_nn::linear(h, nkv * d, vb.pp("v_proj"))?,
-            o_proj: candle_nn::linear_no_bias(nh * d, h, vb.pp("o_proj"))?,
-        })
-    }
-
-    fn forward(
-        &self,
-        x: &Tensor,
-        rope: &RotaryEmbedding,
-        cfg: &Cfg,
-    ) -> anyhow::Result<Tensor> {
-        let (b, s, _h) = x.dims3()?;
-        let q = self.q_proj.forward(x)?; // [B, S, n_heads * head_dim]
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
-        let q = q
-            .reshape((b, s, cfg.n_heads, cfg.head_dim))?
-            .transpose(1, 2)?; // [B, n_heads, S, head_dim]
-        let k = k
-            .reshape((b, s, cfg.n_kv_heads, cfg.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, s, cfg.n_kv_heads, cfg.head_dim))?
-            .transpose(1, 2)?;
-        let q = rope.apply(&q)?;
-        let k = rope.apply(&k)?;
-        let n_rep = cfg.n_heads / cfg.n_kv_heads;
-        let k = repeat_kv(&k, n_rep)?;
-        let v = repeat_kv(&v, n_rep)?;
-        let attn = causal_sdpa(&q, &k, &v)?; // [B, n_heads, S, head_dim]
-        let attn = attn
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, s, cfg.n_heads * cfg.head_dim))?;
-        Ok(self.o_proj.forward(&attn)?)
-    }
-}
-
-/// SwiGLU FFN: `down(silu(gate(x)) * up(x))`. The shape across Qwen2-MoE
-/// experts: routed experts have `intermediate = moe_intermediate_size`;
-/// the shared expert uses `shared_intermediate_size`. The expert struct
-/// itself is shape-agnostic — sizes come from `VarBuilder` weight loads.
-struct SwiGluFfn {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl SwiGluFfn {
-    fn load(vb: &VarBuilder, hidden_size: usize, intermediate: usize) -> anyhow::Result<Self> {
-        Ok(Self {
-            gate_proj: candle_nn::linear_no_bias(hidden_size, intermediate, vb.pp("gate_proj"))?,
-            up_proj: candle_nn::linear_no_bias(hidden_size, intermediate, vb.pp("up_proj"))?,
-            down_proj: candle_nn::linear_no_bias(intermediate, hidden_size, vb.pp("down_proj"))?,
-        })
-    }
-}
-
-impl Module for SwiGluFfn {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        let act = candle_nn::ops::silu(&gate)?;
-        let mlp = (act * up)?;
-        self.down_proj.forward(&mlp)
-    }
-}
-
 struct Layer {
     input_layernorm: Tensor,
-    self_attn: Attention,
+    self_attn: GqaAttention,
     post_attention_layernorm: Tensor,
     gate: Linear,
-    experts: Vec<SwiGluFfn>,
-    shared_expert: SwiGluFfn,
+    experts: Vec<SwiGluExpert>,
+    shared_expert: SwiGluExpert,
     shared_expert_gate: Linear,
 }
 
@@ -355,21 +273,35 @@ impl Layer {
         let post_attention_layernorm = vb
             .pp("post_attention_layernorm")
             .get(cfg.hidden_size, "weight")?;
-        let self_attn = Attention::load(&vb.pp("self_attn"), cfg)?;
+        // Qwen has biases on Q/K/V but not on O.
+        let self_attn = GqaAttention::load(
+            &vb.pp("self_attn"),
+            cfg.hidden_size,
+            cfg.n_heads,
+            cfg.n_kv_heads,
+            cfg.head_dim,
+            /* qkv_bias */ true,
+        )?;
         let mlp_vb = vb.pp("mlp");
         let gate = candle_nn::linear_no_bias(cfg.hidden_size, cfg.n_experts, mlp_vb.pp("gate"))?;
         let mut experts = Vec::with_capacity(cfg.n_experts);
         for e in 0..cfg.n_experts {
-            experts.push(SwiGluFfn::load(
+            experts.push(SwiGluExpert::load(
                 &mlp_vb.pp(format!("experts.{e}")),
                 cfg.hidden_size,
                 cfg.moe_intermediate_size,
+                "gate_proj",
+                "up_proj",
+                "down_proj",
             )?);
         }
-        let shared_expert = SwiGluFfn::load(
+        let shared_expert = SwiGluExpert::load(
             &mlp_vb.pp("shared_expert"),
             cfg.hidden_size,
             cfg.shared_intermediate_size,
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         )?;
         // `shared_expert_gate` is a Linear with output dim 1 — a per-token
         // scalar that gates the shared-expert contribution.
@@ -389,123 +321,3 @@ impl Layer {
         })
     }
 }
-
-// ============================================================================
-// Top-k helpers (CPU-side, on the small router-probability tensor)
-// ============================================================================
-
-/// Pick top-k entries per row of an `[n_rows, n_cols]` row-major matrix.
-/// Returns `(weights, indices)`, each `[n_rows * k]` row-major. `weights`
-/// preserves the original probability values; if the caller wants them
-/// renormalised, they re-divide afterwards.
-fn topk_per_row(
-    probs: &[f32],
-    n_rows: usize,
-    n_cols: usize,
-    k: usize,
-) -> (Vec<f32>, Vec<u32>) {
-    let mut weights = Vec::with_capacity(n_rows * k);
-    let mut indices = Vec::with_capacity(n_rows * k);
-    let mut scratch: Vec<(f32, u32)> = Vec::with_capacity(n_cols);
-    for r in 0..n_rows {
-        let row = &probs[r * n_cols..(r + 1) * n_cols];
-        scratch.clear();
-        for (i, &p) in row.iter().enumerate() {
-            scratch.push((p, i as u32));
-        }
-        // Partial sort: descending by probability. For small n_cols (~60
-        // for Qwen MoE) this is fine without nth-element.
-        scratch.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        for &(p, idx) in scratch.iter().take(k) {
-            weights.push(p);
-            indices.push(idx);
-        }
-    }
-    (weights, indices)
-}
-
-/// In-place: renormalise each row's k weights to sum to 1.
-fn renormalize_topk(weights: &[f32], k: usize) -> Vec<f32> {
-    let mut out = weights.to_vec();
-    for chunk in out.chunks_exact_mut(k) {
-        let s: f32 = chunk.iter().sum();
-        if s > 0.0 {
-            for w in chunk.iter_mut() {
-                *w /= s;
-            }
-        }
-    }
-    out
-}
-
-// ============================================================================
-// Expert dispatch
-// ============================================================================
-
-/// Run each expert's FFN on the tokens that selected it (according to
-/// `topk_indices`), and scatter weighted outputs back into `moe_out`.
-///
-/// Implementation: for each expert E in 0..n_experts, collect the
-/// `(token_idx, weight)` pairs where E appears in any top-k slot,
-/// gather those tokens into a `[N_E, H]` tensor, run the expert FFN,
-/// then scatter the result weighted back.
-///
-/// `x` is `[1, n_tokens, hidden_size]` (we operate on a single probe
-/// batch). `topk_indices` / `topk_weights` are `[n_tokens * top_k]`.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_experts(
-    x: &Tensor,
-    experts: &[SwiGluFfn],
-    topk_indices: &[u32],
-    topk_weights: &[f32],
-    top_k: usize,
-    n_experts: usize,
-    n_tokens: usize,
-    hidden_size: usize,
-    device: &Device,
-    dtype: DType,
-) -> anyhow::Result<Tensor> {
-    let mut moe_out = Tensor::zeros((1, n_tokens, hidden_size), dtype, device)?;
-
-    // Squeeze the batch dim to make gather/scatter simpler.
-    let x_flat = x.reshape((n_tokens, hidden_size))?; // [N, H]
-
-    for e in 0..n_experts {
-        // Find token indices that picked expert e, plus their assigned weights.
-        let mut token_ids: Vec<u32> = Vec::new();
-        let mut token_weights: Vec<f32> = Vec::new();
-        for t in 0..n_tokens {
-            for k_slot in 0..top_k {
-                let idx = topk_indices[t * top_k + k_slot];
-                if idx as usize == e {
-                    token_ids.push(t as u32);
-                    token_weights.push(topk_weights[t * top_k + k_slot]);
-                }
-            }
-        }
-        if token_ids.is_empty() {
-            continue;
-        }
-
-        // Gather x[token_ids, :] → [n_e, H]
-        let n_e = token_ids.len();
-        let ids_t = Tensor::from_vec(token_ids, n_e, device)?;
-        let x_gathered = x_flat.index_select(&ids_t, 0)?; // [n_e, H]
-
-        // Run expert FFN.
-        let expert_out = experts[e].forward(&x_gathered)?; // [n_e, H]
-
-        // Weighted scatter: moe_out[t, :] += w * expert_out[i, :]
-        let weights_t = Tensor::from_vec(token_weights, (n_e, 1), device)?.to_dtype(dtype)?;
-        let weighted = expert_out.broadcast_mul(&weights_t)?; // [n_e, H]
-
-        // candle doesn't ship a scatter-add over rows by index; we do it
-        // via index_add. moe_out has shape [1, N, H]; squeeze, scatter, unsqueeze.
-        let acc = moe_out.squeeze(0)?; // [N, H]
-        let acc = acc.index_add(&ids_t, &weighted, 0)?;
-        moe_out = acc.unsqueeze(0)?;
-    }
-
-    Ok(moe_out)
-}
-
