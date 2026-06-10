@@ -59,23 +59,30 @@ pub struct ExpertRef {
 /// that doesn't match the routed-experts pattern (top-level tensors,
 /// non-MoE layers, shared experts, router gates, biases).
 pub fn parse_hf_expert(name: &str) -> Option<ExpertRef> {
-    // model.layers.{L}.mlp.experts.{E}.{gate|up|down}_proj.weight
+    // model.layers.{L}.mlp.experts.{E}.{gate|up|down}_proj.weight   (Qwen/OLMoE/…)
+    // model.layers.{L}.block_sparse_moe.experts.{E}.{w1|w3|w2}.weight (classic Mixtral)
     let rest = name.strip_prefix("model.layers.")?;
     let (layer_str, rest) = rest.split_once('.')?;
     let layer_idx: u32 = layer_str.parse().ok()?;
 
-    // The MoE block prefix is `mlp.experts.` in the layouts we target
-    // (Mixtral, Qwen3, OLMoE, DeepSeek routed experts). DeepSeek's
-    // `mlp.shared_experts.*` does NOT match — those aren't routed.
-    let rest = rest.strip_prefix("mlp.experts.")?;
+    // The MoE block prefix is `mlp.experts.` for most HF layouts (Qwen3,
+    // OLMoE, DeepSeek routed experts) and `block_sparse_moe.experts.` for the
+    // classic published Mixtral layout. DeepSeek's `mlp.shared_experts.*` does
+    // NOT match — those aren't routed.
+    let rest = match rest.strip_prefix("mlp.experts.") {
+        Some(r) => r,
+        None => rest.strip_prefix("block_sparse_moe.experts.")?,
+    };
 
     let (expert_str, leaf) = rest.split_once('.')?;
     let expert_idx: u32 = expert_str.parse().ok()?;
 
+    // Mixtral names its SwiGLU matrices w1/w3/w2 (gate/up/down); everything
+    // else uses the explicit *_proj names. Map both onto the same slots.
     let weight = match leaf {
-        "gate_proj.weight" => ExpertWeight::GateProj,
-        "up_proj.weight" => ExpertWeight::UpProj,
-        "down_proj.weight" => ExpertWeight::DownProj,
+        "gate_proj.weight" | "w1.weight" => ExpertWeight::GateProj,
+        "up_proj.weight" | "w3.weight" => ExpertWeight::UpProj,
+        "down_proj.weight" | "w2.weight" => ExpertWeight::DownProj,
         _ => return None,
     };
 
@@ -87,19 +94,20 @@ pub fn parse_hf_expert(name: &str) -> Option<ExpertRef> {
 }
 
 /// Parse an HF-style router-gate tensor name. Returns the layer index when
-/// `name` matches `model.layers.{L}.mlp.gate.weight` — the per-layer
-/// MoE router whose rows are per-expert gate vectors. Returns `None` for
-/// anything else (including the per-expert `gate_proj.weight`, which
-/// [`parse_hf_expert`] handles).
+/// `name` matches `model.layers.{L}.mlp.gate.weight` (most HF layouts) or
+/// `model.layers.{L}.block_sparse_moe.gate.weight` (classic Mixtral) — the
+/// per-layer MoE router whose rows are per-expert gate vectors. Returns
+/// `None` for anything else (including the per-expert `gate_proj.weight`,
+/// which [`parse_hf_expert`] handles).
 ///
-/// The router and per-expert tensors don't collide: this fn looks for
-/// `mlp.gate.weight` exactly, while [`parse_hf_expert`] requires
-/// `mlp.experts.{E}.…` (the `experts.` prefix is the discriminator).
+/// The router and per-expert tensors don't collide: this fn looks for the
+/// layer-level `*.gate.weight` exactly, while [`parse_hf_expert`] requires an
+/// `experts.{E}.…` segment (the `experts.` prefix is the discriminator).
 pub fn parse_hf_router(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("model.layers.")?;
     let (layer_str, rest) = rest.split_once('.')?;
     let layer_idx: u32 = layer_str.parse().ok()?;
-    if rest == "mlp.gate.weight" {
+    if rest == "mlp.gate.weight" || rest == "block_sparse_moe.gate.weight" {
         Some(layer_idx)
     } else {
         None
@@ -176,13 +184,45 @@ mod tests {
     }
 
     #[test]
+    fn parses_mixtral_classic_expert() {
+        // Classic published Mixtral: block_sparse_moe.experts.{E}.{w1,w3,w2}.
+        // w1 = gate, w3 = up, w2 = down.
+        let r = parse_hf_expert("model.layers.5.block_sparse_moe.experts.7.w1.weight").unwrap();
+        assert_eq!(r.layer_idx, 5);
+        assert_eq!(r.expert_idx, 7);
+        assert_eq!(r.weight, ExpertWeight::GateProj);
+
+        let r = parse_hf_expert("model.layers.0.block_sparse_moe.experts.0.w3.weight").unwrap();
+        assert_eq!(r.weight, ExpertWeight::UpProj);
+
+        let r = parse_hf_expert("model.layers.31.block_sparse_moe.experts.7.w2.weight").unwrap();
+        assert_eq!(r.weight, ExpertWeight::DownProj);
+
+        // `w1` under the `mlp.experts.` prefix is not a thing, but the leaf
+        // mapping is shared — guard that a bogus leaf still rejects.
+        assert_eq!(
+            parse_hf_expert("model.layers.0.block_sparse_moe.experts.0.w4.weight"),
+            None,
+        );
+    }
+
+    #[test]
     fn rejects_non_weight_leaves() {
         assert_eq!(
             parse_hf_expert("model.layers.0.mlp.experts.0.gate_proj.bias"),
             None,
         );
         assert_eq!(
-            parse_hf_expert("model.layers.0.mlp.experts.0.w1.weight"),
+            parse_hf_expert("model.layers.0.block_sparse_moe.experts.0.w1.bias"),
+            None,
+        );
+        // The fused batched expert tensors carry no per-expert index → no match.
+        assert_eq!(
+            parse_hf_expert("model.layers.0.mlp.experts.gate_up_proj"),
+            None,
+        );
+        assert_eq!(
+            parse_hf_expert("model.layers.0.mlp.experts.down_proj"),
             None,
         );
     }
@@ -203,6 +243,15 @@ mod tests {
     fn parses_router_gate() {
         assert_eq!(parse_hf_router("model.layers.0.mlp.gate.weight"), Some(0));
         assert_eq!(parse_hf_router("model.layers.31.mlp.gate.weight"), Some(31));
+        // Classic Mixtral router lives under block_sparse_moe.
+        assert_eq!(
+            parse_hf_router("model.layers.0.block_sparse_moe.gate.weight"),
+            Some(0),
+        );
+        assert_eq!(
+            parse_hf_router("model.layers.7.block_sparse_moe.gate.weight"),
+            Some(7),
+        );
     }
 
     #[test]
