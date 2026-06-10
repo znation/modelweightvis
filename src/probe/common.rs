@@ -42,12 +42,7 @@ pub struct RotaryEmbedding {
 impl RotaryEmbedding {
     /// Build cosine and sine tables for `max_pos` positions over
     /// `head_dim`. `head_dim` must be even.
-    pub fn new(
-        head_dim: usize,
-        max_pos: usize,
-        theta: f64,
-        device: &Device,
-    ) -> Result<Self> {
+    pub fn new(head_dim: usize, max_pos: usize, theta: f64, device: &Device) -> Result<Self> {
         assert_eq!(head_dim % 2, 0, "RoPE: head_dim must be even");
         let half = head_dim / 2;
         // freqs[i] = 1 / theta^(2i / head_dim)  for i in 0..half
@@ -88,9 +83,7 @@ impl RotaryEmbedding {
         let x1 = x.narrow(D::Minus1, 0, half)?;
         let x2 = x.narrow(D::Minus1, half, half)?;
         // cos / sin: [S, D/2] → broadcast to [B, H, S, D/2].
-        let cos_b = cos
-            .unsqueeze(0)?
-            .unsqueeze(0)?; // [1, 1, S, D/2]
+        let cos_b = cos.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, S, D/2]
         let sin_b = sin.unsqueeze(0)?.unsqueeze(0)?;
         let rotated_1 = (x1.broadcast_mul(&cos_b)? - x2.broadcast_mul(&sin_b)?)?;
         let rotated_2 = (x1.broadcast_mul(&sin_b)? + x2.broadcast_mul(&cos_b)?)?;
@@ -229,10 +222,10 @@ impl GqaAttention {
         let k = repeat_kv(&k, n_rep)?;
         let v = repeat_kv(&v, n_rep)?;
         let attn = causal_sdpa(&q, &k, &v)?; // [B, n_heads, S, head_dim]
-        let attn = attn
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, s, self.n_heads * self.head_dim))?;
+        let attn =
+            attn.transpose(1, 2)?
+                .contiguous()?
+                .reshape((b, s, self.n_heads * self.head_dim))?;
         self.o_proj.forward(&attn)
     }
 }

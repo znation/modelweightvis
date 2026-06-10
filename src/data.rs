@@ -1956,10 +1956,8 @@ async fn build_moe_summary_sources(
 
     // === Determine canvas dimensions ======================================
     let layer_ids: Vec<u32> = {
-        let mut set: std::collections::BTreeSet<u32> = expert_groups
-            .keys()
-            .map(|(l, _)| *l)
-            .collect();
+        let mut set: std::collections::BTreeSet<u32> =
+            expert_groups.keys().map(|(l, _)| *l).collect();
         // Include router-only layers so the canvas covers them too — but in
         // practice every MoE layer with a router also has experts, so this
         // is belt-and-braces.
@@ -1985,11 +1983,8 @@ async fn build_moe_summary_sources(
         anyhow::bail!("--moe-summary: derived n_layers=0 or n_experts=0 from {input}");
     }
     // layer_idx → row index in the output matrix (layer ids may be sparse).
-    let layer_row: BTreeMap<u32, usize> = layer_ids
-        .iter()
-        .enumerate()
-        .map(|(i, &l)| (l, i))
-        .collect();
+    let layer_row: BTreeMap<u32, usize> =
+        layer_ids.iter().enumerate().map(|(i, &l)| (l, i)).collect();
 
     // === Compute per-(layer,weight,expert) scalars ========================
     // For each panel, walk experts sequentially per layer and stream the
@@ -2077,7 +2072,9 @@ async fn build_moe_summary_sources(
                             "moe-summary: router at layer {} has shape[0]={} but inferred \
                              n_experts={}; skipping (likely a router for a different \
                              expert count)",
-                            layer_idx, meta.shape[0], n_experts,
+                            layer_idx,
+                            meta.shape[0],
+                            n_experts,
                         );
                     } else {
                         let cols = meta.shape[1];
@@ -2093,7 +2090,11 @@ async fn build_moe_summary_sources(
                                         log::warn!(
                                             "moe-summary: router row {} of layer {} out of \
                                              bounds (off={} end={} len={}); padding with 0",
-                                            e, layer_idx, off, end, bytes.len(),
+                                            e,
+                                            layer_idx,
+                                            off,
+                                            end,
+                                            bytes.len(),
                                         );
                                         out.push((e as u32, 0.0));
                                     } else {
@@ -2177,10 +2178,15 @@ async fn build_moe_summary_sources(
             .collect();
         let nbytes = bytes_u8.len() as u64;
         let label = match weight {
-            EW::Router => format!("MoE summary · router ({} layers × {} experts)", n_layers, n_experts),
+            EW::Router => format!(
+                "MoE summary · router ({} layers × {} experts)",
+                n_layers, n_experts
+            ),
             _ => format!(
                 "MoE summary · {} ({} layers × {} experts)",
-                weight.label(), n_layers, n_experts,
+                weight.label(),
+                n_layers,
+                n_experts,
             ),
         };
         let synthetic = format::TensorMeta {
@@ -2278,8 +2284,13 @@ async fn run_probe_capture(
 
     // Architecture detection from config.json. Skip probe with a None
     // (caller logs) if the arch isn't supported.
-    let config = crate::layout::model_config::ModelConfig::try_from_dir(&model_dir)
-        .ok_or_else(|| anyhow::anyhow!("--probe: missing or unparseable config.json in {}", model_dir.display()))?;
+    let config =
+        crate::layout::model_config::ModelConfig::try_from_dir(&model_dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--probe: missing or unparseable config.json in {}",
+                model_dir.display()
+            )
+        })?;
     let Some(arch) = crate::probe::detect_arch(&config) else {
         log::warn!(
             "--probe: architecture {:?} not supported (need Qwen2MoeForCausalLM or MixtralForCausalLM)",
@@ -2296,10 +2307,7 @@ async fn run_probe_capture(
         .collect();
     weight_paths.sort();
     if weight_paths.is_empty() {
-        anyhow::bail!(
-            "--probe: no .safetensors shards in {}",
-            model_dir.display(),
-        );
+        anyhow::bail!("--probe: no .safetensors shards in {}", model_dir.display(),);
     }
 
     // Resolve probe text.
@@ -2333,7 +2341,12 @@ fn attach_probe_panel(
 ) -> anyhow::Result<Source> {
     // Normalize freq to U8 per-panel (same convention as the static
     // summary panels): max → 255, 0 → 0.
-    let max = capture.freq.iter().copied().fold(0.0_f32, f32::max).max(1e-12);
+    let max = capture
+        .freq
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max)
+        .max(1e-12);
     let bytes_u8: Vec<u8> = capture
         .freq
         .iter()
@@ -2353,7 +2366,10 @@ fn attach_probe_panel(
     if capture.n_layers != n_layers || capture.n_experts != n_experts {
         anyhow::bail!(
             "--probe: capture dims ({}×{}) differ from summary dims ({}×{}); refusing to attach",
-            capture.n_layers, capture.n_experts, n_layers, n_experts,
+            capture.n_layers,
+            capture.n_experts,
+            n_layers,
+            n_experts,
         );
     }
 
@@ -2406,7 +2422,10 @@ fn attach_cka_probe_panels(
     if capture.n_layers != n_layers || capture.n_experts != n_experts {
         anyhow::bail!(
             "--probe: capture dims ({}×{}) differ from moe-cka dims ({}×{}); refusing to attach",
-            capture.n_layers, capture.n_experts, n_layers, n_experts,
+            capture.n_layers,
+            capture.n_experts,
+            n_layers,
+            n_experts,
         );
     }
     log::info!(
@@ -2578,10 +2597,7 @@ async fn build_moe_cka_sources(
     // Random projection seed is fixed at module level (per-group seed
     // derives from layer + weight) so reruns produce identical heatmaps.
     let datas_ref = &datas;
-    let pb = setup_progress(
-        "moe-cka panels",
-        groups.len() as u64,
-    );
+    let pb = setup_progress("moe-cka panels", groups.len() as u64);
     let pb_for_groups = pb.clone();
     let panel_results: Vec<((u32, EW), anyhow::Result<Vec<u8>>)> =
         stream::iter(groups.iter().map(|(k, v)| (*k, v.clone())))
@@ -2619,7 +2635,10 @@ async fn build_moe_cka_sources(
     let mut total_bytes: u64 = 0;
     for ((layer_idx, weight), result) in panel_results {
         let bytes_u8 = result.with_context(|| {
-            format!("computing CKA panel for layer {layer_idx} {}", weight.label())
+            format!(
+                "computing CKA panel for layer {layer_idx} {}",
+                weight.label()
+            )
         })?;
         let nbytes = bytes_u8.len() as u64;
         let synthetic = format::TensorMeta {
@@ -3025,14 +3044,32 @@ mod tests {
         // Per expert, the gate_up block is 8*4*4 = 128 bytes; each of gate/up
         // is half (4*4*4 = 64 bytes). Expert 1's block starts 128 bytes in.
         // gate(e0): [1000, +64); up(e0): [1064, +64).
-        assert_eq!(by_key[&(0, EW::GateProj, 0)], (0, 1000, 64, format::Dtype::F32));
-        assert_eq!(by_key[&(0, EW::UpProj, 0)], (0, 1064, 64, format::Dtype::F32));
+        assert_eq!(
+            by_key[&(0, EW::GateProj, 0)],
+            (0, 1000, 64, format::Dtype::F32)
+        );
+        assert_eq!(
+            by_key[&(0, EW::UpProj, 0)],
+            (0, 1064, 64, format::Dtype::F32)
+        );
         // gate(e1): [1128, +64); up(e1): [1192, +64).
-        assert_eq!(by_key[&(0, EW::GateProj, 1)], (0, 1128, 64, format::Dtype::F32));
-        assert_eq!(by_key[&(0, EW::UpProj, 1)], (0, 1192, 64, format::Dtype::F32));
+        assert_eq!(
+            by_key[&(0, EW::GateProj, 1)],
+            (0, 1128, 64, format::Dtype::F32)
+        );
+        assert_eq!(
+            by_key[&(0, EW::UpProj, 1)],
+            (0, 1192, 64, format::Dtype::F32)
+        );
         // down block per expert is 4*4*4 = 64 bytes, shard 1.
-        assert_eq!(by_key[&(0, EW::DownProj, 0)], (1, 5000, 64, format::Dtype::F32));
-        assert_eq!(by_key[&(0, EW::DownProj, 1)], (1, 5064, 64, format::Dtype::F32));
+        assert_eq!(
+            by_key[&(0, EW::DownProj, 0)],
+            (1, 5000, 64, format::Dtype::F32)
+        );
+        assert_eq!(
+            by_key[&(0, EW::DownProj, 1)],
+            (1, 5064, 64, format::Dtype::F32)
+        );
         // Exactly 6 jobs (2 experts × {gate, up, down}).
         assert_eq!(jobs.len(), 6);
     }

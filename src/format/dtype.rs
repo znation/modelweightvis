@@ -1177,7 +1177,11 @@ mod tests {
             ("f16", f16_bytes as fn(&[f32]) -> Vec<u8>),
             ("bf16", bf16_bytes as fn(&[f32]) -> Vec<u8>),
         ] {
-            let dt = if name == "f16" { Dtype::F16 } else { Dtype::BF16 };
+            let dt = if name == "f16" {
+                Dtype::F16
+            } else {
+                Dtype::BF16
+            };
             let r_rms = rms_from_buf(dt, &bytes_fn(&[1.0, -1.0, 1.0, -1.0]));
             assert!((r_rms - 1.0).abs() < 1e-2, "{name} rms: {r_rms}");
             let r_fro = frobenius_from_buf(dt, &bytes_fn(&[3.0, 4.0]));

@@ -198,8 +198,7 @@ mod tests {
         let k = 32;
         let d = 1024;
         let r = gaussian_projection(k, d, 7);
-        let mean_sq: f64 =
-            r.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / r.len() as f64;
+        let mean_sq: f64 = r.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / r.len() as f64;
         let expected = 1.0 / k as f64;
         // 1/sqrt(N) noise floor with N = k*d = 32768 → ~0.005 relative.
         assert!(
@@ -239,7 +238,10 @@ mod tests {
         let a_sq = at_b_frobenius_sq(&a_proj, &a_proj, rows, k);
         let b_sq = at_b_frobenius_sq(&b_proj, &b_proj, rows, k);
         let cka = linear_cka(&a_proj, &b_proj, rows, k, a_sq, b_sq);
-        assert!((cka - 1.0).abs() < 1e-4, "scaled CKA should be 1.0, got {cka}");
+        assert!(
+            (cka - 1.0).abs() < 1e-4,
+            "scaled CKA should be 1.0, got {cka}"
+        );
     }
 
     #[test]
@@ -282,9 +284,7 @@ mod tests {
         let rows = 32;
         let cols = 64;
         let w_a = ramp_matrix(rows, cols);
-        let w_b: Vec<f32> = (0..rows * cols)
-            .map(|k| (k as f32 * 0.07).sin())
-            .collect();
+        let w_b: Vec<f32> = (0..rows * cols).map(|k| (k as f32 * 0.07).sin()).collect();
 
         let cka_for_k = |k: usize| {
             let r = gaussian_projection(k, cols, 42);

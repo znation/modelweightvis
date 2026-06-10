@@ -307,8 +307,14 @@ mod tests {
         assert_eq!(parse_hf_router("model.layers.0.mlp.gate_proj.weight"), None);
         // Biases / norms / attention.
         assert_eq!(parse_hf_router("model.layers.0.mlp.gate.bias"), None);
-        assert_eq!(parse_hf_router("model.layers.0.input_layernorm.weight"), None);
-        assert_eq!(parse_hf_router("model.layers.0.self_attn.q_proj.weight"), None);
+        assert_eq!(
+            parse_hf_router("model.layers.0.input_layernorm.weight"),
+            None
+        );
+        assert_eq!(
+            parse_hf_router("model.layers.0.self_attn.q_proj.weight"),
+            None
+        );
     }
 
     #[test]
@@ -341,7 +347,10 @@ mod tests {
             parse_hf_expert("model.layers.0.mlp.experts.gate_up_proj"),
             None,
         );
-        assert_eq!(parse_hf_expert("model.layers.0.mlp.experts.down_proj"), None);
+        assert_eq!(
+            parse_hf_expert("model.layers.0.mlp.experts.down_proj"),
+            None
+        );
         // …and the fused parser must reject the indexed per-expert names.
         assert_eq!(
             parse_hf_fused_expert("model.layers.0.mlp.experts.0.gate_proj.weight"),
@@ -352,12 +361,18 @@ mod tests {
             None,
         );
         // Router and biases are not fused-expert tensors.
-        assert_eq!(parse_hf_fused_expert("model.layers.0.mlp.gate.weight"), None);
+        assert_eq!(
+            parse_hf_fused_expert("model.layers.0.mlp.gate.weight"),
+            None
+        );
         assert_eq!(
             parse_hf_fused_expert("model.layers.0.mlp.experts.gate_up_proj_bias"),
             None,
         );
-        assert_eq!(parse_hf_fused_expert("model.layers.x.mlp.experts.down_proj"), None);
+        assert_eq!(
+            parse_hf_fused_expert("model.layers.x.mlp.experts.down_proj"),
+            None
+        );
     }
 
     #[test]

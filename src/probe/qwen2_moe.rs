@@ -72,7 +72,8 @@ impl Cfg {
             .context("Qwen2-MoE config missing hidden_size")? as usize;
         let n_heads = config
             .num_attention_heads
-            .context("Qwen2-MoE config missing num_attention_heads")? as usize;
+            .context("Qwen2-MoE config missing num_attention_heads")?
+            as usize;
         // Qwen omits head_dim from config; derive from hidden_size / n_heads.
         let head_dim = config
             .head_dim
@@ -84,12 +85,10 @@ impl Cfg {
             .unwrap_or(n_heads);
         let n_experts = config
             .n_experts()
-            .context("Qwen2-MoE config missing num_experts")?
-            as usize;
+            .context("Qwen2-MoE config missing num_experts")? as usize;
         let top_k = config
             .num_experts_per_tok
-            .context("Qwen2-MoE config missing num_experts_per_tok")?
-            as usize;
+            .context("Qwen2-MoE config missing num_experts_per_tok")? as usize;
         let moe_intermediate_size = config
             .moe_intermediate_size
             .context("Qwen2-MoE config missing moe_intermediate_size")?
@@ -151,11 +150,8 @@ pub fn run(
             .context("Qwen2-MoE: opening safetensors shards via VarBuilder")?
     };
 
-    let embed_tokens = candle_nn::embedding(
-        cfg.vocab_size,
-        cfg.hidden_size,
-        vb.pp("model.embed_tokens"),
-    )?;
+    let embed_tokens =
+        candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
     let rope = RotaryEmbedding::new(cfg.head_dim, cfg.max_pos, cfg.rope_theta, &device)?;
 
     let mut hidden = embed_tokens.forward(&input_ids)?;
@@ -248,10 +244,7 @@ pub fn run(
     pb.finish_and_clear();
 
     // Frequencies — counts / n_tokens.
-    let freq: Vec<f32> = counts
-        .iter()
-        .map(|&c| c as f32 / n_tokens as f32)
-        .collect();
+    let freq: Vec<f32> = counts.iter().map(|&c| c as f32 / n_tokens as f32).collect();
     let coact: Vec<f32> = coact_counts
         .iter()
         .map(|&c| c as f32 / n_tokens as f32)
@@ -282,9 +275,7 @@ struct Layer {
 
 impl Layer {
     fn load(vb: &VarBuilder, cfg: &Cfg) -> anyhow::Result<Self> {
-        let input_layernorm = vb
-            .pp("input_layernorm")
-            .get(cfg.hidden_size, "weight")?;
+        let input_layernorm = vb.pp("input_layernorm").get(cfg.hidden_size, "weight")?;
         let post_attention_layernorm = vb
             .pp("post_attention_layernorm")
             .get(cfg.hidden_size, "weight")?;
@@ -320,11 +311,8 @@ impl Layer {
         )?;
         // `shared_expert_gate` is a Linear with output dim 1 — a per-token
         // scalar that gates the shared-expert contribution.
-        let shared_expert_gate = candle_nn::linear_no_bias(
-            cfg.hidden_size,
-            1,
-            mlp_vb.pp("shared_expert_gate"),
-        )?;
+        let shared_expert_gate =
+            candle_nn::linear_no_bias(cfg.hidden_size, 1, mlp_vb.pp("shared_expert_gate"))?;
         Ok(Self {
             input_layernorm,
             self_attn,

@@ -97,13 +97,15 @@ impl Cfg {
             .context("Mixtral config missing num_experts_per_tok")? as usize;
         let intermediate_size = config
             .intermediate_size
-            .context("Mixtral config missing intermediate_size")? as usize;
+            .context("Mixtral config missing intermediate_size")?
+            as usize;
         Ok(Self {
             vocab_size: config.vocab_size.unwrap_or(0) as usize,
             hidden_size,
             n_layers: config
                 .num_hidden_layers
-                .context("Mixtral config missing num_hidden_layers")? as usize,
+                .context("Mixtral config missing num_hidden_layers")?
+                as usize,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -416,7 +418,11 @@ mod tests {
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
             .collect();
         shards.sort();
-        assert!(!shards.is_empty(), "no safetensors shards in {}", dir.display());
+        assert!(
+            !shards.is_empty(),
+            "no safetensors shards in {}",
+            dir.display()
+        );
 
         let cap = crate::probe::run(
             crate::probe::Arch::Mixtral,
@@ -484,9 +490,14 @@ mod tests {
         let text = "The quick brown fox jumps over the lazy dog.";
 
         let fused_shards = sorted_safetensors(&dir);
-        let cap_fused =
-            crate::probe::run(crate::probe::Arch::Mixtral, &dir, &fused_shards, &config, text)
-                .expect("fused forward runs");
+        let cap_fused = crate::probe::run(
+            crate::probe::Arch::Mixtral,
+            &dir,
+            &fused_shards,
+            &config,
+            text,
+        )
+        .expect("fused forward runs");
 
         // Rewrite the same weights into the classic layout in a temp dir.
         let classic_dir = std::env::temp_dir().join("mwv-mixtral-classic-fixture");
@@ -523,11 +534,7 @@ mod tests {
     /// `mlp.experts.gate_up_proj`/`down_proj`) into the classic published
     /// layout (`block_sparse_moe.gate` + `block_sparse_moe.experts.{e}.w1/w3/w2`)
     /// with identical weight values. Used only by the test above.
-    fn convert_fused_to_classic(
-        src: &std::path::Path,
-        dst: &std::path::Path,
-        cfg: &ModelConfig,
-    ) {
+    fn convert_fused_to_classic(src: &std::path::Path, dst: &std::path::Path, cfg: &ModelConfig) {
         use std::collections::HashMap;
         let device = Device::Cpu;
         let inter = cfg.intermediate_size.unwrap() as usize;
@@ -549,14 +556,23 @@ mod tests {
                     let gu = t.get(e).unwrap(); // [2*inter, hidden]
                     let w1 = gu.narrow(0, 0, inter).unwrap().contiguous().unwrap();
                     let w3 = gu.narrow(0, inter, inter).unwrap().contiguous().unwrap();
-                    out.insert(format!("{prefix}.block_sparse_moe.experts.{e}.w1.weight"), w1);
-                    out.insert(format!("{prefix}.block_sparse_moe.experts.{e}.w3.weight"), w3);
+                    out.insert(
+                        format!("{prefix}.block_sparse_moe.experts.{e}.w1.weight"),
+                        w1,
+                    );
+                    out.insert(
+                        format!("{prefix}.block_sparse_moe.experts.{e}.w3.weight"),
+                        w3,
+                    );
                 }
             } else if let Some(prefix) = name.strip_suffix(".mlp.experts.down_proj") {
                 let e_n = t.dim(0).unwrap();
                 for e in 0..e_n {
                     let w2 = t.get(e).unwrap().contiguous().unwrap(); // [hidden, inter]
-                    out.insert(format!("{prefix}.block_sparse_moe.experts.{e}.w2.weight"), w2);
+                    out.insert(
+                        format!("{prefix}.block_sparse_moe.experts.{e}.w2.weight"),
+                        w2,
+                    );
                 }
             } else {
                 out.insert(name, t);

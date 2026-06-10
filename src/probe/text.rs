@@ -23,10 +23,8 @@ pub async fn resolve(source: &ProbeSource) -> anyhow::Result<String> {
     match source {
         ProbeSource::Default => Ok(DEFAULT_PROBE_TEXT.to_string()),
         ProbeSource::Text(s) => Ok(s.clone()),
-        ProbeSource::File(path) => {
-            std::fs::read_to_string(path)
-                .with_context(|| format!("--probe-file: reading {}", path.display()))
-        }
+        ProbeSource::File(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("--probe-file: reading {}", path.display())),
         ProbeSource::Url(url) => fetch_url(url).await,
     }
 }

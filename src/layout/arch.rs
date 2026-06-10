@@ -619,10 +619,7 @@ impl ArchLayout {
     /// colourizer paints each scalar through the plain pixel LUT.
     ///
     /// Returns `None` if no source carries a `MoeSummaryPanel` tag.
-    pub fn try_build_moe_summary(
-        sources: &[Source],
-        cumulative_offsets: &[u64],
-    ) -> Option<Self> {
+    pub fn try_build_moe_summary(sources: &[Source], cumulative_offsets: &[u64]) -> Option<Self> {
         use crate::format::moe::ExpertWeight as EW;
 
         // Collect (panel_kind, source_idx, &TensorMeta, base_off, n_layers, n_experts, hue_key)
@@ -708,9 +705,11 @@ impl ArchLayout {
         let panel_w = n_experts.saturating_mul(MOE_SUMMARY_CELL_PX);
         let panel_h = n_layers.saturating_mul(MOE_SUMMARY_CELL_PX);
         let n_panels = panels.len() as u32;
-        let canvas_w_raw = n_panels
-            .saturating_mul(panel_w)
-            .saturating_add(n_panels.saturating_sub(1).saturating_mul(MOE_SUMMARY_PANEL_PAD));
+        let canvas_w_raw = n_panels.saturating_mul(panel_w).saturating_add(
+            n_panels
+                .saturating_sub(1)
+                .saturating_mul(MOE_SUMMARY_PANEL_PAD),
+        );
         let canvas_h_raw = panel_h;
 
         // Place one PlacedTensor per panel, left-to-right.
@@ -808,10 +807,7 @@ impl ArchLayout {
     /// carries a `MoeCkaPanel` or `MoeCkaProbePanel` tag (set by
     /// [`crate::data::build_moe_cka_sources`]). Returns `None` if no
     /// source carries either tag.
-    pub fn try_build_moe_cka(
-        sources: &[Source],
-        cumulative_offsets: &[u64],
-    ) -> Option<Self> {
+    pub fn try_build_moe_cka(sources: &[Source], cumulative_offsets: &[u64]) -> Option<Self> {
         use crate::format::moe::ExpertWeight as EW;
 
         // A column in the CKA grid: either one of the static per-expert
@@ -838,16 +834,15 @@ impl ArchLayout {
         // `MoeCkaProbePanel` co-activation sources.
         let mut panels: Vec<(u32, CkaColumn, usize, &TensorMeta, u64, u32)> = Vec::new();
         for (sidx, s) in sources.iter().enumerate() {
-            let (layer, column, panel_experts) =
-                if let Some(tag) = s.extensions.get::<crate::data::MoeCkaPanel>().copied() {
-                    (tag.layer, CkaColumn::Weight(tag.weight), tag.n_experts)
-                } else if let Some(tag) =
-                    s.extensions.get::<crate::data::MoeCkaProbePanel>().copied()
-                {
-                    (tag.layer, CkaColumn::Coactivation, tag.n_experts)
-                } else {
-                    continue;
-                };
+            let (layer, column, panel_experts) = if let Some(tag) =
+                s.extensions.get::<crate::data::MoeCkaPanel>().copied()
+            {
+                (tag.layer, CkaColumn::Weight(tag.weight), tag.n_experts)
+            } else if let Some(tag) = s.extensions.get::<crate::data::MoeCkaProbePanel>().copied() {
+                (tag.layer, CkaColumn::Coactivation, tag.n_experts)
+            } else {
+                continue;
+            };
             let Some(st) = s.extensions.get::<crate::format::ModelInfo>() else {
                 continue;
             };
@@ -884,9 +879,7 @@ impl ArchLayout {
         // grouping in source prep.
         let n_experts = panels[0].5;
         if panels.iter().any(|p| p.5 != n_experts) {
-            log::warn!(
-                "moe-cka layout: panels disagree on n_experts; refusing to lay out",
-            );
+            log::warn!("moe-cka layout: panels disagree on n_experts; refusing to lay out",);
             return None;
         }
         if n_experts == 0 {
@@ -899,11 +892,8 @@ impl ArchLayout {
             .enumerate()
             .map(|(i, (l, c, _, _, _, _))| ((*l, *c), i))
             .collect();
-        let layer_row: std::collections::BTreeMap<u32, usize> = layer_ids
-            .iter()
-            .enumerate()
-            .map(|(i, &l)| (l, i))
-            .collect();
+        let layer_row: std::collections::BTreeMap<u32, usize> =
+            layer_ids.iter().enumerate().map(|(i, &l)| (l, i)).collect();
         let column_col: std::collections::BTreeMap<CkaColumn, usize> = column_ids
             .iter()
             .enumerate()
@@ -1924,14 +1914,18 @@ mod tests {
             }
         }
         let cumulative = vec![0u64; sources.len()];
-        let layout = ArchLayout::try_build_moe_cka(&sources, &cumulative)
-            .expect("moe-cka layout built");
+        let layout =
+            ArchLayout::try_build_moe_cka(&sources, &cumulative).expect("moe-cka layout built");
         assert_eq!(layout.tensors.len(), 12);
 
         let panel_side = n_experts * MOE_CKA_CELL_PX;
         // First panel (layer 0, gate) at (0, 0).
         // Down-proj of layer 3 at (col=2, row=3).
-        let last = layout.tensors.iter().find(|t| t.name == "moe-cka::L3::down_proj").unwrap();
+        let last = layout
+            .tensors
+            .iter()
+            .find(|t| t.name == "moe-cka::L3::down_proj")
+            .unwrap();
         assert_eq!(last.canvas_x, 2 * (panel_side + MOE_CKA_PANEL_PAD));
         assert_eq!(last.canvas_y, 3 * (panel_side + MOE_CKA_PANEL_PAD));
         assert_eq!(last.disp_w, panel_side);

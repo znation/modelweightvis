@@ -161,8 +161,8 @@ pub async fn load_arch_tile_regions(
             .copied()
             .unwrap_or(0);
         let (abs_start, len, leading) = region_byte_span(&region);
-        let painted = (region.tile_x1 - region.tile_x0) as u64
-            * (region.tile_y1 - region.tile_y0) as u64;
+        let painted =
+            (region.tile_x1 - region.tile_x0) as u64 * (region.tile_y1 - region.tile_y0) as u64;
         // The compact path's row-batched fetch + per-pixel sub-sample only
         // makes sense for single-byte-per-element regions; block and packed
         // dtypes have alignment requirements that the compact layout doesn't
@@ -175,8 +175,7 @@ pub async fn load_arch_tile_regions(
 
         if use_compact {
             let compact =
-                fetch_compact_region_u8(&source_data[region.source_idx], &region, src_off)
-                    .await?;
+                fetch_compact_region_u8(&source_data[region.source_idx], &region, src_off).await?;
             out.regions.push((region, compact, 0, true));
         } else {
             let local_off = abs_start - src_off;
@@ -219,14 +218,14 @@ async fn fetch_compact_region_u8(
 
     for dy in 0..paint_h {
         let er = (region.samp_y0 + dy) * rows / fh; // absolute source row
-        // Fixed(1) stride: each row is `cols` bytes.
+                                                    // Fixed(1) stride: each row is `cols` bytes.
         let row_byte_abs = region.tensor_byte_start + er * cols;
         let row_byte_local = row_byte_abs.saturating_sub(src_off);
         let row_bytes = data.fetch_range(row_byte_local, cols as usize).await?;
         for dx in 0..paint_w {
             let ec = (region.samp_x0 + dx) * cols / fw; // absolute source col
-            // Defensive: clamp to row bounds. The render's mid-grey-on-miss
-            // (`unwrap_or(127)`) matches diff_to_u8's "no change" byte.
+                                                        // Defensive: clamp to row bounds. The render's mid-grey-on-miss
+                                                        // (`unwrap_or(127)`) matches diff_to_u8's "no change" byte.
             let byte = row_bytes.get(ec as usize).copied().unwrap_or(127);
             compact[(dy * paint_w + dx) as usize] = byte;
         }
@@ -410,16 +409,14 @@ pub fn render_arch_tile_xet(
             // byte at `elem_off` and the byte-address proxy still keys off
             // `tbs` (the region's anchor), which is fine for xorb hue lookup.
             iter_region_pixels_compact(region, |px, py, elem_off| {
-                let color = xet_element_color(
-                    dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut,
-                );
+                let color =
+                    xet_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut);
                 img.put_pixel(px, py, color);
             });
         } else {
             iter_region_pixels(region, *leading, |px, py, elem_off| {
-                let color = xet_element_color(
-                    dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut,
-                );
+                let color =
+                    xet_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut);
                 img.put_pixel(px, py, color);
             });
         }
@@ -480,8 +477,7 @@ pub fn render_arch_tile_diff_paired(
     }
 
     for (region_a, bytes_a, leading_a, _is_compact_a) in &tile_a.regions {
-        let Some((_region_b, bytes_b, leading_b, _is_compact_b)) =
-            by_id_b.get(&region_a.tensor_id)
+        let Some((_region_b, bytes_b, leading_b, _is_compact_b)) = by_id_b.get(&region_a.tensor_id)
         else {
             continue;
         };
