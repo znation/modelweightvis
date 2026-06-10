@@ -3,15 +3,16 @@
 //! Owns every model-aware piece of the workspace:
 //! - `format/` — safetensors / GGUF / PyTorch-pickle header parsers, dtype
 //!   tables, MoE expert decoding.
-//! - `layout/` — architectural canvas, MoE-diff matrix layout, transformer
+//! - `layout/` — architectural canvas, MoE summary / CKA layouts, transformer
 //!   name classification, dtype-aware element colorizers.
 //! - `tiled/` — per-tensor tile load and the dtype-aware tile renderers.
-//! - `data` — `TensorDiffSource`, MoE-diff source prep, multi-shard
-//!   safetensors diff helpers, `MoeCell`, `SourceMeta`.
+//! - `data` — `TensorDiffSource`, multi-shard safetensors diff helpers, MoE
+//!   summary / CKA source prep, `SourceMeta`.
 //! - `finetune` — HF model-card finetune auto-detection.
-//! - Plugin impls (`ArchLayoutPlugin`, `MoeDiffLayoutPlugin`,
-//!   `TensorDiffBuilder`, `ArchRegionsLoader`, `ArchRegionsRenderer`, the
-//!   `FormatPlugin` family, plus the `MoeDiffPrep`/`RepoDiffPrep`/
+//! - Plugin impls (`ArchLayoutPlugin`, `MoeSummaryLayoutPlugin`,
+//!   `MoeCkaLayoutPlugin`, `TensorDiffBuilder`, `ArchRegionsLoader`,
+//!   `ArchRegionsRenderer`, the `FormatPlugin` family, plus the
+//!   `MoeSummaryPrep`/`MoeCkaPrep`/`RepoDiffPrep`/
 //!   `DirectoryTensorDiffPrep`/`FinetuneDetect`/`SingleImageArchHook` hooks)
 //!   are registered on a registry via [`register_all`].
 //!
@@ -38,9 +39,9 @@ pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{
     ArchSingleImageHook, HfModelCardFinetuneDetect, SourceMetaSidecarHook, TensorDirectoryDiffPrep,
-    TensorMoeCkaPrep, TensorMoeDiffPrep, TensorMoeSummaryPrep, TensorRepoDiffPrep,
+    TensorMoeCkaPrep, TensorMoeSummaryPrep, TensorRepoDiffPrep,
 };
-pub use layout::{ArchLayoutPlugin, MoeCkaLayoutPlugin, MoeDiffLayoutPlugin, MoeSummaryLayoutPlugin};
+pub use layout::{ArchLayoutPlugin, MoeCkaLayoutPlugin, MoeSummaryLayoutPlugin};
 pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
 
 use std::sync::Arc;
@@ -51,11 +52,11 @@ use arbvis::Registry;
 ///
 /// Populates the four Vec slots (`formats`, `layouts`, `diffs`, plus
 /// `leaf`'s loader+renderer maps) and every Option-slot hook
-/// (`moe_diff`, `repo_diff`, `dir_tensor_diff`, `finetune_detect`,
-/// `single_image_arch`). After this returns, arbvis::run handles every
-/// CLI shape the pre-split single-crate `arbvis` did, including
-/// `--moe-diff`, repo-level `--diff`, directory-safetensors `--diff`,
-/// single-image arch, and FormatPlugin-driven `ModelInfo` population.
+/// (`moe_summary`, `moe_cka`, `repo_diff`, `dir_tensor_diff`,
+/// `finetune_detect`, `single_image_arch`). After this returns, arbvis::run
+/// handles every CLI shape the model-aware crate supports, including
+/// `--moe-summary` / `--moe-cka`, repo-level `--diff`, directory-safetensors
+/// `--diff`, single-image arch, and FormatPlugin-driven `ModelInfo` population.
 pub fn register_all(registry: &mut Registry) {
     // Per-format header parsers — first plugin that detects a path
     // wins. Stuff `ModelInfo` into `Source.extensions` so the arch
@@ -68,12 +69,11 @@ pub fn register_all(registry: &mut Registry) {
     // it wins over the JSON / plain-byte fallbacks for matching pairs.
     registry.diffs.push(Arc::new(TensorDiffBuilder));
 
-    // Architectural + MoE-diff + MoE-summary layouts. Priority 200 / 200 / 100;
-    // `select_layout` sorts by `priority()` descending. The two MoE plugins
-    // can't collide — they look for different per-source extension tags
-    // (`MoeCell` vs `MoeSummaryPanel`), set by different CLI dispatches.
+    // Architectural + MoE summary + MoE CKA layouts. `select_layout` sorts by
+    // `priority()` descending. The MoE plugins can't collide — they look for
+    // different per-source extension tags (`MoeSummaryPanel` vs `MoeCkaPanel`),
+    // set by different CLI dispatches.
     registry.layouts.push(Arc::new(ArchLayoutPlugin));
-    registry.layouts.push(Arc::new(MoeDiffLayoutPlugin));
     registry.layouts.push(Arc::new(MoeSummaryLayoutPlugin));
     registry.layouts.push(Arc::new(MoeCkaLayoutPlugin));
 
@@ -84,7 +84,6 @@ pub fn register_all(registry: &mut Registry) {
         .register_renderer(Arc::new(ArchRegionsRenderer));
 
     // Option-slot hooks — each one taps a single CLI dispatch.
-    registry.moe_diff = Some(Arc::new(TensorMoeDiffPrep));
     registry.moe_summary = Some(Arc::new(TensorMoeSummaryPrep));
     registry.moe_cka = Some(Arc::new(TensorMoeCkaPrep));
     registry.repo_diff = Some(Arc::new(TensorRepoDiffPrep));

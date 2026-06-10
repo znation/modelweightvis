@@ -3,9 +3,9 @@
 //! These items use `format::*` (Dtype, TensorMeta, etc.) and the
 //! safetensors / GGUF / pickle parsers — all of which live in
 //! `modelweightvis::format`. arbvis itself stays format-agnostic; it
-//! reaches these helpers via the `MoeDiffPrep`, `RepoDiffPrep`,
-//! `DirectoryTensorDiffPrep`, and (per-Source) `FormatPlugin` hooks
-//! registered by `modelweightvis::register_all`.
+//! reaches these helpers via the `MoeSummaryPrep`, `MoeCkaPrep`,
+//! `RepoDiffPrep`, `DirectoryTensorDiffPrep`, and (per-Source)
+//! `FormatPlugin` hooks registered by `modelweightvis::register_all`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -243,18 +243,6 @@ impl CustomSource for TensorDiffSource {
     }
 }
 
-/// Per-MoE-cell coordinates attached to a `Source.extensions` map when the
-/// source represents one expert-vs-expert diff (or self-render diagonal)
-/// inside one MoE layer. Presence of this extension is the trigger that
-/// routes `select_layout` to the MoE-diff layout plugin.
-#[derive(Debug, Clone, Copy)]
-pub struct MoeCell {
-    pub layer: u32,
-    pub weight: ExpertWeight,
-    pub i: u32,
-    pub j: u32,
-}
-
 /// Per-panel tag attached to each `--moe-summary` source. One source per
 /// `ExpertWeight` variant present in the model (gate/up/down/router); the
 /// source's bytes are a `n_layers × n_experts` U8 heatmap, row-major
@@ -461,7 +449,7 @@ async fn fetch_model_header(
     }
 }
 
-// === extracted from arbvis::data (prepare_diff_sources_from_http,strip_prefix_components,find_strip_depths,TensorMatch,match_under_strip_depths,find_matched_tensor_pairs,fetch_rms_estimates,build_multi_safetensors_diff_sources_inner,build_multi_safetensors_diff_sources,build_multi_safetensors_diff_sources_from_http,prepare_moe_diff_sources,build_safetensors_diff_sources,SourceMeta,try_load_source_meta,load_meta_for_sources,fetch_hf_sidecar) ===
+// === extracted from arbvis::data (prepare_diff_sources_from_http,strip_prefix_components,find_strip_depths,TensorMatch,match_under_strip_depths,find_matched_tensor_pairs,fetch_rms_estimates,build_multi_safetensors_diff_sources_inner,build_multi_safetensors_diff_sources,build_multi_safetensors_diff_sources_from_http,build_safetensors_diff_sources,SourceMeta,try_load_source_meta,load_meta_for_sources,fetch_hf_sidecar) ===
 /// Build diff sources from two repos listed as HTTP specs (no download).
 ///
 /// Safetensors files are diffed lazily via range requests — no model weights
@@ -1464,465 +1452,6 @@ async fn build_multi_safetensors_diff_sources_from_http(
     .await
 }
 
-/// Build the per-expert N×N diff matrix sources for a single MoE checkpoint.
-///
-/// Each routed-experts MLP layer expands into `3 * N * (N + 1) / 2` Sources:
-/// for every weight in `{gate_proj, up_proj, down_proj}` and every expert
-/// pair `(i, j)` with `i <= j`, one `SourceKind::TensorDiff` whose two byte
-/// ranges point into the *same* checkpoint at experts `i` and `j`. Diagonal
-/// cells (`i == j`) point both sides at the same offset, so under any metric
-/// they paint as a uniform "no change" colour — black under `Exact`, mid-grey
-/// otherwise. (A future enhancement could swap diagonals for a self-render
-/// of the expert; v1 keeps the source-kind surface untouched.)
-///
-/// Source tensors keep their natural element shape (e.g. 1408×2048 for
-/// Qwen1.5-MoE), so the rendered output preserves a 1:1 tensor-element-to-
-/// display-pixel mapping at any pyramid level the leaf renderer chooses to
-/// sample. The per-tile fetch path in [`crate::tiled::leaf_arch`] detects
-/// heavily-shrunk regions and uses a sparse row-batched compact fetch so
-/// the renderer doesn't allocate the full element bounding box per region —
-/// see `load_arch_tile_regions` for the threshold and the compact layout.
-///
-/// `input` is a local path or `hf://` URL. Repo-level `hf://` URLs are listed
-/// over the HF API. When `stream` is false (the default), every shard is
-/// downloaded to the local hf-hub cache and mmapped before any source is
-/// constructed — per-cell diffs then read from local memory. When `stream`
-/// is true, shards stay as `Data::Xet`/`Data::Http` and every per-tile
-/// `fetch_range` issues an HTTP request. Single-file and local inputs always
-/// go through `hf_url::resolve` + mmap regardless of the flag.
-///
-/// GGUF checkpoints with fused expert tensors (`ffn_*_exps.weight`) are out
-/// of scope for v1 and return a clear error — see
-/// `src/format/name_map.rs:61-69`.
-pub async fn prepare_moe_diff_sources(
-    input: &str,
-    metric: format::DiffMetric,
-    stream: bool,
-) -> anyhow::Result<(Vec<Source>, u64)> {
-    // Open the input as one or more whole-file `Arc<Data>`s plus their formats.
-    // Two code paths mirror `prepare_diff_sources` / `_from_http`: repo-level
-    // `hf://` URLs stream lazily over HTTP; everything else is opened on disk
-    // (downloading first if a single-file `hf://` URL was passed).
-    let (datas, fmts, file_names) = if hf_url::is_repo_level(input)? {
-        let listed = hf_url::list_repo_as_http_specs(input)
-            .await
-            .with_context(|| format!("listing files in {input}"))?;
-        // Filter to model-format files only — config.json / tokenizer.* are
-        // not relevant to per-expert layout.
-        let st_specs: Vec<&(String, hf_url::RemoteFileSpec)> = listed
-            .iter()
-            .filter(|(n, _)| SourceFormat::from_name(n).is_some())
-            .collect();
-        if st_specs.is_empty() {
-            anyhow::bail!("--moe-diff: no .safetensors / .gguf files in {input}");
-        }
-        let fmts: Vec<SourceFormat> = st_specs
-            .iter()
-            .map(|(n, _)| SourceFormat::from_name(n).unwrap_or(SourceFormat::Safetensors))
-            .collect();
-        let names: Vec<String> = st_specs.iter().map(|(n, _)| n.clone()).collect();
-
-        let specs_owned: Vec<RemoteFileSpec> = st_specs.iter().map(|(_, s)| s.clone()).collect();
-        // In streaming mode each shard becomes an `Arc<Data::Xet>` (or
-        // `Data::Http` fallback) and per-tile diffs go over HTTP. In the
-        // disk-backed default we skip the xet reconstruction setup entirely
-        // — `materialize_remote_arcs` below downloads every shard via the
-        // `hf` CLI and replaces the arc with a `Data::Mapped` mmap, so the
-        // per-tile path is pure memcpy.
-        let mut datas: Vec<Arc<Data>> = if stream {
-            let pb = setup_progress(
-                "source files (xet reconstruction for moe-diff)",
-                specs_owned.len() as u64,
-            );
-            let pb_for_workers = pb.clone();
-            let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> =
-                stream::iter(specs_owned.iter().cloned().enumerate())
-                    .map(|(i, spec)| {
-                        let pb = pb_for_workers.clone();
-                        async move {
-                            let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
-                                match XetReader::new(&spec).await {
-                                    Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
-                                    Err(e) => {
-                                        log::warn!(
-                                    "{}: XetReader build failed ({e}); falling back to Data::Http",
-                                    spec.filename,
-                                );
-                                        Ok(Arc::new(Data::Http {
-                                            repo: spec.repo.clone(),
-                                            filename: Arc::clone(&spec.filename),
-                                            revision: Arc::clone(&spec.revision),
-                                        }))
-                                    }
-                                }
-                            } else {
-                                Ok(Arc::new(Data::Http {
-                                    repo: spec.repo.clone(),
-                                    filename: Arc::clone(&spec.filename),
-                                    revision: Arc::clone(&spec.revision),
-                                }))
-                            };
-                            if let Some(pb) = pb.as_ref() {
-                                pb.inc(1);
-                            }
-                            (i, r)
-                        }
-                    })
-                    .buffer_unordered(SETUP_FETCH_CONCURRENCY)
-                    .collect()
-                    .await;
-            if let Some(pb) = pb.as_ref() {
-                pb.finish_and_clear();
-            }
-            out.sort_by_key(|(i, _)| *i);
-            out.into_iter()
-                .map(|(_, r)| r)
-                .collect::<anyhow::Result<Vec<_>>>()?
-        } else {
-            // Placeholder arcs that materialize_remote_arcs will replace.
-            // Cheap (just an Arc<RemoteRepo> clone per shard); the real
-            // download happens once in the helper.
-            specs_owned
-                .iter()
-                .map(|spec| {
-                    Arc::new(Data::Http {
-                        repo: spec.repo.clone(),
-                        filename: Arc::clone(&spec.filename),
-                        revision: Arc::clone(&spec.revision),
-                    })
-                })
-                .collect()
-        };
-        if !stream {
-            materialize_remote_arcs(
-                &mut datas,
-                &specs_owned,
-                "source files (downloading for moe-diff)",
-            )
-            .await?;
-        }
-        (datas, fmts, names)
-    } else {
-        // Local path or single-file hf:// URL. Resolve to disk and open.
-        let resolved = hf_url::resolve(Path::new(input))
-            .await
-            .with_context(|| format!("resolving {input}"))?;
-        let files: Vec<PathBuf> = if resolved.is_dir() {
-            collect_files_recursive(&resolved)
-                .into_iter()
-                .filter(|p| SourceFormat::from_path(p).is_some())
-                .collect()
-        } else {
-            vec![resolved]
-        };
-        if files.is_empty() {
-            anyhow::bail!(
-                "--moe-diff: no recognised model files (.safetensors / .gguf) in {input}"
-            );
-        }
-        let mut datas = Vec::with_capacity(files.len());
-        let mut fmts = Vec::with_capacity(files.len());
-        let mut names = Vec::with_capacity(files.len());
-        for p in &files {
-            let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
-            datas.push(Arc::new(Data::Mapped(unsafe { Mmap::map(&f) }?)));
-            fmts.push(SourceFormat::from_path(p).unwrap_or(SourceFormat::Safetensors));
-            names.push(
-                p.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            );
-        }
-        (datas, fmts, names)
-    };
-
-    // Fetch headers for every shard in parallel — same pattern as
-    // `build_multi_safetensors_diff_sources_inner`.
-    let total_headers = datas.len() as u64;
-    let pb = setup_progress("source files (model headers)", total_headers);
-    let headers: Vec<(usize, Vec<format::TensorMeta>)> = {
-        let pb = pb.clone();
-        // Materialize the iter input as owned tuples so the
-        // `stream::iter(...).map(...)` closure doesn't borrow `datas` /
-        // `fmts` across the await — the for-all-lifetimes Send bound on
-        // the `MoeDiffPrep` trait future doesn't tolerate borrows
-        // leaking through async_trait's erased future.
-        let items: Vec<(usize, Arc<Data>, SourceFormat)> = datas
-            .iter()
-            .zip(fmts.iter())
-            .enumerate()
-            .map(|(i, (d, fmt))| (i, Arc::clone(d), *fmt))
-            .collect();
-        let mut out: Vec<(usize, anyhow::Result<Vec<format::TensorMeta>>)> = stream::iter(items)
-            .map(|(i, d, fmt)| {
-                let pb = pb.clone();
-                async move {
-                    let r = fetch_model_header(&d, fmt)
-                        .await
-                        .map(|(t, _)| t)
-                        .with_context(|| format!("reading {fmt:?} header for moe-diff file {i}"));
-                    if let Some(pb) = pb.as_ref() {
-                        pb.inc(1);
-                    }
-                    (i, r)
-                }
-            })
-            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
-            .collect()
-            .await;
-        out.sort_by_key(|(i, _)| *i);
-        out.into_iter()
-            .map(|(i, r)| r.map(|t| (i, t)))
-            .collect::<anyhow::Result<Vec<_>>>()?
-    };
-    if let Some(pb) = pb.as_ref() {
-        pb.finish_and_clear();
-    }
-
-    // Detect GGUF fused-experts up front and bail with a clear message.
-    for (shard_idx, tensors) in &headers {
-        if matches!(fmts[*shard_idx], SourceFormat::Gguf)
-            && tensors
-                .iter()
-                .any(|t| crate::format::moe::is_fused_gguf_expert(&t.name))
-        {
-            anyhow::bail!(
-                "--moe-diff: GGUF fused expert tensors are not yet supported \
-                 (found `ffn_*_exps.weight` in {}). See src/format/name_map.rs:61-69 — \
-                 the canonicaliser would need to either preserve per-expert names or \
-                 expose a slice-by-expert path.",
-                file_names
-                    .get(*shard_idx)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>"),
-            );
-        }
-    }
-
-    // Group per-expert tensors by (layer, weight, expert_idx). Each entry
-    // carries the shard index + the tensor metadata.
-    use crate::format::moe::{parse_hf_expert, ExpertWeight as EW};
-    use std::collections::BTreeMap;
-    type LayerKey = (u32, EW);
-    let mut groups: BTreeMap<LayerKey, BTreeMap<u32, (usize, format::TensorMeta)>> =
-        BTreeMap::new();
-    let mut shapes_seen: BTreeMap<LayerKey, Vec<u64>> = BTreeMap::new();
-    let mut dtypes_seen: BTreeMap<LayerKey, format::Dtype> = BTreeMap::new();
-    for (shard_idx, tensors) in headers {
-        for t in tensors {
-            if let Some(r) = parse_hf_expert(&t.name) {
-                let key = (r.layer_idx, r.weight);
-                // Sanity: all experts of one (layer, weight) must share shape
-                // + dtype (they do in practice — they're the same per-expert
-                // FFN slice). Mismatch would indicate a malformed checkpoint;
-                // log loudly and skip the offending tensor.
-                if let Some(prev_shape) = shapes_seen.get(&key) {
-                    if prev_shape != &t.shape {
-                        log::warn!(
-                            "--moe-diff: shape mismatch within layer {} weight {} expert {}: \
-                             {:?} vs {:?} — skipping",
-                            r.layer_idx,
-                            r.weight.label(),
-                            r.expert_idx,
-                            prev_shape,
-                            &t.shape,
-                        );
-                        continue;
-                    }
-                } else {
-                    shapes_seen.insert(key, t.shape.clone());
-                    dtypes_seen.insert(key, t.dtype);
-                }
-                groups
-                    .entry(key)
-                    .or_default()
-                    .insert(r.expert_idx, (shard_idx, t));
-            }
-        }
-    }
-
-    if groups.is_empty() {
-        anyhow::bail!(
-            "--moe-diff: no per-expert tensors found in {input} \
-             (expected `model.layers.{{L}}.mlp.experts.{{E}}.{{gate|up|down}}_proj.weight`)"
-        );
-    }
-
-    // For DiffMetric::Rms we need a per-(layer, weight) RMS estimate. Sample
-    // from expert 0's bytes — every expert of one layer+weight shares shape
-    // and lives in the same shard family, so one sample per group is enough.
-    let need_rms = matches!(metric, format::DiffMetric::Rms);
-    let mut scales: BTreeMap<LayerKey, f32> = BTreeMap::new();
-    if need_rms {
-        const SCALE_SAMPLE_BYTES: u64 = 64 * 1024;
-        let pb = setup_progress("moe expert RMS samples", groups.len() as u64);
-        type SampleJob = (LayerKey, usize, u64, u64, format::Dtype);
-        let inputs: Vec<SampleJob> = groups
-            .iter()
-            .filter_map(|(k, experts)| {
-                let (shard_idx, meta) = experts.values().next()?;
-                let elem = meta.dtype.element_size() as u64;
-                let tensor_bytes = meta.file_end.saturating_sub(meta.file_start);
-                let want = SCALE_SAMPLE_BYTES.min(tensor_bytes);
-                let len = want.checked_div(elem).map(|q| q * elem).unwrap_or(0);
-                Some((*k, *shard_idx, meta.file_start, len, meta.dtype))
-            })
-            .collect();
-        let datas_ref = &datas;
-        let pb_for_workers = pb.clone();
-        let results: Vec<(LayerKey, f32)> = stream::iter(inputs)
-            .map(|(k, shard, start, len, dtype)| {
-                let d = Arc::clone(&datas_ref[shard]);
-                let pb = pb_for_workers.clone();
-                async move {
-                    let v = if len == 0 {
-                        0.0
-                    } else {
-                        match d.fetch_range(start, len as usize).await {
-                            Ok(bytes) => format::rms_from_buf(dtype, &bytes),
-                            Err(e) => {
-                                log::warn!("moe-diff: RMS sample failed ({e}); using 0.0");
-                                0.0
-                            }
-                        }
-                    };
-                    if let Some(pb) = pb.as_ref() {
-                        pb.inc(1);
-                    }
-                    (k, v)
-                }
-            })
-            .buffer_unordered(RMS_SAMPLE_FETCH_CONCURRENCY)
-            .collect()
-            .await;
-        if let Some(pb) = pb.as_ref() {
-            pb.finish_and_clear();
-        }
-        for (k, v) in results {
-            scales.insert(k, v);
-        }
-    }
-
-    // Emit one Source per upper-triangle cell (including diagonal). The diff
-    // Source carries both `orig` and `mod_` pointing at the same checkpoint's
-    // `Arc<Data>`, just at different file_start offsets — the leaf renderer's
-    // load stage (`load_arch_tile_regions`) issues per-region byte ranges via
-    // the existing `TensorDiff` path, with a sparse compact path for heavily-
-    // shrunk regions so a 24×24 sub-tile of a 1408×2048 expert doesn't read
-    // the full element bounding box.
-    let mut sources: Vec<Source> = Vec::new();
-    let mut total: u64 = 0;
-    for ((layer_idx, weight), experts) in &groups {
-        let scale_orig = scales.get(&(*layer_idx, *weight)).copied().unwrap_or(0.0);
-        // Stable expert order ascending.
-        let expert_ids: Vec<u32> = experts.keys().copied().collect();
-        for (a, &ei) in expert_ids.iter().enumerate() {
-            for &ej in &expert_ids[a..] {
-                let (oi, e_i) = &experts[&ei];
-                let (oj, e_j) = &experts[&ej];
-                let nelem: u64 = e_i.shape.iter().product();
-                if nelem == 0 {
-                    continue;
-                }
-                // Synthetic 1-byte-per-element diff tensor that the
-                // architectural layout places at its natural 2D shape.
-                let diff_meta = format::TensorMeta {
-                    name: format!(
-                        "moe::L{layer}::{weight}::E{i}-E{j}",
-                        layer = layer_idx,
-                        weight = weight.label(),
-                        i = ei,
-                        j = ej,
-                    ),
-                    dtype: format::Dtype::U8,
-                    shape: e_i.shape.clone(),
-                    file_start: 0,
-                    file_end: nelem,
-                    packed_sidecars: None,
-                };
-                let label = if ei == ej {
-                    format!(
-                        "Layer {layer_idx} · {wlabel} · Expert {ei} (self)",
-                        wlabel = weight.label()
-                    )
-                } else {
-                    format!(
-                        "Layer {layer_idx} · {wlabel} · Expert {ei} × Expert {ej}",
-                        wlabel = weight.label()
-                    )
-                };
-                let mut extensions = Extensions::default();
-                extensions.insert(ModelInfo {
-                    format: SourceFormat::Safetensors,
-                    tensors: vec![diff_meta],
-                    color_ranges: Vec::new(),
-                });
-                extensions.insert(MoeCell {
-                    layer: *layer_idx,
-                    weight: *weight,
-                    i: ei,
-                    j: ej,
-                });
-                sources.push(Source {
-                    file_idx: sources.len(),
-                    kind: SourceKind::Custom(Box::new(TensorDiffSource {
-                        orig: Arc::clone(&datas[*oi]),
-                        mod_: Arc::clone(&datas[*oj]),
-                        orig_start: e_i.file_start,
-                        mod_start: e_j.file_start,
-                        orig_dtype: e_i.dtype,
-                        mod_dtype: e_j.dtype,
-                        metric,
-                        scale_orig,
-                        byte_size: nelem,
-                    })),
-                    byte_size: nelem,
-                    name_override: Some(label),
-                    xet_terms: None,
-                    extensions,
-                });
-                total += nelem;
-            }
-        }
-    }
-
-    let n_layers = groups
-        .keys()
-        .map(|k| k.0)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    let weight_keys = groups
-        .keys()
-        .filter(|(_, w)| matches!(w, EW::GateProj))
-        .count();
-    log::info!(
-        "moe-diff: {} layer(s), {} weight slot(s) per layer ({}{} {}), \
-         emitted {} cell(s) totalling {} synthetic byte(s)",
-        n_layers,
-        groups.len() / n_layers.max(1),
-        if groups.contains_key(&(groups.keys().next().unwrap().0, EW::GateProj)) {
-            "gate_proj "
-        } else {
-            ""
-        },
-        if groups.contains_key(&(groups.keys().next().unwrap().0, EW::UpProj)) {
-            "up_proj "
-        } else {
-            ""
-        },
-        if groups.contains_key(&(groups.keys().next().unwrap().0, EW::DownProj)) {
-            "down_proj"
-        } else {
-            ""
-        },
-        sources.len(),
-        total,
-    );
-    let _ = weight_keys; // intentional: silence unused if log changes
-
-    Ok((sources, total))
-}
-
 /// `(layer, weight, expert)` key for one per-expert summary scalar.
 type ScalarKey = (u32, crate::format::moe::ExpertWeight, u32);
 /// A unit of scalar work: which bytes to read and how to interpret them —
@@ -2069,7 +1598,7 @@ fn build_fused_expert_jobs(
 /// side-by-side.
 ///
 /// Reuses the same file-opening / header-fetch / per-expert grouping
-/// scaffolding as [`prepare_moe_diff_sources`]; the duplication is
+/// scaffolding as [`prepare_moe_cka_sources`]; the duplication is
 /// intentional for now (the shared scaffolding is the easy half of an
 /// eventual extraction once the summary code stabilises).
 pub async fn prepare_moe_summary_sources(
@@ -2078,7 +1607,7 @@ pub async fn prepare_moe_summary_sources(
     stream: bool,
     probe: &arbvis::ProbeOpts,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
-    // === File opening — identical to prepare_moe_diff_sources ============
+    // === File opening — identical to prepare_moe_cka_sources ============
     let (datas, fmts, file_names) = if hf_url::is_repo_level(input)? {
         let listed = hf_url::list_repo_as_http_specs(input)
             .await
@@ -2199,7 +1728,7 @@ pub async fn prepare_moe_summary_sources(
         (datas, fmts, names)
     };
 
-    // === Header fetch — identical to prepare_moe_diff_sources ============
+    // === Header fetch — identical to prepare_moe_cka_sources ============
     let total_headers = datas.len() as u64;
     let pb = setup_progress("source files (model headers)", total_headers);
     let headers: Vec<(usize, Vec<format::TensorMeta>)> = {
@@ -2235,7 +1764,7 @@ pub async fn prepare_moe_summary_sources(
         pb.finish_and_clear();
     }
 
-    // GGUF fused-expert rejection — same constraint as moe-diff.
+    // GGUF fused-expert rejection — same constraint as moe-cka.
     for (shard_idx, tensors) in &headers {
         if matches!(fmts[*shard_idx], SourceFormat::Gguf)
             && tensors

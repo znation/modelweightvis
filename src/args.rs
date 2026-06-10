@@ -1,8 +1,9 @@
 //! Tensor-aware CLI surface that flattens [`arbvis::Args`] and adds the
-//! four model-side flags (`--moe-diff`, `--finetune` / `--no-finetune`,
+//! model-side flags (`--moe-summary` / `--moe-cka`, the `--probe` family,
+//! `--summary-stat`, `--cka-sample`, `--finetune` / `--no-finetune`,
 //! `--diff-metric`, `--layout`).
 //!
-//! These four flags used to live on `arbvis::Args` directly, which meant
+//! The diff / layout flags used to live on `arbvis::Args` directly, which meant
 //! `arbvis --help` advertised them even though they only do anything when
 //! a tensor-aware backend is registered (and the byte-only `arbvis`
 //! binary errors out at runtime if the user actually passes them). After
@@ -115,35 +116,16 @@ pub struct ModelArgs {
     #[command(flatten)]
     pub arbvis: arbvis::Args,
 
-    /// Visualize an N×N expert-vs-expert diff matrix for each MoE layer of a single
-    /// model. MODEL is a local path or hf:// URL. Each cell (i, j) shows the
-    /// element-wise diff between expert i and expert j for `gate_proj`, `up_proj`,
-    /// and `down_proj`, stacked horizontally; only the upper triangle + diagonal is
-    /// rendered (the raw diff is antisymmetric). Currently supports HF-style
-    /// per-expert safetensors (Mixtral / Qwen3-MoE / OLMoE / DeepSeek routed
-    /// experts); GGUF fused-expert tensors are not yet supported.
-    ///
-    /// Note: element-wise expert diff produces near-Gaussian noise on real
-    /// models because expert positions have no functional correspondence.
-    /// Prefer `--moe-summary` for a per-expert scalar heatmap that actually
-    /// reveals signal (outliers, dead experts, layer-wise trends).
-    #[arg(
-        long,
-        value_name = "MODEL",
-        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_summary"]
-    )]
-    pub moe_diff: Option<PathBuf>,
-
     /// Visualize per-expert scalar heatmaps for each MoE layer of a single
     /// model. MODEL is a local path or hf:// URL. Each panel is one weight
     /// (gate_proj / up_proj / down_proj / router) rendered as a layers × experts
     /// heatmap, with one colored cell per expert. The scalar is chosen by
-    /// `--summary-stat`. Reveals signal that `--moe-diff` can't: outlier
-    /// experts, layer-wise magnitude trends, dead experts.
+    /// `--summary-stat`. Surfaces outlier experts, layer-wise magnitude
+    /// trends, and dead experts.
     #[arg(
         long,
         value_name = "MODEL",
-        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_diff", "moe_cka"]
+        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_cka"]
     )]
     pub moe_summary: Option<PathBuf>,
 
@@ -157,7 +139,7 @@ pub struct ModelArgs {
     #[arg(
         long,
         value_name = "MODEL",
-        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_diff", "moe_summary"]
+        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_summary"]
     )]
     pub moe_cka: Option<PathBuf>,
 
@@ -179,7 +161,7 @@ pub struct ModelArgs {
     pub no_finetune: bool,
 
     /// How per-element tensor deltas are encoded for visualization
-    /// (applies to `--diff` and `--moe-diff`).
+    /// (applies to `--diff`).
     #[arg(long, value_enum, default_value_t = DiffMetricArg::Rms)]
     pub diff_metric: DiffMetricArg,
 
@@ -268,7 +250,6 @@ impl ModelArgs {
                 ProbeSource::Text(_) | ProbeSource::File(_) | ProbeSource::Url(_)
             );
         let opts = ModelOpts {
-            moe_diff: self.moe_diff,
             moe_summary: self.moe_summary,
             moe_cka: self.moe_cka,
             finetune: self.finetune,

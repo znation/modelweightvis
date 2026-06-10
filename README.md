@@ -61,15 +61,36 @@ When both arguments are `hf://` model URLs, modelweightvis auto-detects whether 
 
 Non-tensor files in a `--diff` between repos or directories (READMEs, tokenizer configs, etc.) fall back to arbvis's plain-byte / JSON-aware diff path.
 
-## MoE expert-vs-expert matrix: `--moe-diff`
+## MoE per-expert summary: `--moe-summary`
 
 ```sh
-modelweightvis --moe-diff hf://mistralai/Mixtral-8x7B-v0.1 --tiles ./out
+modelweightvis --moe-summary hf://Qwen/Qwen1.5-MoE-A2.7B --tiles ./out
 ```
 
-Renders an N×N grid showing the element-wise diff of every expert pair within a single MoE model. Each cell stacks `gate_proj`, `up_proj`, and `down_proj` horizontally; only the upper triangle and diagonal are drawn (the raw diff is antisymmetric).
+Renders one heatmap panel per FFN weight (`gate_proj`, `up_proj`, `down_proj`) plus the router gate, side by side. Each panel is a `layers × experts` grid with one colored cell per expert, so dead experts, per-layer magnitude trends, and outliers pop out at a glance. The scalar shown per cell is chosen by `--summary-stat`:
 
-Supports HF-style per-expert safetensors layouts: Mixtral, Qwen3-MoE, OLMoE, and DeepSeek routed experts. GGUF fused-expert tensors are not yet supported.
+- `rms` (default) — √(mean(x²)), comparable across tensors of different scale.
+- `frobenius` — √(sum(x²)), honest about total magnitude.
+- `mean-abs` — mean(|x|), stable and dominated by typical entries.
+- `sparsity` — fraction of near-zero entries, surfacing dead / near-dead experts.
+
+Supports HF per-expert safetensors (Qwen-MoE, OLMoE, DeepSeek routed experts), the classic Mixtral `block_sparse_moe` layout, and the newer fused `transformers` export (batched `mlp.experts.gate_up_proj` / `down_proj`). GGUF fused-expert tensors are not yet supported.
+
+### Routing-frequency probe: `--probe`
+
+```sh
+modelweightvis --moe-summary hf://Qwen/Qwen1.5-MoE-A2.7B --probe --tiles ./out
+```
+
+Adds a fifth panel: per-`(layer, expert)` **routing frequency** from a routing-faithful forward pass over a probe input. This is the one behavioral signal — it reflects which experts the router actually fires on real tokens, not just static weights. Override the bundled probe text with `--probe-text "…"`, `--probe-file <path>`, or `--probe-url <https|hf://…>`. Supported architectures: `Qwen2MoeForCausalLM`, `MixtralForCausalLM`.
+
+## MoE expert-similarity matrix: `--moe-cka`
+
+```sh
+modelweightvis --moe-cka hf://Qwen/Qwen1.5-MoE-A2.7B --tiles ./out
+```
+
+Renders one `n_experts × n_experts` linear-CKA similarity heatmap per `(layer, weight)`: the diagonal is 1.0 (every expert is self-identical) and bright off-diagonal blocks reveal redundant expert clusters. Uses Gaussian random projection on the input axis (`--cka-sample`, default 128) to keep a 60-expert × 24-layer model tractable.
 
 ## Inherited from arbvis
 
@@ -91,15 +112,15 @@ See the [arbvis README](https://github.com/znation/arbvis#readme) for the full r
 modelweightvis extends arbvis through its plugin / hook surface — no fork, no patch:
 
 - `FormatPlugin` impls (`SafetensorsFormatPlugin`, `GgufFormatPlugin`, `PickleFormatPlugin`) parse each format's header and stuff a `ModelInfo` (tensors + dtype color ranges) into the source's `extensions` map.
-- `LayoutPlugin` impls (`ArchLayoutPlugin`, `MoeDiffLayoutPlugin`) register the architectural canvas and the MoE-diff matrix layout; arbvis's plugin-iteration `select_layout` picks them by priority.
+- `LayoutPlugin` impls (`ArchLayoutPlugin`, `MoeSummaryLayoutPlugin`, `MoeCkaLayoutPlugin`) register the architectural canvas and the MoE summary / CKA panel layouts; arbvis's plugin-iteration `select_layout` picks them by priority.
 - `LeafLoader` + `LeafRenderer` pair (`ArchRegionsLoader`, `ArchRegionsRenderer`) drive per-tensor tile rendering at element granularity.
 - `DiffSourceBuilder` (`TensorDiffBuilder`) handles tensor-aware `--diff` at priority above arbvis's JSON / plain-byte fallbacks.
-- Option-slot hooks (`MoeDiffPrep`, `RepoDiffPrep`, `DirectoryTensorDiffPrep`, `FinetuneDetect`, `SingleImageArchHook`, `PrepareSourcesExtension`) tap arbvis's CLI dispatch points so `--moe-diff`, repo-level `--diff`, single-image arch render, and HF model-card finetune detection slot in cleanly.
+- Option-slot hooks (`MoeSummaryPrep`, `MoeCkaPrep`, `RepoDiffPrep`, `DirectoryTensorDiffPrep`, `FinetuneDetect`, `SingleImageArchHook`, `PrepareSourcesExtension`) tap arbvis's CLI dispatch points so `--moe-summary` / `--moe-cka`, repo-level `--diff`, single-image arch render, and HF model-card finetune detection slot in cleanly.
 
 The `modelweightvis` binary itself is tiny — it builds an `arbvis::Registry::with_defaults()`, calls `modelweightvis::register_all(&mut registry)`, and hands off to `arbvis::run`. Same renderer, same Hub I/O, same tile pyramid; the tensor awareness comes entirely through the registered plugins.
 
 **Which to use:**
-- **modelweightvis** — for `.safetensors` / `.gguf` / `.bin` model checkpoints, architectural transformer layout, `--moe-diff`, `--diff-metric`, `--finetune` / `--no-finetune`, `--layout`, dtype-aware coloring. Inherits arbvis's full CLI surface.
+- **modelweightvis** — for `.safetensors` / `.gguf` / `.bin` model checkpoints, architectural transformer layout, `--moe-summary` / `--moe-cka` / `--probe`, `--diff-metric`, `--finetune` / `--no-finetune`, `--layout`, dtype-aware coloring. Inherits arbvis's full CLI surface.
 - **arbvis** — for non-model binaries (any file format), JSON/JSONL diffs, plain-byte diffs, the xet xorb path on arbitrary content. Smaller dependency footprint (no `candle-core` / `regex` / `zip` / `half`).
 
 ## Building

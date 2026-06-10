@@ -13,13 +13,13 @@
 //! sources the gap is a free `memcpy` slice.
 //!
 //! Sparse compact path: when the renderer is sampling at heavy shrink
-//! (e.g. a 24 px sub-tile of a 1408×2048 tensor at MoE-diff overview), the
+//! (e.g. a 24 px sub-tile of a 1408×2048 tensor at arch-overview zoom), the
 //! coalesced bounding-box span is multi-MB per region but only the
 //! `paint_w × paint_h` sampled elements are actually painted. Per region
-//! that means allocating ~2.8 MB and computing ~2.8 M diff bytes to use ~600
+//! that means allocating ~2.8 MB and computing ~2.8 M bytes to use ~600
 //! of them; multiplied across ~300 regions per tile and ~100 in-flight
 //! workers this OOMs the render pipeline. For `Fixed(1)`-stride regions
-//! (i.e. the `U8` diff buffers emitted by `prepare_moe_diff_sources`) where
+//! (heavily-shrunk `U8` region buffers) where
 //! the bounding-box span exceeds the painted area by [`SPARSE_WASTE_THRESHOLD`],
 //! the loader takes a compact path: one `fetch_range` per *sampled* source
 //! row (≪ all rows in the bounding box), packed into a `paint_w × paint_h`
@@ -31,8 +31,8 @@
 /// exceeds the painted pixel area by this factor. `8` is a soft heuristic:
 /// at exactly the threshold the full path still wins on async overhead;
 /// past it the compact path's row-batched reads pay back the extra fetches.
-/// MoE-diff overview regions blow past this by ~5000× — the trigger is
-/// essentially "any heavy shrink".
+/// Heavily-shrunk overview regions can blow past this by ~5000× — the trigger
+/// is essentially "any heavy shrink".
 const SPARSE_WASTE_THRESHOLD: u64 = 8;
 
 use image::Rgb;
@@ -166,9 +166,9 @@ pub async fn load_arch_tile_regions(
         // The compact path's row-batched fetch + per-pixel sub-sample only
         // makes sense for single-byte-per-element regions; block and packed
         // dtypes have alignment requirements that the compact layout doesn't
-        // respect. In practice the only regions that hit this branch are the
-        // U8 diff buffers from `prepare_moe_diff_sources` — which is exactly
-        // where heavy shrink (and the OOM it caused) lives.
+        // respect. The regions that hit this branch are heavily-shrunk
+        // single-byte (`U8`) buffers — which is exactly where the wasteful
+        // bounding-box read (and the OOM it caused) lives.
         let fixed_one = matches!(region.dtype.stride(), ElementStride::Fixed(1));
         let use_compact =
             fixed_one && painted > 0 && (len as u64) > painted * SPARSE_WASTE_THRESHOLD;

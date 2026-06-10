@@ -16,17 +16,18 @@
 //! (which deliberately collapses HF per-expert names to the GGUF fused form
 //! for the regular `--diff` flow).
 //!
-//! NB: this module is the parser only. Source construction and matrix layout
-//! live in [`crate::data::prepare_moe_diff_sources`] and
-//! [`crate::layout::arch::ArchLayout::try_build_moe_diff`].
+//! NB: this module is the parser only. Source construction and panel layout
+//! live in [`crate::data::prepare_moe_summary_sources`] /
+//! [`crate::data::prepare_moe_cka_sources`] and the matching
+//! `ArchLayout::try_build_moe_{summary,cka}` builders.
 
 /// Which weight matrix of a single expert. `GateProj` / `UpProj` /
 /// `DownProj` are the three per-expert FFN matrices; `Router` is the
 /// layer-level router gate (`model.layers.{L}.mlp.gate.weight`) whose
 /// rows are per-expert gate vectors — included so `--moe-summary` can
 /// surface routing-side specialization alongside the FFN signal.
-/// `Router` is not used by `--moe-diff` (the pairwise expert layout
-/// only consumes the per-expert FFN slots).
+/// `Router` is not used by `--moe-cka` (pairwise expert CKA only
+/// consumes the per-expert FFN slots).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(clippy::enum_variant_names)]
 pub enum ExpertWeight {

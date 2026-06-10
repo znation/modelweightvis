@@ -12,35 +12,16 @@ use std::path::{Path, PathBuf};
 
 use arbvis::hf_url::RemoteFileSpec;
 use arbvis::{
-    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeCkaPrep, MoeDiffPrep,
-    MoeSummaryPrep, PrepareSourcesExtension, ProbeOpts, RepoDiffPrep, SingleImageArchHook, Source,
-    SummaryStat,
+    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeCkaPrep, MoeSummaryPrep,
+    PrepareSourcesExtension, ProbeOpts, RepoDiffPrep, SingleImageArchHook, Source, SummaryStat,
 };
 use async_trait::async_trait;
 
 use crate::data::{
     build_multi_safetensors_diff_sources, load_meta_for_sources, prepare_diff_sources_from_http,
-    prepare_moe_cka_sources, prepare_moe_diff_sources, prepare_moe_summary_sources,
+    prepare_moe_cka_sources, prepare_moe_summary_sources,
 };
 use crate::format::SourceFormat;
-
-/// `--moe-diff <model>` source preparer. Delegates to
-/// [`prepare_moe_diff_sources`], which builds the N×N expert-vs-expert
-/// diff buffers + `MoeCell` extension tags that
-/// [`crate::MoeDiffLayoutPlugin`] reads back.
-pub struct TensorMoeDiffPrep;
-
-#[async_trait(?Send)]
-impl MoeDiffPrep for TensorMoeDiffPrep {
-    async fn prepare(
-        &self,
-        input: &str,
-        metric: DiffMetric,
-        stream: bool,
-    ) -> anyhow::Result<(Vec<Source>, u64)> {
-        prepare_moe_diff_sources(input, metric, stream).await
-    }
-}
 
 /// `--moe-summary <model>` source preparer. Delegates to
 /// [`prepare_moe_summary_sources`], which builds one in-memory U8 heatmap

@@ -1,5 +1,5 @@
-//! Tensor-aware layout module: the architectural canvas, MoE-diff matrix
-//! layout, transformer-name classification, dtype-aware element colorizers,
+//! Tensor-aware layout module: the architectural canvas, MoE summary / CKA
+//! layouts, transformer-name classification, dtype-aware element colorizers,
 //! and the matching `LayoutPlugin` impls.
 
 pub mod arch;
@@ -12,7 +12,7 @@ use std::any::Any;
 
 use arbvis::{CanvasGeom, LayoutBuildCtx, LayoutMode, LayoutPlugin, LayoutShape};
 
-use crate::data::{MoeCell, MoeCkaPanel, MoeSummaryPanel, SourceMeta};
+use crate::data::{MoeCkaPanel, MoeSummaryPanel, SourceMeta};
 use crate::format::{Dtype, ModelInfo};
 pub use arch::ArchLayout;
 
@@ -28,10 +28,11 @@ impl LayoutShape for ArchLayout {
         // `map.fitBounds(...)` in the leaflet HTML zooms onto the matrix
         // instead of the next-pow2-padded tile grid. The padded canvas is
         // typically much larger than the placed-tensor extent — most starkly
-        // for the MoE-diff layout where a 5272×37792-pixel matrix is padded
-        // to an 8192×65536-pixel canvas (raw 11×74 tiles → next_pow2 16×128).
-        // Without this override the initial view fits the padded canvas and
-        // the matrix becomes a tiny strip in a sea of empty padding tiles.
+        // for the tall MoE layouts (e.g. the CKA grid stacks many per-layer
+        // panels, so a content extent well short of a power-of-two tile count
+        // gets padded up to the next pow2 on each axis). Without this override
+        // the initial view fits the padded canvas and the content becomes a
+        // tiny strip in a sea of empty padding tiles.
         //
         // Tile coords still operate on the padded grid (`width_tiles`,
         // `height_tiles` unchanged) — the pyramid accumulator needs a
@@ -237,38 +238,12 @@ impl LayoutPlugin for ArchLayoutPlugin {
     }
 }
 
-/// MoE-diff plugin — applies when any source carries a `MoeCell` tag (only
-/// emitted by the MoE-diff source preparation in arbvis, so this fork
-/// can't collide with a normal arch run).
-pub struct MoeDiffLayoutPlugin;
-
-impl LayoutPlugin for MoeDiffLayoutPlugin {
-    fn id(&self) -> &'static str {
-        "moe-diff"
-    }
-    fn priority(&self) -> i32 {
-        200
-    }
-    fn applicable(&self, ctx: &LayoutBuildCtx<'_>) -> bool {
-        if matches!(ctx.mode, LayoutMode::Hilbert) {
-            return false;
-        }
-        ctx.sources
-            .iter()
-            .any(|s| s.extensions.get::<MoeCell>().is_some())
-    }
-    fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
-        ArchLayout::try_build_moe_diff(ctx.sources, ctx.cumulative_offsets)
-            .map(|l| Box::new(l) as Box<dyn LayoutShape>)
-    }
-}
-
 /// MoE-summary plugin — applies when any source carries a `MoeSummaryPanel`
 /// tag (set by [`crate::data::prepare_moe_summary_sources`]).
 ///
-/// Can't collide with [`MoeDiffLayoutPlugin`]: the two are mutually
-/// exclusive at the CLI layer (`--moe-diff` vs `--moe-summary`) and use
-/// different per-source extension tags.
+/// Can't collide with [`MoeCkaLayoutPlugin`]: the two are mutually exclusive
+/// at the CLI layer (`--moe-summary` vs `--moe-cka`) and use different
+/// per-source extension tags.
 pub struct MoeSummaryLayoutPlugin;
 
 impl LayoutPlugin for MoeSummaryLayoutPlugin {
