@@ -114,6 +114,44 @@ pub fn parse_hf_router(name: &str) -> Option<u32> {
     }
 }
 
+/// One of the two batched fused-expert tensors in the newer `transformers`
+/// MoE export, where all experts of a layer share a single parameter rather
+/// than one tensor per expert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FusedExpertTensor {
+    /// `mlp.experts.gate_up_proj`, shape `[n_experts, 2·intermediate, hidden]`.
+    /// The first `intermediate` rows of dim 1 are the gate matrix, the next
+    /// `intermediate` rows are the up matrix (concatenated along the output
+    /// dim) — matching how [`crate::probe::mixtral`] slices it for the forward.
+    GateUp,
+    /// `mlp.experts.down_proj`, shape `[n_experts, hidden, intermediate]`.
+    Down,
+}
+
+/// Parse a batched fused-expert tensor name from the newer `transformers`
+/// MoE export. Returns the layer index and which of the two batched tensors
+/// it is, for `model.layers.{L}.mlp.experts.{gate_up_proj|down_proj}` (with
+/// or without a trailing `.weight`). Returns `None` for anything else.
+///
+/// This is the fused counterpart to [`parse_hf_expert`] (one tensor *per*
+/// expert): the two never collide because [`parse_hf_expert`] requires an
+/// `experts.{E}.…` numeric index, which the batched names lack. Unlike
+/// [`is_fused_gguf_expert`] — which exists only to *reject* GGUF fusion —
+/// this layout *is* sliceable into per-expert byte ranges, so callers use it
+/// to build per-expert scalar jobs.
+pub fn parse_hf_fused_expert(name: &str) -> Option<(u32, FusedExpertTensor)> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let (layer_str, rest) = rest.split_once('.')?;
+    let layer_idx: u32 = layer_str.parse().ok()?;
+    let leaf = rest.strip_prefix("mlp.experts.")?;
+    let kind = match leaf {
+        "gate_up_proj" | "gate_up_proj.weight" => FusedExpertTensor::GateUp,
+        "down_proj" | "down_proj.weight" => FusedExpertTensor::Down,
+        _ => return None,
+    };
+    Some((layer_idx, kind))
+}
+
 /// Whether `name` is a GGUF fused-expert tensor (`ffn_{gate|up|down}_exps.weight`,
 /// optionally under `blk.{L}.`). Used by callers to bail with a clear error
 /// before attempting per-expert layout on a GGUF checkpoint.
@@ -275,6 +313,50 @@ mod tests {
     #[test]
     fn router_rejects_unparseable_indices() {
         assert_eq!(parse_hf_router("model.layers.x.mlp.gate.weight"), None);
+    }
+
+    #[test]
+    fn parses_hf_fused_experts() {
+        // Newer transformers export: batched per-layer expert tensors.
+        assert_eq!(
+            parse_hf_fused_expert("model.layers.0.mlp.experts.gate_up_proj"),
+            Some((0, FusedExpertTensor::GateUp)),
+        );
+        assert_eq!(
+            parse_hf_fused_expert("model.layers.31.mlp.experts.down_proj"),
+            Some((31, FusedExpertTensor::Down)),
+        );
+        // Tolerate a trailing `.weight` (some exports keep it).
+        assert_eq!(
+            parse_hf_fused_expert("model.layers.7.mlp.experts.gate_up_proj.weight"),
+            Some((7, FusedExpertTensor::GateUp)),
+        );
+    }
+
+    #[test]
+    fn fused_parser_does_not_collide_with_per_expert() {
+        // The per-expert parser must reject the batched names…
+        assert_eq!(
+            parse_hf_expert("model.layers.0.mlp.experts.gate_up_proj"),
+            None,
+        );
+        assert_eq!(parse_hf_expert("model.layers.0.mlp.experts.down_proj"), None);
+        // …and the fused parser must reject the indexed per-expert names.
+        assert_eq!(
+            parse_hf_fused_expert("model.layers.0.mlp.experts.0.gate_proj.weight"),
+            None,
+        );
+        assert_eq!(
+            parse_hf_fused_expert("model.layers.0.block_sparse_moe.experts.0.w1.weight"),
+            None,
+        );
+        // Router and biases are not fused-expert tensors.
+        assert_eq!(parse_hf_fused_expert("model.layers.0.mlp.gate.weight"), None);
+        assert_eq!(
+            parse_hf_fused_expert("model.layers.0.mlp.experts.gate_up_proj_bias"),
+            None,
+        );
+        assert_eq!(parse_hf_fused_expert("model.layers.x.mlp.experts.down_proj"), None);
     }
 
     #[test]

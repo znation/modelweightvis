@@ -1923,6 +1923,144 @@ pub async fn prepare_moe_diff_sources(
     Ok((sources, total))
 }
 
+/// `(layer, weight, expert)` key for one per-expert summary scalar.
+type ScalarKey = (u32, crate::format::moe::ExpertWeight, u32);
+/// A unit of scalar work: which bytes to read and how to interpret them —
+/// `(key, shard_idx, file_start, byte_len, dtype)`. Produced both by the
+/// per-expert tensor scan and by [`build_fused_expert_jobs`].
+type ScalarJob = (ScalarKey, usize, u64, u64, format::Dtype);
+
+/// Whether `dtype` stores elements in blocks / bit-packed groups rather than
+/// a fixed number of contiguous bytes per element. Such tensors can't be
+/// sliced on arbitrary element boundaries, so the fused per-expert slicer
+/// skips them.
+fn is_block_or_packed_dtype(dtype: format::Dtype) -> bool {
+    use format::Dtype::*;
+    matches!(
+        dtype,
+        Q4_0 | Q4_1
+            | Q5_0
+            | Q5_1
+            | Q8_0
+            | Q8_1
+            | Q2K
+            | Q3K
+            | Q4K
+            | Q5K
+            | Q6K
+            | Q8K
+            | Int4Packed
+            | Int3Packed
+            | Int8Packed
+    )
+}
+
+/// Slice batched fused-expert tensors into per-expert [`ScalarJob`]s.
+///
+/// `mlp.experts.gate_up_proj` is `[E, 2·inter, H]` (gate rows then up rows
+/// along dim 1); `mlp.experts.down_proj` is `[E, H, inter]`. Each expert's
+/// weight occupies a contiguous element-major byte sub-range of the batched
+/// tensor, so we emit one job per `(layer, weight, expert)` pointing at that
+/// range — the existing `scalar_from_buf` path then reads it unchanged. This
+/// mirrors how [`crate::probe::mixtral`] slices the same tensors for the
+/// forward pass.
+///
+/// Returns the jobs, the largest per-layer expert count seen (for canvas
+/// sizing), and the set of layers that carried fused tensors. Block-quantized
+/// / bit-packed dtypes can't be sub-sliced on element boundaries, so such
+/// tensors are logged and skipped rather than mis-read.
+fn build_fused_expert_jobs(
+    fused: &std::collections::BTreeMap<
+        (u32, crate::format::moe::FusedExpertTensor),
+        (usize, format::TensorMeta),
+    >,
+) -> (Vec<ScalarJob>, u32, std::collections::BTreeSet<u32>) {
+    use crate::format::moe::{ExpertWeight as EW, FusedExpertTensor};
+    let mut jobs: Vec<ScalarJob> = Vec::new();
+    let mut n_experts: u32 = 0;
+    let mut layers: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+
+    for (&(layer_idx, kind), (shard, meta)) in fused {
+        if is_block_or_packed_dtype(meta.dtype) {
+            log::warn!(
+                "moe-summary: fused expert tensor at layer {} has block/packed dtype {:?}; \
+                 cannot slice per-expert — skipping",
+                layer_idx,
+                meta.dtype,
+            );
+            continue;
+        }
+        if meta.shape.len() != 3 {
+            log::warn!(
+                "moe-summary: fused expert tensor at layer {} has rank {} (expected 3); skipping",
+                layer_idx,
+                meta.shape.len(),
+            );
+            continue;
+        }
+        let e = meta.shape[0];
+        let elem = meta.dtype.element_size() as u64;
+        // Per-expert element count + which (weight, sub-offset, sub-len) slots
+        // live inside one expert's block, in *elements*.
+        let (per_expert_elems, slots): (u64, Vec<(EW, u64, u64)>) = match kind {
+            FusedExpertTensor::GateUp => {
+                let two_inter = meta.shape[1];
+                let h = meta.shape[2];
+                if two_inter % 2 != 0 {
+                    log::warn!(
+                        "moe-summary: fused gate_up_proj at layer {} has odd dim1={} \
+                         (expected 2*intermediate); skipping",
+                        layer_idx,
+                        two_inter,
+                    );
+                    continue;
+                }
+                let half = (two_inter / 2) * h; // elements in one of {gate, up}
+                (
+                    two_inter * h,
+                    vec![(EW::GateProj, 0, half), (EW::UpProj, half, half)],
+                )
+            }
+            FusedExpertTensor::Down => {
+                let block = meta.shape[1] * meta.shape[2]; // H * inter
+                (block, vec![(EW::DownProj, 0, block)])
+            }
+        };
+        n_experts = n_experts.max(e as u32);
+        layers.insert(layer_idx);
+        let per_expert_bytes = per_expert_elems * elem;
+        for expert_idx in 0..e {
+            let expert_base = meta.file_start + expert_idx * per_expert_bytes;
+            for &(weight, sub_off_elems, sub_len_elems) in &slots {
+                let start = expert_base + sub_off_elems * elem;
+                let len = sub_len_elems * elem;
+                // Defensive: never read past the tensor's own byte range.
+                if start + len > meta.file_end {
+                    log::warn!(
+                        "moe-summary: fused {} slice for layer {} expert {} out of range \
+                         (start={} len={} end={}); skipping",
+                        weight.label(),
+                        layer_idx,
+                        expert_idx,
+                        start,
+                        len,
+                        meta.file_end,
+                    );
+                    continue;
+                }
+                jobs.push((
+                    (layer_idx, weight, expert_idx as u32),
+                    *shard,
+                    start,
+                    len,
+                    meta.dtype,
+                ));
+            }
+        }
+    }
+    (jobs, n_experts, layers)
+}
+
 /// Build per-expert summary `Source`s for `--moe-summary`. Emits one
 /// `Source` per per-weight panel (gate / up / down, plus router when the
 /// checkpoint has `mlp.gate.weight` tensors) carrying a `MoeSummaryPanel`
@@ -2116,12 +2254,19 @@ pub async fn prepare_moe_summary_sources(
     }
 
     // === Group per-expert + router tensors ================================
-    use crate::format::moe::{parse_hf_expert, parse_hf_router, ExpertWeight as EW};
+    use crate::format::moe::{
+        parse_hf_expert, parse_hf_fused_expert, parse_hf_router, ExpertWeight as EW,
+        FusedExpertTensor,
+    };
     use std::collections::BTreeMap;
     type LayerKey = (u32, EW);
     let mut expert_groups: BTreeMap<LayerKey, BTreeMap<u32, (usize, format::TensorMeta)>> =
         BTreeMap::new();
     let mut routers: BTreeMap<u32, (usize, format::TensorMeta)> = BTreeMap::new();
+    // Batched fused-expert tensors (newer transformers export): one entry per
+    // `(layer, GateUp|Down)`, sliced into per-expert byte ranges below.
+    let mut fused: BTreeMap<(u32, FusedExpertTensor), (usize, format::TensorMeta)> =
+        BTreeMap::new();
     for (shard_idx, tensors) in &headers {
         for t in tensors {
             if let Some(r) = parse_hf_expert(&t.name) {
@@ -2129,16 +2274,27 @@ pub async fn prepare_moe_summary_sources(
                     .entry((r.layer_idx, r.weight))
                     .or_default()
                     .insert(r.expert_idx, (*shard_idx, t.clone()));
+            } else if let Some((layer_idx, kind)) = parse_hf_fused_expert(&t.name) {
+                fused.insert((layer_idx, kind), (*shard_idx, t.clone()));
             } else if let Some(layer_idx) = parse_hf_router(&t.name) {
                 routers.insert(layer_idx, (*shard_idx, t.clone()));
             }
         }
     }
 
-    if expert_groups.is_empty() {
+    // Slice the batched fused tensors into per-expert scalar jobs. Each
+    // expert's gate/up/down weights occupy a contiguous byte sub-range of
+    // the batched tensor (row-major over `[E, …, …]`), so the existing
+    // `scalar_from_buf` machinery applies unchanged — we just hand it the
+    // right offset and length. Returns the jobs plus the per-layer expert
+    // count discovered from the tensor shapes.
+    let (fused_jobs, fused_n_experts, fused_layers) = build_fused_expert_jobs(&fused);
+
+    if expert_groups.is_empty() && fused_jobs.is_empty() {
         anyhow::bail!(
             "--moe-summary: no per-expert tensors found in {input} \
-             (expected `model.layers.{{L}}.mlp.experts.{{E}}.{{gate|up|down}}_proj.weight`)"
+             (expected `model.layers.{{L}}.mlp.experts.{{E}}.{{gate|up|down}}_proj.weight` \
+             or batched `model.layers.{{L}}.mlp.experts.{{gate_up_proj|down_proj}}`)"
         );
     }
 
@@ -2154,6 +2310,11 @@ pub async fn prepare_moe_summary_sources(
         for l in routers.keys() {
             set.insert(*l);
         }
+        // Fused checkpoints carry no per-expert tensors, so their layers come
+        // entirely from the batched-tensor scan.
+        for l in &fused_layers {
+            set.insert(*l);
+        }
         set.into_iter().collect()
     };
     let n_experts: u32 = expert_groups
@@ -2161,7 +2322,8 @@ pub async fn prepare_moe_summary_sources(
         .flat_map(|m| m.keys().copied())
         .max()
         .map(|m| m + 1)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(fused_n_experts);
     let n_layers = layer_ids.len() as u32;
     if n_layers == 0 || n_experts == 0 {
         anyhow::bail!("--moe-summary: derived n_layers=0 or n_experts=0 from {input}");
@@ -2178,8 +2340,6 @@ pub async fn prepare_moe_summary_sources(
     // whole tensor through `scalar_from_buf` (single pass, dtype-aware).
     // Experts within one layer are independent → parallelised per panel
     // via `buffer_unordered`.
-    type ScalarKey = (u32, EW, u32); // (layer, weight, expert)
-    type ScalarJob = (ScalarKey, usize, u64, u64, format::Dtype);
     let mut jobs: Vec<ScalarJob> = Vec::new();
     for ((layer_idx, weight), experts) in &expert_groups {
         for (&expert_idx, (shard, meta)) in experts {
@@ -2193,6 +2353,9 @@ pub async fn prepare_moe_summary_sources(
             ));
         }
     }
+    // Per-expert jobs sliced out of the batched fused tensors join the same
+    // pool — downstream only cares about `(layer, weight, expert) → scalar`.
+    jobs.extend(fused_jobs);
     let pb = setup_progress("moe-summary expert scalars", jobs.len() as u64);
     let datas_ref = &datas;
     let pb_for_workers = pb.clone();
@@ -3212,4 +3375,98 @@ async fn fetch_hf_sidecar(
         .await
         .with_context(|| format!("reading body of {filename}"))?;
     Ok(bytes.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::moe::{ExpertWeight as EW, FusedExpertTensor};
+    use std::collections::BTreeMap;
+
+    fn meta(shape: Vec<u64>, dtype: format::Dtype, file_start: u64) -> format::TensorMeta {
+        let elems: u64 = shape.iter().product();
+        format::TensorMeta {
+            name: "fused".into(),
+            dtype,
+            file_start,
+            file_end: file_start + elems * dtype.element_size() as u64,
+            shape,
+            packed_sidecars: None,
+        }
+    }
+
+    #[test]
+    fn fused_jobs_slice_gate_up_and_down_at_correct_offsets() {
+        // E=2 experts, intermediate=4, hidden=4 → gate_up = [2, 8, 4],
+        // down = [2, 4, 4]. F32 (4 bytes/elem) keeps the arithmetic legible.
+        let mut fused: BTreeMap<(u32, FusedExpertTensor), (usize, format::TensorMeta)> =
+            BTreeMap::new();
+        // gate_up_proj at file offset 1000; down_proj (shard 1) at 5000.
+        fused.insert(
+            (0, FusedExpertTensor::GateUp),
+            (0, meta(vec![2, 8, 4], format::Dtype::F32, 1000)),
+        );
+        fused.insert(
+            (0, FusedExpertTensor::Down),
+            (1, meta(vec![2, 4, 4], format::Dtype::F32, 5000)),
+        );
+
+        let (jobs, n_experts, layers) = build_fused_expert_jobs(&fused);
+        assert_eq!(n_experts, 2);
+        assert_eq!(layers.into_iter().collect::<Vec<_>>(), vec![0]);
+
+        // Index the jobs by (layer, weight, expert) for assertion.
+        let by_key: BTreeMap<ScalarKey, (usize, u64, u64, format::Dtype)> = jobs
+            .iter()
+            .map(|&(k, shard, start, len, dt)| (k, (shard, start, len, dt)))
+            .collect();
+
+        // Per expert, the gate_up block is 8*4*4 = 128 bytes; each of gate/up
+        // is half (4*4*4 = 64 bytes). Expert 1's block starts 128 bytes in.
+        // gate(e0): [1000, +64); up(e0): [1064, +64).
+        assert_eq!(by_key[&(0, EW::GateProj, 0)], (0, 1000, 64, format::Dtype::F32));
+        assert_eq!(by_key[&(0, EW::UpProj, 0)], (0, 1064, 64, format::Dtype::F32));
+        // gate(e1): [1128, +64); up(e1): [1192, +64).
+        assert_eq!(by_key[&(0, EW::GateProj, 1)], (0, 1128, 64, format::Dtype::F32));
+        assert_eq!(by_key[&(0, EW::UpProj, 1)], (0, 1192, 64, format::Dtype::F32));
+        // down block per expert is 4*4*4 = 64 bytes, shard 1.
+        assert_eq!(by_key[&(0, EW::DownProj, 0)], (1, 5000, 64, format::Dtype::F32));
+        assert_eq!(by_key[&(0, EW::DownProj, 1)], (1, 5064, 64, format::Dtype::F32));
+        // Exactly 6 jobs (2 experts × {gate, up, down}).
+        assert_eq!(jobs.len(), 6);
+    }
+
+    #[test]
+    fn fused_jobs_skip_block_quantized_and_malformed() {
+        // Block-quantized dtype can't be sub-sliced → skipped.
+        let mut q: BTreeMap<(u32, FusedExpertTensor), (usize, format::TensorMeta)> =
+            BTreeMap::new();
+        q.insert(
+            (0, FusedExpertTensor::GateUp),
+            (0, meta(vec![2, 8, 4], format::Dtype::Q4K, 0)),
+        );
+        let (jobs, n, _) = build_fused_expert_jobs(&q);
+        assert!(jobs.is_empty());
+        assert_eq!(n, 0);
+
+        // Odd dim-1 on gate_up (not 2*intermediate) → skipped.
+        let mut odd: BTreeMap<(u32, FusedExpertTensor), (usize, format::TensorMeta)> =
+            BTreeMap::new();
+        odd.insert(
+            (0, FusedExpertTensor::GateUp),
+            (0, meta(vec![2, 7, 4], format::Dtype::F32, 0)),
+        );
+        let (jobs, _, _) = build_fused_expert_jobs(&odd);
+        assert!(jobs.is_empty());
+
+        // Wrong rank → skipped.
+        let mut rank: BTreeMap<(u32, FusedExpertTensor), (usize, format::TensorMeta)> =
+            BTreeMap::new();
+        rank.insert(
+            (0, FusedExpertTensor::Down),
+            (0, meta(vec![2, 4], format::Dtype::F32, 0)),
+        );
+        let (jobs, _, _) = build_fused_expert_jobs(&rank);
+        assert!(jobs.is_empty());
+    }
 }
