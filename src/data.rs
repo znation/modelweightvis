@@ -1813,10 +1813,10 @@ async fn open_moe_model_sources(input: &str, stream: bool) -> anyhow::Result<Loa
 /// logged and skipped so the other scene still renders. Only an
 /// all-scenes-failed run is a hard error.
 ///
-/// Note: when `--probe` is enabled each scene runs its own probe forward (a
-/// `RoutingCapture` carries both the routing-frequency and co-activation
-/// signals, so this is a future dedup opportunity — the static model load is
-/// already shared via [`open_moe_model_sources`]).
+/// When `--probe` is enabled the routing-faithful forward runs exactly **once**
+/// here — a single [`crate::probe::RoutingCapture`] carries both the
+/// routing-frequency (summary) and co-activation (CKA) signals — and the
+/// capture is shared with both scene builders.
 pub async fn prepare_moe_scenes_sources(
     input: &str,
     stat: format::SummaryStat,
@@ -1826,9 +1826,31 @@ pub async fn prepare_moe_scenes_sources(
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let loaded = open_moe_model_sources(input, stream).await?;
 
+    // Run the probe forward at most once and share its capture across scenes.
+    // Non-fatal: an unsupported architecture or a failed forward logs and drops
+    // the behavioral panels; the static scenes still render.
+    let capture = if probe.enabled {
+        match run_probe_capture(input, probe).await {
+            Ok(Some(c)) => Some(c),
+            Ok(None) => {
+                log::warn!(
+                    "--moe: --probe requested but the architecture isn't supported; \
+                     skipping behavioral panels"
+                );
+                None
+            }
+            Err(e) => {
+                log::warn!("--moe: --probe forward failed ({e:#}); skipping behavioral panels");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut sources: Vec<Source> = Vec::new();
 
-    match build_moe_summary_sources(&loaded, stat, probe, input).await {
+    match build_moe_summary_sources(&loaded, stat, capture.as_ref(), input).await {
         Ok(mut summary) => {
             tag_scene(&mut summary, "summary", "Summary", 0);
             sources.append(&mut summary);
@@ -1836,7 +1858,7 @@ pub async fn prepare_moe_scenes_sources(
         Err(e) => log::warn!("--moe: summary scene could not be built ({e:#}); skipping it"),
     }
 
-    match build_moe_cka_sources(&loaded, sample, probe, input).await {
+    match build_moe_cka_sources(&loaded, sample, capture.as_ref(), input).await {
         Ok(mut cka) => {
             tag_scene(&mut cka, "cka", "CKA", 1);
             sources.append(&mut cka);
@@ -1878,7 +1900,7 @@ fn tag_scene(sources: &mut [Source], key: &str, label: &str, order: u32) {
 async fn build_moe_summary_sources(
     loaded: &LoadedMoe,
     stat: format::SummaryStat,
-    probe: &arbvis::ProbeOpts,
+    probe_capture: Option<&crate::probe::RoutingCapture>,
     input: &str,
 ) -> anyhow::Result<Vec<Source>> {
     // Cheap clones: `datas` only bumps Arc refcounts (shared shard bytes),
@@ -2191,26 +2213,20 @@ async fn build_moe_summary_sources(
         total_bytes += nbytes;
     }
 
-    // === Optional probe forward pass =====================================
-    // When `--probe` is set, run a routing-faithful forward on the
-    // resolved probe text and emit one extra Source per ProbeStat
-    // tagged with `MoeProbePanel`. The layout merges these alongside
-    // the static panels.
-    if probe.enabled {
-        match attach_probe_panel(input, probe, n_layers, n_experts).await {
-            Ok(Some(source)) => {
+    // === Optional probe panel ============================================
+    // The probe forward is run once by `prepare_moe_scenes_sources`; if it
+    // produced a capture, turn its routing-frequency signal into one extra
+    // `MoeProbePanel` source. The layout merges it alongside the static panels.
+    if let Some(capture) = probe_capture {
+        match attach_probe_panel(capture, n_layers, n_experts) {
+            Ok(source) => {
                 total_bytes += source.byte_size;
                 sources.push(source);
             }
-            Ok(None) => {
-                log::warn!(
-                    "moe-summary: --probe requested but no panel produced (unsupported arch?)"
-                );
-            }
             Err(e) => {
-                // Probe failures are non-fatal: log and skip the panel
-                // so the static summary still renders.
-                log::warn!("moe-summary: --probe forward failed ({e:#}); skipping probe panel");
+                // A dim mismatch is non-fatal: log and skip the panel so the
+                // static summary still renders.
+                log::warn!("moe-summary: probe panel skipped ({e:#})");
             }
         }
     }
@@ -2306,21 +2322,15 @@ async fn run_probe_capture(
     Ok(Some(capture))
 }
 
-/// Resolve the probe input, run the routing-faithful forward, and
-/// package the resulting routing-frequency capture as one `Source`
-/// tagged with `MoeProbePanel`. Returns `Ok(None)` only when the
-/// model's architecture isn't supported by the probe (and we want
-/// the caller to log a warning rather than fail).
-async fn attach_probe_panel(
-    input: &str,
-    probe: &arbvis::ProbeOpts,
+/// Build the summary scene's behavioral panel — a per-`(layer, expert)`
+/// routing-frequency heatmap — from an already-captured routing forward (run
+/// once by [`prepare_moe_scenes_sources`] and shared across scenes). Tagged
+/// with `MoeProbePanel`. Errors only on a capture/summary dimension mismatch.
+fn attach_probe_panel(
+    capture: &crate::probe::RoutingCapture,
     n_layers: u32,
     n_experts: u32,
-) -> anyhow::Result<Option<Source>> {
-    let Some(capture) = run_probe_capture(input, probe).await? else {
-        return Ok(None);
-    };
-
+) -> anyhow::Result<Source> {
     // Normalize freq to U8 per-panel (same convention as the static
     // summary panels): max → 255, 0 → 0.
     let max = capture.freq.iter().copied().fold(0.0_f32, f32::max).max(1e-12);
@@ -2370,7 +2380,7 @@ async fn attach_probe_panel(
         n_layers,
         n_experts,
     });
-    Ok(Some(Source {
+    Ok(Source {
         // file_idx is overwritten by the caller before push.
         file_idx: 0,
         kind: SourceKind::Buffered(bytes_u8),
@@ -2378,24 +2388,19 @@ async fn attach_probe_panel(
         name_override: Some(label),
         xet_terms: None,
         extensions,
-    }))
+    })
 }
 
-/// Resolve the probe input, run the routing-faithful forward, and package
-/// the per-layer routing co-activation matrices as one `Source` per layer,
-/// each tagged with `MoeCkaProbePanel`. The CKA layout slots these in as an
-/// extra column. Returns `Ok(None)` only when the model's architecture isn't
-/// supported by the probe (caller logs a warning rather than fail).
-async fn attach_cka_probe_panels(
-    input: &str,
-    probe: &arbvis::ProbeOpts,
+/// Build the CKA scene's behavioral panels — one per-layer `n_experts ×
+/// n_experts` routing co-activation matrix — from an already-captured routing
+/// forward (run once by [`prepare_moe_scenes_sources`] and shared across
+/// scenes). Each is tagged with `MoeCkaProbePanel`; the CKA layout slots them
+/// in as an extra column. Errors only on a capture/CKA dimension mismatch.
+fn attach_cka_probe_panels(
+    capture: &crate::probe::RoutingCapture,
     n_layers: u32,
     n_experts: u32,
-) -> anyhow::Result<Option<Vec<Source>>> {
-    let Some(capture) = run_probe_capture(input, probe).await? else {
-        return Ok(None);
-    };
-
+) -> anyhow::Result<Vec<Source>> {
     // Refuse to attach if dimensions don't match the static CKA panels —
     // would mis-place / mis-render the heatmaps in the grid.
     if capture.n_layers != n_layers || capture.n_experts != n_experts {
@@ -2459,7 +2464,7 @@ async fn attach_cka_probe_panels(
             extensions,
         });
     }
-    Ok(Some(out))
+    Ok(out)
 }
 
 /// Dispatch a [`format::SummaryStat`] over a contiguous tensor byte slice.
@@ -2512,7 +2517,7 @@ fn decode_tensor_to_f32(dtype: format::Dtype, bytes: &[u8], n_elements: usize) -
 async fn build_moe_cka_sources(
     loaded: &LoadedMoe,
     sample: u32,
-    probe: &arbvis::ProbeOpts,
+    probe_capture: Option<&crate::probe::RoutingCapture>,
     input: &str,
 ) -> anyhow::Result<Vec<Source>> {
     // Cheap clones: see [`build_moe_summary_sources`].
@@ -2657,24 +2662,17 @@ async fn build_moe_cka_sources(
     // matrix) tagged with `MoeCkaProbePanel`. The CKA layout merges these in
     // as an extra column. Probe failures are non-fatal: log and skip so the
     // static CKA grid still renders.
-    if probe.enabled {
-        match attach_cka_probe_panels(input, probe, n_layers, n_experts).await {
-            Ok(Some(panels)) => {
+    if let Some(capture) = probe_capture {
+        match attach_cka_probe_panels(capture, n_layers, n_experts) {
+            Ok(panels) => {
                 for mut source in panels {
                     source.file_idx = sources.len();
                     total_bytes += source.byte_size;
                     sources.push(source);
                 }
             }
-            Ok(None) => {
-                log::warn!(
-                    "moe-cka: --probe requested but no panel produced (unsupported arch?)"
-                );
-            }
             Err(e) => {
-                log::warn!(
-                    "moe-cka: --probe forward failed ({e:#}); skipping co-activation panels"
-                );
+                log::warn!("moe-cka: co-activation panels skipped ({e:#})");
             }
         }
     }
