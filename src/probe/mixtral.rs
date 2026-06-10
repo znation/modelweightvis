@@ -47,8 +47,8 @@ use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::layout::model_config::ModelConfig;
 use crate::probe::common::{
-    dispatch_experts, renormalize_topk, rms_norm, topk_per_row, GqaAttention, RotaryEmbedding,
-    SwiGluExpert,
+    accumulate_coactivation, dispatch_experts, renormalize_topk, rms_norm, topk_per_row,
+    GqaAttention, RotaryEmbedding, SwiGluExpert,
 };
 use crate::probe::RoutingCapture;
 
@@ -150,6 +150,8 @@ pub fn run(
 
     // Per-layer routing-decision counts; divided by n_tokens at the end.
     let mut counts = vec![0u32; cfg.n_layers * cfg.n_experts];
+    // Per-layer routing co-occurrence counts (`--moe-cka --probe`).
+    let mut coact_counts = vec![0u32; cfg.n_layers * cfg.n_experts * cfg.n_experts];
 
     let layers_vb = vb.pp("model.layers");
     let pb = indicatif::ProgressBar::new(cfg.n_layers as u64);
@@ -180,6 +182,14 @@ pub fn run(
         for &e in &topk_indices_host {
             counts[layer_off + e as usize] += 1;
         }
+        accumulate_coactivation(
+            &mut coact_counts,
+            &topk_indices_host,
+            n_tokens,
+            cfg.top_k,
+            cfg.n_experts,
+            layer_idx,
+        );
 
         // Mixtral always renormalises the top-k routing weights to sum to 1.
         let topk_weights_renorm = renormalize_topk(&topk_weights_host, cfg.top_k);
@@ -204,12 +214,17 @@ pub fn run(
     pb.finish_and_clear();
 
     let freq: Vec<f32> = counts.iter().map(|&c| c as f32 / n_tokens as f32).collect();
+    let coact: Vec<f32> = coact_counts
+        .iter()
+        .map(|&c| c as f32 / n_tokens as f32)
+        .collect();
 
     Ok(RoutingCapture {
         n_layers: cfg.n_layers as u32,
         n_experts: cfg.n_experts as u32,
         n_tokens: n_tokens as u32,
         freq,
+        coact,
     })
 }
 
@@ -425,6 +440,28 @@ mod tests {
                 (mass - k).abs() < 1e-3,
                 "layer {l}: routing-freq mass {mass} != top_k {k}",
             );
+        }
+
+        // Co-activation matrix: right size, symmetric, and its diagonal equals
+        // the per-expert routing frequency (a token co-activates an expert with
+        // itself exactly when it selects it).
+        assert_eq!(cap.coact.len(), cap.n_layers as usize * ne * ne);
+        for l in 0..cap.n_layers as usize {
+            let block = &cap.coact[l * ne * ne..(l + 1) * ne * ne];
+            for i in 0..ne {
+                for j in 0..ne {
+                    assert!(
+                        (block[i * ne + j] - block[j * ne + i]).abs() < 1e-6,
+                        "layer {l}: co-activation asymmetry at ({i},{j})",
+                    );
+                }
+                let diag = block[i * ne + i];
+                let freq = cap.freq[l * ne + i];
+                assert!(
+                    (diag - freq).abs() < 1e-6,
+                    "layer {l} expert {i}: co-activation diagonal {diag} != freq {freq}",
+                );
+            }
         }
     }
 

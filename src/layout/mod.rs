@@ -12,7 +12,7 @@ use std::any::Any;
 
 use arbvis::{CanvasGeom, LayoutBuildCtx, LayoutMode, LayoutPlugin, LayoutShape};
 
-use crate::data::{MoeCkaPanel, MoeSummaryPanel, SourceMeta};
+use crate::data::{MoeCkaPanel, MoeCkaProbePanel, MoeSummaryPanel, SourceMeta};
 use crate::format::{Dtype, ModelInfo};
 pub use arch::ArchLayout;
 
@@ -267,9 +267,9 @@ impl LayoutPlugin for MoeSummaryLayoutPlugin {
     }
 }
 
-/// MoE-CKA plugin — applies when any source carries a `MoeCkaPanel` tag
-/// (set by [`crate::data::prepare_moe_cka_sources`]). Mutually exclusive
-/// with the other MoE plugins at the CLI layer.
+/// MoE-CKA plugin — applies when any source carries a `MoeCkaPanel` or
+/// `MoeCkaProbePanel` tag (set by [`crate::data::prepare_moe_cka_sources`]).
+/// Mutually exclusive with the other MoE plugins at the CLI layer.
 pub struct MoeCkaLayoutPlugin;
 
 impl LayoutPlugin for MoeCkaLayoutPlugin {
@@ -283,9 +283,10 @@ impl LayoutPlugin for MoeCkaLayoutPlugin {
         if matches!(ctx.mode, LayoutMode::Hilbert) {
             return false;
         }
-        ctx.sources
-            .iter()
-            .any(|s| s.extensions.get::<MoeCkaPanel>().is_some())
+        ctx.sources.iter().any(|s| {
+            s.extensions.get::<MoeCkaPanel>().is_some()
+                || s.extensions.get::<MoeCkaProbePanel>().is_some()
+        })
     }
     fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
         ArchLayout::try_build_moe_cka(ctx.sources, ctx.cumulative_offsets)

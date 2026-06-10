@@ -662,9 +662,14 @@ impl ArchLayout {
                     tag.n_experts,
                 ));
             } else if let Some(tag) = s.extensions.get::<crate::data::MoeProbePanel>().copied() {
-                let (secondary, label) = match tag.stat {
-                    crate::data::ProbeStat::RoutingFreq => (0, "routing_freq"),
+                // `MoeProbePanel` only ever carries `RoutingFreq` here
+                // (co-activation goes to the CKA layout); the arm keeps the
+                // match exhaustive and the secondary sort key stable.
+                let secondary = match tag.stat {
+                    crate::data::ProbeStat::RoutingFreq => 0,
+                    crate::data::ProbeStat::RoutingCoactivation => 1,
                 };
+                let label = tag.stat.label();
                 panels.push((
                     (1, secondary, label),
                     sidx,
@@ -794,25 +799,55 @@ impl ArchLayout {
     /// Build the per-`(layer, weight)` CKA-similarity canvas. Each panel
     /// is one synthetic U8 tensor of shape `(n_experts, n_experts)`
     /// rendered at `MOE_CKA_CELL_PX` pixels per cell. Panels are arranged
-    /// in a `n_layers × 3` grid: rows ascending by layer index, columns
-    /// gate_proj | up_proj | down_proj.
+    /// in a `n_layers × n_columns` grid: rows ascending by layer index,
+    /// columns gate_proj | up_proj | down_proj, plus an optional trailing
+    /// `coactivation` column when `--probe` is set (per-layer routing
+    /// co-activation matrices tagged `MoeCkaProbePanel`).
     ///
     /// Triggered by [`crate::layout::select_layout`] when any source
-    /// carries a `MoeCkaPanel` tag (set by
+    /// carries a `MoeCkaPanel` or `MoeCkaProbePanel` tag (set by
     /// [`crate::data::prepare_moe_cka_sources`]). Returns `None` if no
-    /// source carries the tag.
+    /// source carries either tag.
     pub fn try_build_moe_cka(
         sources: &[Source],
         cumulative_offsets: &[u64],
     ) -> Option<Self> {
         use crate::format::moe::ExpertWeight as EW;
 
-        // Collect (layer, weight, source_idx, &TensorMeta, base_off, n_experts).
-        let mut panels: Vec<(u32, EW, usize, &TensorMeta, u64, u32)> = Vec::new();
+        // A column in the CKA grid: either one of the static per-expert
+        // weights (gate / up / down) or the optional `--probe` routing
+        // co-activation matrix. Derived `Ord` orders by variant declaration
+        // first, so `Coactivation` sorts after every `Weight(_)` — columns
+        // read gate | up | down | coactivation.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum CkaColumn {
+            Weight(EW),
+            Coactivation,
+        }
+        impl CkaColumn {
+            fn label(self) -> &'static str {
+                match self {
+                    CkaColumn::Weight(w) => w.label(),
+                    CkaColumn::Coactivation => "routing_coactivation",
+                }
+            }
+        }
+
+        // Collect (layer, column, source_idx, &TensorMeta, base_off, n_experts)
+        // from both the static `MoeCkaPanel` sources and the optional per-layer
+        // `MoeCkaProbePanel` co-activation sources.
+        let mut panels: Vec<(u32, CkaColumn, usize, &TensorMeta, u64, u32)> = Vec::new();
         for (sidx, s) in sources.iter().enumerate() {
-            let Some(tag) = s.extensions.get::<crate::data::MoeCkaPanel>().copied() else {
-                continue;
-            };
+            let (layer, column, panel_experts) =
+                if let Some(tag) = s.extensions.get::<crate::data::MoeCkaPanel>().copied() {
+                    (tag.layer, CkaColumn::Weight(tag.weight), tag.n_experts)
+                } else if let Some(tag) =
+                    s.extensions.get::<crate::data::MoeCkaProbePanel>().copied()
+                {
+                    (tag.layer, CkaColumn::Coactivation, tag.n_experts)
+                } else {
+                    continue;
+                };
             let Some(st) = s.extensions.get::<crate::format::ModelInfo>() else {
                 continue;
             };
@@ -820,28 +855,28 @@ impl ArchLayout {
                 continue;
             };
             let off = cumulative_offsets.get(sidx).copied().unwrap_or(0);
-            panels.push((tag.layer, tag.weight, sidx, t, off, tag.n_experts));
+            panels.push((layer, column, sidx, t, off, panel_experts));
         }
         if panels.is_empty() {
             return None;
         }
 
-        // Inferred grid dims: layers (ascending) × weights ordered by the
-        // enum's natural ordering (gate / up / down — Router never reaches
-        // this layout, the CKA prep skips it).
+        // Inferred grid dims: layers (ascending) × columns ordered by
+        // CkaColumn's natural ordering (gate / up / down / coactivation;
+        // Router never reaches this layout — the CKA prep skips it).
         let layer_ids: Vec<u32> = {
             let set: std::collections::BTreeSet<u32> =
                 panels.iter().map(|(l, _, _, _, _, _)| *l).collect();
             set.into_iter().collect()
         };
-        let weight_ids: Vec<EW> = {
-            let set: std::collections::BTreeSet<EW> =
-                panels.iter().map(|(_, w, _, _, _, _)| *w).collect();
+        let column_ids: Vec<CkaColumn> = {
+            let set: std::collections::BTreeSet<CkaColumn> =
+                panels.iter().map(|(_, c, _, _, _, _)| *c).collect();
             set.into_iter().collect()
         };
         let n_layers = layer_ids.len() as u32;
-        let n_weights = weight_ids.len() as u32;
-        if n_layers == 0 || n_weights == 0 {
+        let n_cols = column_ids.len() as u32;
+        if n_layers == 0 || n_cols == 0 {
             return None;
         }
 
@@ -858,41 +893,41 @@ impl ArchLayout {
             return None;
         }
 
-        // Lookup: (layer, weight) → panel index.
-        let panel_at: std::collections::BTreeMap<(u32, EW), usize> = panels
+        // Lookup: (layer, column) → panel index.
+        let panel_at: std::collections::BTreeMap<(u32, CkaColumn), usize> = panels
             .iter()
             .enumerate()
-            .map(|(i, (l, w, _, _, _, _))| ((*l, *w), i))
+            .map(|(i, (l, c, _, _, _, _))| ((*l, *c), i))
             .collect();
         let layer_row: std::collections::BTreeMap<u32, usize> = layer_ids
             .iter()
             .enumerate()
             .map(|(i, &l)| (l, i))
             .collect();
-        let weight_col: std::collections::BTreeMap<EW, usize> = weight_ids
+        let column_col: std::collections::BTreeMap<CkaColumn, usize> = column_ids
             .iter()
             .enumerate()
-            .map(|(i, &w)| (w, i))
+            .map(|(i, &c)| (c, i))
             .collect();
 
         let cell_px = MOE_CKA_CELL_PX;
         let panel_side = n_experts.saturating_mul(cell_px);
-        let canvas_w_raw = n_weights
+        let canvas_w_raw = n_cols
             .saturating_mul(panel_side)
-            .saturating_add(n_weights.saturating_sub(1).saturating_mul(MOE_CKA_PANEL_PAD));
+            .saturating_add(n_cols.saturating_sub(1).saturating_mul(MOE_CKA_PANEL_PAD));
         let canvas_h_raw = n_layers
             .saturating_mul(panel_side)
             .saturating_add(n_layers.saturating_sub(1).saturating_mul(MOE_CKA_PANEL_PAD));
 
         let mut tensors: Vec<PlacedTensor> = Vec::new();
         for layer in &layer_ids {
-            for weight in &weight_ids {
-                let Some(&pidx) = panel_at.get(&(*layer, *weight)) else {
+            for column in &column_ids {
+                let Some(&pidx) = panel_at.get(&(*layer, *column)) else {
                     continue;
                 };
                 let (_, _, sidx, t, base_off, _) = &panels[pidx];
                 let row = layer_row[layer];
-                let col = weight_col[weight];
+                let col = column_col[column];
                 let canvas_x = (col as u32) * (panel_side + MOE_CKA_PANEL_PAD);
                 let canvas_y = (row as u32) * (panel_side + MOE_CKA_PANEL_PAD);
                 tensors.push(PlacedTensor {
@@ -908,7 +943,7 @@ impl ArchLayout {
                     scale: cell_px as f32,
                     canvas_x,
                     canvas_y,
-                    hue: name_hue(weight.label()),
+                    hue: name_hue(column.label()),
                     layer_idx: Some(*layer),
                 });
             }
@@ -935,9 +970,9 @@ impl ArchLayout {
         });
 
         log::info!(
-            "moe-cka layout: {} layer(s) × {} weight(s) = {} panel(s); {n_experts}×{n_experts} per panel @ {cell_px}px/cell; \
+            "moe-cka layout: {} layer(s) × {} column(s) = {} panel(s); {n_experts}×{n_experts} per panel @ {cell_px}px/cell; \
              canvas {canvas_w}×{canvas_h} ({width_tiles} × {height_tiles} tiles, max_zoom={max_zoom})",
-            n_layers, n_weights, tensors.len(),
+            n_layers, n_cols, tensors.len(),
         );
 
         Some(Self {
@@ -953,8 +988,8 @@ impl ArchLayout {
             tensors,
             layer_bounds: Vec::new(),
             architecture: format!(
-                "MoE CKA similarity ({} layer(s) × {} weight(s), {n_experts}×{n_experts} per panel)",
-                n_layers, n_weights,
+                "MoE CKA similarity ({} layer(s) × {} column(s), {n_experts}×{n_experts} per panel)",
+                n_layers, n_cols,
             ),
             sorted_idx,
         })

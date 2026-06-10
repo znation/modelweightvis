@@ -38,8 +38,8 @@ use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::layout::model_config::ModelConfig;
 use crate::probe::common::{
-    dispatch_experts, renormalize_topk, rms_norm, topk_per_row, GqaAttention, RotaryEmbedding,
-    SwiGluExpert,
+    accumulate_coactivation, dispatch_experts, renormalize_topk, rms_norm, topk_per_row,
+    GqaAttention, RotaryEmbedding, SwiGluExpert,
 };
 use crate::probe::RoutingCapture;
 
@@ -164,6 +164,8 @@ pub fn run(
     // increments each time `expert` appears in top-k for any token in that
     // layer. Divide by `n_tokens` at the end for frequencies.
     let mut counts = vec![0u32; cfg.n_layers * cfg.n_experts];
+    // Per-layer routing co-occurrence counts (`--moe-cka --probe`).
+    let mut coact_counts = vec![0u32; cfg.n_layers * cfg.n_experts * cfg.n_experts];
 
     let layers_vb = vb.pp("model.layers");
     let pb = indicatif::ProgressBar::new(cfg.n_layers as u64);
@@ -200,6 +202,14 @@ pub fn run(
         for &e in &topk_indices_host {
             counts[layer_off + e as usize] += 1;
         }
+        accumulate_coactivation(
+            &mut coact_counts,
+            &topk_indices_host,
+            n_tokens,
+            cfg.top_k,
+            cfg.n_experts,
+            layer_idx,
+        );
 
         // Optionally renormalize top-k weights to sum to 1 along the k
         // axis. Qwen1.5-MoE has this off.
@@ -242,12 +252,17 @@ pub fn run(
         .iter()
         .map(|&c| c as f32 / n_tokens as f32)
         .collect();
+    let coact: Vec<f32> = coact_counts
+        .iter()
+        .map(|&c| c as f32 / n_tokens as f32)
+        .collect();
 
     Ok(RoutingCapture {
         n_layers: cfg.n_layers as u32,
         n_experts: cfg.n_experts as u32,
         n_tokens: n_tokens as u32,
         freq,
+        coact,
     })
 }
 

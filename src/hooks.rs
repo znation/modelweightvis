@@ -55,8 +55,9 @@ impl MoeCkaPrep for TensorMoeCkaPrep {
         input: &str,
         sample: u32,
         stream: bool,
+        probe: &ProbeOpts,
     ) -> anyhow::Result<(Vec<Source>, u64)> {
-        prepare_moe_cka_sources(input, sample, stream).await
+        prepare_moe_cka_sources(input, sample, stream, probe).await
     }
 }
 

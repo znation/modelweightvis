@@ -268,23 +268,30 @@ pub struct MoeCkaPanel {
     pub n_experts: u32,
 }
 
-/// Which behavioral stat a `MoeProbePanel` carries. Drives the panel's
-/// label and (later) colormap choices in the layout. For Phase 3 we
-/// only ship `RoutingFreq`; the enum variant keeps the door open for
+/// Which behavioral stat a probe panel carries. Drives the panel's
+/// label and (later) colormap choices in the layout. `RoutingFreq` is
+/// the `n_layers × n_experts` per-expert stat attached to `--moe-summary`;
+/// `RoutingCoactivation` is the per-layer `n_experts × n_experts` co-routing
+/// matrix attached to `--moe-cka`. The enum keeps the door open for
 /// `RoutingWeightMean`, `ExpertOutputNorm`, etc. in follow-ups without
-/// re-shuffling the extension type.
+/// re-shuffling the extension types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeStat {
     /// Fraction of probe tokens routed to this expert by the router's
     /// top-k decision in this layer. Range: `[0, k / n_experts]` in
     /// expectation under uniform routing; real MoEs concentrate.
     RoutingFreq,
+    /// Fraction of probe tokens whose top-k decision in this layer
+    /// included both experts `i` and `j` (the diagonal is each expert's
+    /// own routing frequency). Symmetric; range `[0, 1]` per cell.
+    RoutingCoactivation,
 }
 
 impl ProbeStat {
     pub fn label(self) -> &'static str {
         match self {
             ProbeStat::RoutingFreq => "routing_freq",
+            ProbeStat::RoutingCoactivation => "routing_coactivation",
         }
     }
 }
@@ -298,6 +305,19 @@ impl ProbeStat {
 pub struct MoeProbePanel {
     pub stat: ProbeStat,
     pub n_layers: u32,
+    pub n_experts: u32,
+}
+
+/// Per-layer tag attached to each `--moe-cka --probe` co-activation
+/// source. One source per MoE layer; the source's bytes are an
+/// `n_experts × n_experts` U8 co-routing heatmap (cell `(i,j)` = fraction
+/// of probe tokens whose top-k included both expert `i` and `j`; the
+/// diagonal `(i,i)` is expert `i`'s routing frequency), per-panel
+/// normalised to `0..=255`. Same shape as [`MoeCkaPanel`], so the CKA
+/// layout slots it in as an extra column per layer.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeCkaProbePanel {
+    pub layer: u32,
     pub n_experts: u32,
 }
 
@@ -2122,17 +2142,17 @@ pub async fn prepare_moe_summary_sources(
     Ok((sources, total_bytes))
 }
 
-/// Resolve the probe input, run the routing-faithful forward, and
-/// package the resulting routing-frequency capture as one `Source`
-/// tagged with `MoeProbePanel`. Returns `Ok(None)` only when the
-/// model's architecture isn't supported by the probe (and we want
-/// the caller to log a warning rather than fail).
-async fn attach_probe_panel(
+/// Resolve a local model directory, detect the architecture, and run the
+/// routing-faithful probe forward. Shared by [`attach_probe_panel`]
+/// (`--moe-summary`) and [`attach_cka_probe_panels`] (`--moe-cka`).
+///
+/// Returns `Ok(None)` when the architecture isn't supported by the probe
+/// (the caller logs a warning and renders the static panels anyway).
+/// Errors on any other failure (bad input, missing shards, forward panic).
+async fn run_probe_capture(
     input: &str,
     probe: &arbvis::ProbeOpts,
-    n_layers: u32,
-    n_experts: u32,
-) -> anyhow::Result<Option<Source>> {
+) -> anyhow::Result<Option<crate::probe::RoutingCapture>> {
     // Currently only local-directory inputs are supported for the probe:
     // we need tokenizer.json + per-shard paths to hand to candle's
     // VarBuilder. hf:// inputs go via the HF cache, but threading those
@@ -2198,6 +2218,24 @@ async fn attach_probe_panel(
     .await
     .with_context(|| "--probe: forward pass panicked")??;
 
+    Ok(Some(capture))
+}
+
+/// Resolve the probe input, run the routing-faithful forward, and
+/// package the resulting routing-frequency capture as one `Source`
+/// tagged with `MoeProbePanel`. Returns `Ok(None)` only when the
+/// model's architecture isn't supported by the probe (and we want
+/// the caller to log a warning rather than fail).
+async fn attach_probe_panel(
+    input: &str,
+    probe: &arbvis::ProbeOpts,
+    n_layers: u32,
+    n_experts: u32,
+) -> anyhow::Result<Option<Source>> {
+    let Some(capture) = run_probe_capture(input, probe).await? else {
+        return Ok(None);
+    };
+
     // Normalize freq to U8 per-panel (same convention as the static
     // summary panels): max → 255, 0 → 0.
     let max = capture.freq.iter().copied().fold(0.0_f32, f32::max).max(1e-12);
@@ -2258,6 +2296,87 @@ async fn attach_probe_panel(
     }))
 }
 
+/// Resolve the probe input, run the routing-faithful forward, and package
+/// the per-layer routing co-activation matrices as one `Source` per layer,
+/// each tagged with `MoeCkaProbePanel`. The CKA layout slots these in as an
+/// extra column. Returns `Ok(None)` only when the model's architecture isn't
+/// supported by the probe (caller logs a warning rather than fail).
+async fn attach_cka_probe_panels(
+    input: &str,
+    probe: &arbvis::ProbeOpts,
+    n_layers: u32,
+    n_experts: u32,
+) -> anyhow::Result<Option<Vec<Source>>> {
+    let Some(capture) = run_probe_capture(input, probe).await? else {
+        return Ok(None);
+    };
+
+    // Refuse to attach if dimensions don't match the static CKA panels —
+    // would mis-place / mis-render the heatmaps in the grid.
+    if capture.n_layers != n_layers || capture.n_experts != n_experts {
+        anyhow::bail!(
+            "--probe: capture dims ({}×{}) differ from moe-cka dims ({}×{}); refusing to attach",
+            capture.n_layers, capture.n_experts, n_layers, n_experts,
+        );
+    }
+    log::info!(
+        "--probe: routing co-activation capture from {} tokens ({} layers × {} experts)",
+        capture.n_tokens,
+        capture.n_layers,
+        capture.n_experts,
+    );
+
+    let e = n_experts as usize;
+    let mut out: Vec<Source> = Vec::with_capacity(n_layers as usize);
+    for layer in 0..n_layers as usize {
+        let block = &capture.coact[layer * e * e..(layer + 1) * e * e];
+        // Per-panel (per-layer) max → 255 normalisation, matching the
+        // summary probe panel and `compute_cka_panel`'s 0..=255 scaling.
+        // The brightest cell is the most-co-fired expert pair in the layer.
+        let max = block.iter().copied().fold(0.0_f32, f32::max).max(1e-12);
+        let bytes_u8: Vec<u8> = block
+            .iter()
+            .map(|&v| ((v / max).clamp(0.0, 1.0) * 255.0) as u8)
+            .collect();
+        let nbytes = bytes_u8.len() as u64;
+        let synthetic = format::TensorMeta {
+            name: format!(
+                "moe-cka::L{layer}::{}",
+                ProbeStat::RoutingCoactivation.label()
+            ),
+            dtype: format::Dtype::U8,
+            shape: vec![n_experts as u64, n_experts as u64],
+            file_start: 0,
+            file_end: nbytes,
+            packed_sidecars: None,
+        };
+        let label = format!(
+            "MoE co-activation · layer {layer} ({n_experts}×{n_experts}, {} tokens)",
+            capture.n_tokens,
+        );
+        let mut extensions = Extensions::default();
+        extensions.insert(ModelInfo {
+            format: SourceFormat::Safetensors,
+            tensors: vec![synthetic],
+            color_ranges: Vec::new(),
+        });
+        extensions.insert(MoeCkaProbePanel {
+            layer: layer as u32,
+            n_experts,
+        });
+        out.push(Source {
+            // file_idx is overwritten by the caller before push.
+            file_idx: 0,
+            kind: SourceKind::Buffered(bytes_u8),
+            byte_size: nbytes,
+            name_override: Some(label),
+            xet_terms: None,
+            extensions,
+        });
+    }
+    Ok(Some(out))
+}
+
 /// Dispatch a [`format::SummaryStat`] over a contiguous tensor byte slice.
 /// Single-pass, dtype-aware. Used by [`prepare_moe_summary_sources`].
 fn scalar_from_buf(stat: format::SummaryStat, dtype: format::Dtype, bytes: &[u8]) -> f32 {
@@ -2309,6 +2428,7 @@ pub async fn prepare_moe_cka_sources(
     input: &str,
     sample: u32,
     stream: bool,
+    probe: &arbvis::ProbeOpts,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     // === File opening — identical to the other two MoE prep helpers ======
     let (datas, fmts, file_names) = if hf_url::is_repo_level(input)? {
@@ -2516,6 +2636,17 @@ pub async fn prepare_moe_cka_sources(
     if n_experts == 0 {
         anyhow::bail!("--moe-cka: derived n_experts=0 from {input}");
     }
+    // Layer count for the optional probe co-activation panels (one per
+    // layer). Derived from the static panel grid; the dims guard in
+    // `attach_cka_probe_panels` rejects any mismatch with the probe's
+    // config-derived layer count, so a partial-shard CKA run declines the
+    // panels rather than mis-rendering.
+    let n_layers: u32 = groups
+        .keys()
+        .map(|(layer, _)| *layer)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
 
     // === Per-(layer, weight): project all experts, then pair CKA ==========
     // Process groups serially so peak memory stays bounded — each group
@@ -2603,6 +2734,34 @@ pub async fn prepare_moe_cka_sources(
             extensions,
         });
         total_bytes += nbytes;
+    }
+
+    // === Optional probe forward pass =====================================
+    // When `--probe` is set, run a routing-faithful forward on the resolved
+    // probe text and emit one extra Source per layer (a routing co-activation
+    // matrix) tagged with `MoeCkaProbePanel`. The CKA layout merges these in
+    // as an extra column. Probe failures are non-fatal: log and skip so the
+    // static CKA grid still renders.
+    if probe.enabled {
+        match attach_cka_probe_panels(input, probe, n_layers, n_experts).await {
+            Ok(Some(panels)) => {
+                for mut source in panels {
+                    source.file_idx = sources.len();
+                    total_bytes += source.byte_size;
+                    sources.push(source);
+                }
+            }
+            Ok(None) => {
+                log::warn!(
+                    "moe-cka: --probe requested but no panel produced (unsupported arch?)"
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "moe-cka: --probe forward failed ({e:#}); skipping co-activation panels"
+                );
+            }
+        }
     }
 
     log::info!(

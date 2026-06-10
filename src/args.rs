@@ -112,6 +112,16 @@ impl From<LayoutArg> for LayoutMode {
 /// group name and trip a debug-build assertion in clap.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
+// `--probe*` require a MoE mode to hook into. They accept either
+// `--moe-summary` OR `--moe-cka`, expressed as a `requires = "moe_mode"`
+// against this group. `multiple(false)` reinforces the modes' mutual
+// exclusivity (also enforced by each mode's `conflicts_with_all`).
+#[command(group(
+    clap::ArgGroup::new("moe_mode")
+        .args(["moe_summary", "moe_cka"])
+        .multiple(false)
+        .required(false)
+))]
 pub struct ModelArgs {
     #[command(flatten)]
     pub arbvis: arbvis::Args,
@@ -183,29 +193,32 @@ pub struct ModelArgs {
     pub cka_sample: u32,
 
     /// Run a routing-faithful forward pass on a probe input and add a
-    /// per-`(layer, expert)` routing-frequency heatmap to `--moe-summary`.
-    /// Without `--probe-text` / `--probe-file` / `--probe-url`, uses a
-    /// small bundled default snippet of varied prose / code / dialogue.
-    /// Supported architectures: `Qwen2MoeForCausalLM`, `MixtralForCausalLM`.
-    #[arg(long, requires = "moe_summary")]
+    /// behavioral panel: a per-`(layer, expert)` routing-frequency heatmap
+    /// under `--moe-summary`, or per-layer `n_experts × n_experts` routing
+    /// co-activation matrices under `--moe-cka`. Without `--probe-text` /
+    /// `--probe-file` / `--probe-url`, uses a small bundled default snippet
+    /// of varied prose / code / dialogue. Requires `--moe-summary` or
+    /// `--moe-cka`. Supported architectures: `Qwen2MoeForCausalLM`,
+    /// `MixtralForCausalLM`.
+    #[arg(long, requires = "moe_mode")]
     pub probe: bool,
 
     /// Override the bundled probe with literal text. Mutually exclusive with
     /// `--probe-file` and `--probe-url`. Implies `--probe`.
-    #[arg(long, value_name = "TEXT", requires = "moe_summary", conflicts_with_all = ["probe_file", "probe_url"])]
+    #[arg(long, value_name = "TEXT", requires = "moe_mode", conflicts_with_all = ["probe_file", "probe_url"])]
     pub probe_text: Option<String>,
 
     /// Override the bundled probe with the contents of a local UTF-8 text
     /// file. Mutually exclusive with `--probe-text` and `--probe-url`.
     /// Implies `--probe`.
-    #[arg(long, value_name = "PATH", requires = "moe_summary", conflicts_with_all = ["probe_text", "probe_url"])]
+    #[arg(long, value_name = "PATH", requires = "moe_mode", conflicts_with_all = ["probe_text", "probe_url"])]
     pub probe_file: Option<PathBuf>,
 
     /// Override the bundled probe with text fetched from a URL. Accepts
     /// plain HTTPS URLs (returns the response body as UTF-8 text) or
     /// `hf://...` URLs (downloads via the HF Hub). Mutually exclusive with
     /// `--probe-text` and `--probe-file`. Implies `--probe`.
-    #[arg(long, value_name = "URL", requires = "moe_summary", conflicts_with_all = ["probe_text", "probe_file"])]
+    #[arg(long, value_name = "URL", requires = "moe_mode", conflicts_with_all = ["probe_text", "probe_file"])]
     pub probe_url: Option<String>,
 
     /// Layout strategy for arranging tensors on the canvas.

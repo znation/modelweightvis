@@ -72,12 +72,20 @@ pub fn detect_arch(config: &ModelConfig) -> Option<Arch> {
 /// whose top-k routing decisions for `layer` included `expert`. Range
 /// `[0, k / n_experts]` in expectation if routing were uniform; real
 /// MoEs concentrate on a subset.
+///
+/// `coact` carries the per-layer routing *co-activation* matrix used by
+/// `--moe-cka --probe`: `coact[layer * n_experts^2 + i * n_experts + j]`
+/// is the fraction of probe tokens whose top-k for `layer` included
+/// **both** expert `i` and `j`. It is symmetric, and the diagonal
+/// `coact[.. + i * n_experts + i]` equals expert `i`'s routing frequency
+/// (`freq`). Range `[0, 1]` per cell.
 #[derive(Debug, Clone)]
 pub struct RoutingCapture {
     pub n_layers: u32,
     pub n_experts: u32,
     pub n_tokens: u32,
     pub freq: Vec<f32>,
+    pub coact: Vec<f32>,
 }
 
 /// Run the routing-faithful forward pass on `probe_text`, returning

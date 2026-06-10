@@ -323,6 +323,43 @@ pub fn topk_per_row(probs: &[f32], n_rows: usize, n_cols: usize, k: usize) -> (V
     (weights, indices)
 }
 
+/// Accumulate one layer's routing co-occurrence into a shared
+/// `n_layers * n_experts^2` count buffer. `topk_indices` is `[n_tokens * top_k]`
+/// row-major — the same buffer the caller already feeds to [`dispatch_experts`]
+/// and tallies routing-frequency from.
+///
+/// For each token, for every *unordered* pair `(a, b)` of distinct experts in
+/// its top-k slots we bump `[a][b]` and `[b][a]`; the diagonal `[a][a]` is
+/// bumped once per selected expert, so the diagonal reproduces the per-expert
+/// routing-frequency counts exactly (its sum over experts is `n_tokens * top_k`).
+/// `topk_per_row` yields distinct indices per row, so the off-diagonal pairs
+/// never collide with the diagonal.
+///
+/// Cheap: `O(n_tokens * top_k^2)` host-side integer increments.
+pub fn accumulate_coactivation(
+    coact_counts: &mut [u32],
+    topk_indices: &[u32],
+    n_tokens: usize,
+    top_k: usize,
+    n_experts: usize,
+    layer_idx: usize,
+) {
+    let base = layer_idx * n_experts * n_experts;
+    for t in 0..n_tokens {
+        let slots = &topk_indices[t * top_k..(t + 1) * top_k];
+        for (si, &a) in slots.iter().enumerate() {
+            let a = a as usize;
+            // Diagonal: counts how many tokens selected expert `a` (== freq count).
+            coact_counts[base + a * n_experts + a] += 1;
+            for &b in &slots[si + 1..] {
+                let b = b as usize;
+                coact_counts[base + a * n_experts + b] += 1;
+                coact_counts[base + b * n_experts + a] += 1;
+            }
+        }
+    }
+}
+
 /// Renormalise each row's `k` weights to sum to 1. Mixtral always does this;
 /// Qwen1.5-MoE leaves it off (per its `norm_topk_prob`).
 pub fn renormalize_topk(weights: &[f32], k: usize) -> Vec<f32> {
@@ -396,4 +433,54 @@ pub fn dispatch_experts(
     }
 
     Ok(moe_out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coactivation_symmetric_diagonal_is_freq() {
+        // 3 experts, top_k = 2, 3 tokens, single layer.
+        // Token top-k picks: [0,1], [0,2], [0,1].
+        let idx = vec![0u32, 1, 0, 2, 0, 1];
+        let (n_tokens, top_k, e) = (3usize, 2usize, 3usize);
+        let mut c = vec![0u32; e * e];
+        accumulate_coactivation(&mut c, &idx, n_tokens, top_k, e, 0);
+        let at = |i: usize, j: usize| c[i * e + j];
+
+        // Symmetric.
+        for i in 0..e {
+            for j in 0..e {
+                assert_eq!(at(i, j), at(j, i), "asymmetry at ({i},{j})");
+            }
+        }
+        // Diagonal == per-expert selection count: e0 in all 3, e1 in 2, e2 in 1.
+        assert_eq!(at(0, 0), 3);
+        assert_eq!(at(1, 1), 2);
+        assert_eq!(at(2, 2), 1);
+        // Off-diagonal co-counts: (0,1) in tokens 0 & 2 → 2; (0,2) in token 1 → 1;
+        // (1,2) never co-occur → 0.
+        assert_eq!(at(0, 1), 2);
+        assert_eq!(at(0, 2), 1);
+        assert_eq!(at(1, 2), 0);
+        // Diagonal mass == n_tokens * top_k.
+        let diag: u32 = (0..e).map(|i| at(i, i)).sum();
+        assert_eq!(diag, (n_tokens * top_k) as u32);
+    }
+
+    #[test]
+    fn coactivation_writes_into_correct_layer_block() {
+        // Two layers, 2 experts, top_k = 2, 1 token picking [0,1] in layer 1 only.
+        let (n_tokens, top_k, e) = (1usize, 2usize, 2usize);
+        let idx = vec![0u32, 1];
+        let mut c = vec![0u32; 2 * e * e];
+        accumulate_coactivation(&mut c, &idx, n_tokens, top_k, e, 1);
+        // Layer 0 block untouched.
+        assert!(c[0..e * e].iter().all(|&v| v == 0));
+        // Layer 1 block: the lone token co-activates both experts, so every
+        // cell (diagonal + off-diagonal) of the 2×2 block is 1.
+        let base = e * e;
+        assert!(c[base..base + e * e].iter().all(|&v| v == 1));
+    }
 }

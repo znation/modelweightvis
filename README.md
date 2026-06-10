@@ -84,6 +84,8 @@ modelweightvis --moe-summary hf://Qwen/Qwen1.5-MoE-A2.7B --probe --tiles ./out
 
 Adds a fifth panel: per-`(layer, expert)` **routing frequency** from a routing-faithful forward pass over a probe input. This is the one behavioral signal — it reflects which experts the router actually fires on real tokens, not just static weights. Override the bundled probe text with `--probe-text "…"`, `--probe-file <path>`, or `--probe-url <https|hf://…>`. Supported architectures: `Qwen2MoeForCausalLM`, `MixtralForCausalLM`.
 
+`--probe` works with either MoE mode: under `--moe-summary` it adds the routing-frequency column described here; under [`--moe-cka`](#moe-expert-similarity-matrix---moe-cka) it adds per-layer routing **co-activation** matrices (see below). It requires one of `--moe-summary` or `--moe-cka`, and the probe input must be a local directory (resolve `hf://` repos with `hf download …` first).
+
 ## MoE expert-similarity matrix: `--moe-cka`
 
 ```sh
@@ -91,6 +93,14 @@ modelweightvis --moe-cka hf://Qwen/Qwen1.5-MoE-A2.7B --tiles ./out
 ```
 
 Renders one `n_experts × n_experts` linear-CKA similarity heatmap per `(layer, weight)`: the diagonal is 1.0 (every expert is self-identical) and bright off-diagonal blocks reveal redundant expert clusters. Uses Gaussian random projection on the input axis (`--cka-sample`, default 128) to keep a 60-expert × 24-layer model tractable.
+
+### Routing co-activation probe: `--probe`
+
+```sh
+modelweightvis --moe-cka /path/to/Qwen1.5-MoE --probe --tiles ./out
+```
+
+Appends a trailing per-layer **co-activation** column to the CKA grid: cell `(i, j)` is the fraction of probe tokens whose router top-k fired **both** expert `i` and `j`, and the diagonal `(i, i)` is expert `i`'s own routing frequency. It's the behavioral complement to CKA — CKA asks "which experts have similar *weights*," co-activation asks "which experts actually *fire together*." Each layer's panel is per-panel normalized, so the brightest cell is that layer's most-co-fired expert pair (unlike the CKA panels, the diagonal is *not* a constant bright line). Same probe-text overrides and supported architectures (`Qwen2MoeForCausalLM`, `MixtralForCausalLM`) as the [`--moe-summary` probe](#routing-frequency-probe---probe); the input must be a local directory. Probe failures are non-fatal — the static CKA grid still renders.
 
 ## Inherited from arbvis
 
