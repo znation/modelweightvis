@@ -95,4 +95,12 @@ pub fn register_all(registry: &mut Registry) {
     // and inserts a `SourceMeta` extension that `ArchLayoutPlugin` reads
     // back for transformer-aware grouping.
     registry.prepare_sources_extension = Some(Arc::new(SourceMetaSidecarHook));
+
+    // Rebrand the viewer arbvis generates: title fallback ("modelweightvis
+    // moe" / " diff" / plain) + the info-panel title link + leaflet
+    // attribution all point at modelweightvis instead of arbvis.
+    registry.branding = arbvis::Branding::new(
+        "modelweightvis",
+        "https://github.com/znation/modelweightvis",
+    );
 }
