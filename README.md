@@ -61,13 +61,18 @@ When both arguments are `hf://` model URLs, modelweightvis auto-detects whether 
 
 Non-tensor files in a `--diff` between repos or directories (READMEs, tokenizer configs, etc.) fall back to arbvis's plain-byte / JSON-aware diff path.
 
-## MoE per-expert summary: `--moe-summary`
+## MoE viewer: `--moe`
 
 ```sh
-modelweightvis --moe-summary hf://Qwen/Qwen1.5-MoE-A2.7B --tiles ./out
+modelweightvis --moe hf://Qwen/Qwen1.5-MoE-A2.7B --tiles ./out
+# then open out/index.html — toggle the Summary / CKA tabs (top-right)
 ```
 
-Renders one heatmap panel per FFN weight (`gate_proj`, `up_proj`, `down_proj`) plus the router gate, side by side. Each panel is a `layers × experts` grid with one colored cell per expert, so dead experts, per-layer magnitude trends, and outliers pop out at a glance. The scalar shown per cell is chosen by `--summary-stat`:
+`--moe` loads the model **once** and renders two complementary lenses as separate, tab-switchable scenes in the viewer (the tab switcher is the Leaflet base-layer control top-right). It needs a tile destination — `--tiles` (or `--space`); a single-PNG / window output can't host the tabs.
+
+### Summary scene
+
+One heatmap panel per FFN weight (`gate_proj`, `up_proj`, `down_proj`) plus the router gate, side by side. Each panel is a `layers × experts` grid with one colored cell per expert, so dead experts, per-layer magnitude trends, and outliers pop out at a glance. The scalar shown per cell is chosen by `--summary-stat`:
 
 - `rms` (default) — √(mean(x²)), comparable across tensors of different scale.
 - `frobenius` — √(sum(x²)), honest about total magnitude.
@@ -76,31 +81,22 @@ Renders one heatmap panel per FFN weight (`gate_proj`, `up_proj`, `down_proj`) p
 
 Supports HF per-expert safetensors (Qwen-MoE, OLMoE, DeepSeek routed experts), the classic Mixtral `block_sparse_moe` layout, and the newer fused `transformers` export (batched `mlp.experts.gate_up_proj` / `down_proj`). GGUF fused-expert tensors are not yet supported.
 
-### Routing-frequency probe: `--probe`
+### CKA scene
+
+One `n_experts × n_experts` linear-CKA similarity heatmap per `(layer, weight)`: the diagonal is 1.0 (every expert is self-identical) and bright off-diagonal blocks reveal redundant expert clusters. Uses Gaussian random projection on the input axis (`--cka-sample`, default 128) to keep a 60-expert × 24-layer model tractable. The CKA scene needs **per-expert** tensors — on a fused-layout checkpoint it's skipped (with a warning) and only the Summary scene renders.
+
+### Routing probe: `--probe`
 
 ```sh
-modelweightvis --moe-summary hf://Qwen/Qwen1.5-MoE-A2.7B --probe --tiles ./out
+modelweightvis --moe /path/to/Qwen1.5-MoE --probe --tiles ./out
 ```
 
-Adds a fifth panel: per-`(layer, expert)` **routing frequency** from a routing-faithful forward pass over a probe input. This is the one behavioral signal — it reflects which experts the router actually fires on real tokens, not just static weights. Override the bundled probe text with `--probe-text "…"`, `--probe-file <path>`, or `--probe-url <https|hf://…>`. Supported architectures: `Qwen2MoeForCausalLM`, `MixtralForCausalLM`.
+Adds one behavioral panel to **each** scene from a routing-faithful forward pass over a probe input — the one signal that reflects which experts the router actually fires on real tokens, not just static weights:
 
-`--probe` works with either MoE mode: under `--moe-summary` it adds the routing-frequency column described here; under [`--moe-cka`](#moe-expert-similarity-matrix---moe-cka) it adds per-layer routing **co-activation** matrices (see below). It requires one of `--moe-summary` or `--moe-cka`, and the probe input must be a local directory (resolve `hf://` repos with `hf download …` first).
+- **Summary** gets a per-`(layer, expert)` **routing-frequency** panel.
+- **CKA** gets a per-layer `n_experts × n_experts` **co-activation** grid: cell `(i, j)` is the fraction of probe tokens whose router top-k fired **both** expert `i` and `j` (diagonal `(i, i)` = expert `i`'s own frequency). CKA asks "which experts have similar *weights*"; co-activation asks "which experts actually *fire together*." Each layer's panel is per-panel normalized.
 
-## MoE expert-similarity matrix: `--moe-cka`
-
-```sh
-modelweightvis --moe-cka hf://Qwen/Qwen1.5-MoE-A2.7B --tiles ./out
-```
-
-Renders one `n_experts × n_experts` linear-CKA similarity heatmap per `(layer, weight)`: the diagonal is 1.0 (every expert is self-identical) and bright off-diagonal blocks reveal redundant expert clusters. Uses Gaussian random projection on the input axis (`--cka-sample`, default 128) to keep a 60-expert × 24-layer model tractable.
-
-### Routing co-activation probe: `--probe`
-
-```sh
-modelweightvis --moe-cka /path/to/Qwen1.5-MoE --probe --tiles ./out
-```
-
-Appends a trailing per-layer **co-activation** column to the CKA grid: cell `(i, j)` is the fraction of probe tokens whose router top-k fired **both** expert `i` and `j`, and the diagonal `(i, i)` is expert `i`'s own routing frequency. It's the behavioral complement to CKA — CKA asks "which experts have similar *weights*," co-activation asks "which experts actually *fire together*." Each layer's panel is per-panel normalized, so the brightest cell is that layer's most-co-fired expert pair (unlike the CKA panels, the diagonal is *not* a constant bright line). Same probe-text overrides and supported architectures (`Qwen2MoeForCausalLM`, `MixtralForCausalLM`) as the [`--moe-summary` probe](#routing-frequency-probe---probe); the input must be a local directory. Probe failures are non-fatal — the static CKA grid still renders.
+Override the bundled probe text with `--probe-text "…"`, `--probe-file <path>`, or `--probe-url <https|hf://…>`. The probe input must be a local directory (resolve `hf://` repos with `hf download …` first). Supported architectures: `Qwen2MoeForCausalLM`, `MixtralForCausalLM`. Probe failures are non-fatal — the static scenes still render.
 
 ## Inherited from arbvis
 
@@ -125,12 +121,12 @@ modelweightvis extends arbvis through its plugin / hook surface — no fork, no 
 - `LayoutPlugin` impls (`ArchLayoutPlugin`, `MoeSummaryLayoutPlugin`, `MoeCkaLayoutPlugin`) register the architectural canvas and the MoE summary / CKA panel layouts; arbvis's plugin-iteration `select_layout` picks them by priority.
 - `LeafLoader` + `LeafRenderer` pair (`ArchRegionsLoader`, `ArchRegionsRenderer`) drive per-tensor tile rendering at element granularity.
 - `DiffSourceBuilder` (`TensorDiffBuilder`) handles tensor-aware `--diff` at priority above arbvis's JSON / plain-byte fallbacks.
-- Option-slot hooks (`MoeSummaryPrep`, `MoeCkaPrep`, `RepoDiffPrep`, `DirectoryTensorDiffPrep`, `FinetuneDetect`, `SingleImageArchHook`, `PrepareSourcesExtension`) tap arbvis's CLI dispatch points so `--moe-summary` / `--moe-cka`, repo-level `--diff`, single-image arch render, and HF model-card finetune detection slot in cleanly.
+- Option-slot hooks (`MoeScenesPrep`, `RepoDiffPrep`, `DirectoryTensorDiffPrep`, `FinetuneDetect`, `SingleImageArchHook`, `PrepareSourcesExtension`) tap arbvis's CLI dispatch points so `--moe`, repo-level `--diff`, single-image arch render, and HF model-card finetune detection slot in cleanly.
 
 The `modelweightvis` binary itself is tiny — it builds an `arbvis::Registry::with_defaults()`, calls `modelweightvis::register_all(&mut registry)`, and hands off to `arbvis::run`. Same renderer, same Hub I/O, same tile pyramid; the tensor awareness comes entirely through the registered plugins.
 
 **Which to use:**
-- **modelweightvis** — for `.safetensors` / `.gguf` / `.bin` model checkpoints, architectural transformer layout, `--moe-summary` / `--moe-cka` / `--probe`, `--diff-metric`, `--finetune` / `--no-finetune`, `--layout`, dtype-aware coloring. Inherits arbvis's full CLI surface.
+- **modelweightvis** — for `.safetensors` / `.gguf` / `.bin` model checkpoints, architectural transformer layout, `--moe` (tabbed summary + CKA scenes) / `--probe`, `--diff-metric`, `--finetune` / `--no-finetune`, `--layout`, dtype-aware coloring. Inherits arbvis's full CLI surface.
 - **arbvis** — for non-model binaries (any file format), JSON/JSONL diffs, plain-byte diffs, the xet xorb path on arbitrary content. Smaller dependency footprint (no `candle-core` / `regex` / `zip` / `half`).
 
 ## Building

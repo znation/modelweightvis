@@ -12,52 +12,36 @@ use std::path::{Path, PathBuf};
 
 use arbvis::hf_url::RemoteFileSpec;
 use arbvis::{
-    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeCkaPrep, MoeSummaryPrep,
+    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeScenesPrep,
     PrepareSourcesExtension, ProbeOpts, RepoDiffPrep, SingleImageArchHook, Source, SummaryStat,
 };
 use async_trait::async_trait;
 
 use crate::data::{
     build_multi_safetensors_diff_sources, load_meta_for_sources, prepare_diff_sources_from_http,
-    prepare_moe_cka_sources, prepare_moe_summary_sources,
+    prepare_moe_scenes_sources,
 };
 use crate::format::SourceFormat;
 
-/// `--moe-summary <model>` source preparer. Delegates to
-/// [`prepare_moe_summary_sources`], which builds one in-memory U8 heatmap
-/// per per-weight panel (gate / up / down / router) plus `MoeSummaryPanel`
-/// extension tags that [`crate::MoeSummaryLayoutPlugin`] reads back.
-pub struct TensorMoeSummaryPrep;
+/// `--moe <model>` source preparer. Delegates to [`prepare_moe_scenes_sources`],
+/// which loads the model once and builds two scenes — a per-expert scalar
+/// "summary" (panels carrying `MoeSummaryPanel` tags, read by
+/// [`crate::MoeSummaryLayoutPlugin`]) and an N×N "cka" similarity grid (panels
+/// carrying `MoeCkaPanel` tags, read by [`crate::MoeCkaLayoutPlugin`]) — each
+/// stamped with an `arbvis::SceneTag` so the tiler renders a tab switcher.
+pub struct TensorMoeScenesPrep;
 
 #[async_trait(?Send)]
-impl MoeSummaryPrep for TensorMoeSummaryPrep {
+impl MoeScenesPrep for TensorMoeScenesPrep {
     async fn prepare(
         &self,
         input: &str,
         stat: SummaryStat,
-        stream: bool,
-        probe: &ProbeOpts,
-    ) -> anyhow::Result<(Vec<Source>, u64)> {
-        prepare_moe_summary_sources(input, stat, stream, probe).await
-    }
-}
-
-/// `--moe-cka <model>` source preparer. Delegates to
-/// [`prepare_moe_cka_sources`], which builds one in-memory U8 CKA-
-/// similarity heatmap per `(layer, weight)` panel plus `MoeCkaPanel`
-/// extension tags that [`crate::MoeCkaLayoutPlugin`] reads back.
-pub struct TensorMoeCkaPrep;
-
-#[async_trait(?Send)]
-impl MoeCkaPrep for TensorMoeCkaPrep {
-    async fn prepare(
-        &self,
-        input: &str,
         sample: u32,
         stream: bool,
         probe: &ProbeOpts,
     ) -> anyhow::Result<(Vec<Source>, u64)> {
-        prepare_moe_cka_sources(input, sample, stream, probe).await
+        prepare_moe_scenes_sources(input, stat, sample, stream, probe).await
     }
 }
 

@@ -611,7 +611,7 @@ impl ArchLayout {
     /// a `n_layers × n_experts` U8 heatmap rendered at `MOE_SUMMARY_CELL_PX`
     /// pixels per scalar. Triggered by [`crate::layout::select_layout`] when
     /// any source carries a `MoeSummaryPanel` extension tag (set by
-    /// [`crate::data::prepare_moe_summary_sources`]).
+    /// [`crate::data::build_moe_summary_sources`]).
     ///
     /// Panels appear in a fixed order — gate_proj, up_proj, down_proj, then
     /// router if present. Each panel is one synthetic tensor of shape
@@ -806,7 +806,7 @@ impl ArchLayout {
     ///
     /// Triggered by [`crate::layout::select_layout`] when any source
     /// carries a `MoeCkaPanel` or `MoeCkaProbePanel` tag (set by
-    /// [`crate::data::prepare_moe_cka_sources`]). Returns `None` if no
+    /// [`crate::data::build_moe_cka_sources`]). Returns `None` if no
     /// source carries either tag.
     pub fn try_build_moe_cka(
         sources: &[Source],

@@ -239,11 +239,13 @@ impl LayoutPlugin for ArchLayoutPlugin {
 }
 
 /// MoE-summary plugin — applies when any source carries a `MoeSummaryPanel`
-/// tag (set by [`crate::data::prepare_moe_summary_sources`]).
+/// tag (set by [`crate::data::build_moe_summary_sources`]).
 ///
-/// Can't collide with [`MoeCkaLayoutPlugin`]: the two are mutually exclusive
-/// at the CLI layer (`--moe-summary` vs `--moe-cka`) and use different
-/// per-source extension tags.
+/// Can't collide with [`MoeCkaLayoutPlugin`]: under `--moe` the two lenses are
+/// emitted as separate `arbvis::SceneTag` scenes, which arbvis partitions into
+/// independent tile pyramids *before* layout selection — so each plugin only
+/// ever sees its own scene's sources (and they key off different per-source
+/// extension tags besides).
 pub struct MoeSummaryLayoutPlugin;
 
 impl LayoutPlugin for MoeSummaryLayoutPlugin {
@@ -268,8 +270,9 @@ impl LayoutPlugin for MoeSummaryLayoutPlugin {
 }
 
 /// MoE-CKA plugin — applies when any source carries a `MoeCkaPanel` or
-/// `MoeCkaProbePanel` tag (set by [`crate::data::prepare_moe_cka_sources`]).
-/// Mutually exclusive with the other MoE plugins at the CLI layer.
+/// `MoeCkaProbePanel` tag (set by [`crate::data::build_moe_cka_sources`]).
+/// Lives in its own `arbvis::SceneTag` scene, so it can't collide with the
+/// summary plugin (see [`MoeSummaryLayoutPlugin`]).
 pub struct MoeCkaLayoutPlugin;
 
 impl LayoutPlugin for MoeCkaLayoutPlugin {

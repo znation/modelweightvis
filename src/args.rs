@@ -1,7 +1,7 @@
 //! Tensor-aware CLI surface that flattens [`arbvis::Args`] and adds the
-//! model-side flags (`--moe-summary` / `--moe-cka`, the `--probe` family,
-//! `--summary-stat`, `--cka-sample`, `--finetune` / `--no-finetune`,
-//! `--diff-metric`, `--layout`).
+//! model-side flags (`--moe`, the `--probe` family, `--summary-stat`,
+//! `--cka-sample`, `--finetune` / `--no-finetune`, `--diff-metric`,
+//! `--layout`).
 //!
 //! The diff / layout flags used to live on `arbvis::Args` directly, which meant
 //! `arbvis --help` advertised them even though they only do anything when
@@ -112,46 +112,34 @@ impl From<LayoutArg> for LayoutMode {
 /// group name and trip a debug-build assertion in clap.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-// `--probe*` require a MoE mode to hook into. They accept either
-// `--moe-summary` OR `--moe-cka`, expressed as a `requires = "moe_mode"`
-// against this group. `multiple(false)` reinforces the modes' mutual
-// exclusivity (also enforced by each mode's `conflicts_with_all`).
-#[command(group(
-    clap::ArgGroup::new("moe_mode")
-        .args(["moe_summary", "moe_cka"])
-        .multiple(false)
-        .required(false)
-))]
+// `--probe*` only make sense alongside the MoE viewer, expressed as a
+// `requires = "moe"` on each probe flag.
 pub struct ModelArgs {
     #[command(flatten)]
     pub arbvis: arbvis::Args,
 
-    /// Visualize per-expert scalar heatmaps for each MoE layer of a single
-    /// model. MODEL is a local path or hf:// URL. Each panel is one weight
-    /// (gate_proj / up_proj / down_proj / router) rendered as a layers × experts
-    /// heatmap, with one colored cell per expert. The scalar is chosen by
-    /// `--summary-stat`. Surfaces outlier experts, layer-wise magnitude
-    /// trends, and dead experts.
+    /// Visualize a single MoE model as a tabbed, multi-scene render. MODEL is
+    /// a local path or hf:// URL. Two scenes are produced from one load and the
+    /// viewer switches between them:
+    ///
+    /// • **Summary** — per-expert scalar heatmaps, one panel per weight
+    ///   (gate_proj / up_proj / down_proj / router) as a layers × experts grid
+    ///   (one cell per expert; scalar chosen by `--summary-stat`). Surfaces
+    ///   outlier experts, layer-wise magnitude trends, and dead experts.
+    ///
+    /// • **CKA** — per-(layer, weight) expert-vs-expert linear-CKA similarity
+    ///   matrices (`n_experts × n_experts`, diagonal 1.0); off-diagonal blocks
+    ///   reveal redundant expert clusters. Uses Gaussian random projection on
+    ///   the input axis (see `--cka-sample`).
+    ///
+    /// `--probe` adds a behavioral panel to each scene. Requires a tile
+    /// destination (`--tiles` / `--space`) — the tab switcher is viewer-only.
     #[arg(
         long,
         value_name = "MODEL",
-        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_cka"]
+        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs"]
     )]
-    pub moe_summary: Option<PathBuf>,
-
-    /// Visualize per-(layer, weight) expert-vs-expert linear CKA similarity
-    /// matrices for a single MoE model. MODEL is a local path or hf:// URL.
-    /// Each panel is one `(layer, weight)` rendered as an `n_experts × n_experts`
-    /// heatmap of pairwise CKA scores in `[0, 1]`; the diagonal is `1.0`
-    /// (every expert is self-identical) and off-diagonal blocks reveal expert
-    /// clusters / redundancy. Uses Gaussian random projection on the input
-    /// axis (see `--cka-sample`) so a 60-expert × 24-layer model is tractable.
-    #[arg(
-        long,
-        value_name = "MODEL",
-        conflicts_with_all = ["diff", "files", "file_list", "finetune", "no_finetune", "show_xet_xorbs", "moe_summary"]
-    )]
-    pub moe_cka: Option<PathBuf>,
+    pub moe: Option<PathBuf>,
 
     /// Force-treat the second --diff argument as a finetune of the first.
     /// In finetune mode, tensors present only on the base side are rendered
@@ -175,15 +163,15 @@ pub struct ModelArgs {
     #[arg(long, value_enum, default_value_t = DiffMetricArg::Rms)]
     pub diff_metric: DiffMetricArg,
 
-    /// Which per-expert scalar `--moe-summary` computes from each FFN
-    /// weight. `rms` (default) is comparable across tensors of different
+    /// Which per-expert scalar the `--moe` summary scene computes from each
+    /// FFN weight. `rms` (default) is comparable across tensors of different
     /// scale; `frobenius` is honest about total magnitude; `mean-abs` is
     /// stable and dominated by typical entries; `sparsity` surfaces dead
     /// experts.
     #[arg(long, value_enum, default_value_t = SummaryStatArg::Rms)]
     pub summary_stat: SummaryStatArg,
 
-    /// Random-projection dimension for `--moe-cka`. Trades CKA estimation
+    /// Random-projection dimension for the `--moe` CKA scene. Trades CKA estimation
     /// accuracy for compute: smaller is faster (per-pair cost is O(k² · d_out)),
     /// larger preserves CKA more accurately (the projection becomes lossless
     /// as k approaches d_in). Default 128 lands the full 24-layer × 3-weight
@@ -193,32 +181,32 @@ pub struct ModelArgs {
     pub cka_sample: u32,
 
     /// Run a routing-faithful forward pass on a probe input and add a
-    /// behavioral panel: a per-`(layer, expert)` routing-frequency heatmap
-    /// under `--moe-summary`, or per-layer `n_experts × n_experts` routing
-    /// co-activation matrices under `--moe-cka`. Without `--probe-text` /
-    /// `--probe-file` / `--probe-url`, uses a small bundled default snippet
-    /// of varied prose / code / dialogue. Requires `--moe-summary` or
-    /// `--moe-cka`. Supported architectures: `Qwen2MoeForCausalLM`,
+    /// behavioral panel to each `--moe` scene: a per-`(layer, expert)`
+    /// routing-frequency heatmap in the summary scene, and per-layer
+    /// `n_experts × n_experts` routing co-activation matrices in the CKA
+    /// scene. Without `--probe-text` / `--probe-file` / `--probe-url`, uses a
+    /// small bundled default snippet of varied prose / code / dialogue.
+    /// Requires `--moe`. Supported architectures: `Qwen2MoeForCausalLM`,
     /// `MixtralForCausalLM`.
-    #[arg(long, requires = "moe_mode")]
+    #[arg(long, requires = "moe")]
     pub probe: bool,
 
     /// Override the bundled probe with literal text. Mutually exclusive with
     /// `--probe-file` and `--probe-url`. Implies `--probe`.
-    #[arg(long, value_name = "TEXT", requires = "moe_mode", conflicts_with_all = ["probe_file", "probe_url"])]
+    #[arg(long, value_name = "TEXT", requires = "moe", conflicts_with_all = ["probe_file", "probe_url"])]
     pub probe_text: Option<String>,
 
     /// Override the bundled probe with the contents of a local UTF-8 text
     /// file. Mutually exclusive with `--probe-text` and `--probe-url`.
     /// Implies `--probe`.
-    #[arg(long, value_name = "PATH", requires = "moe_mode", conflicts_with_all = ["probe_text", "probe_url"])]
+    #[arg(long, value_name = "PATH", requires = "moe", conflicts_with_all = ["probe_text", "probe_url"])]
     pub probe_file: Option<PathBuf>,
 
     /// Override the bundled probe with text fetched from a URL. Accepts
     /// plain HTTPS URLs (returns the response body as UTF-8 text) or
     /// `hf://...` URLs (downloads via the HF Hub). Mutually exclusive with
     /// `--probe-text` and `--probe-file`. Implies `--probe`.
-    #[arg(long, value_name = "URL", requires = "moe_mode", conflicts_with_all = ["probe_text", "probe_file"])]
+    #[arg(long, value_name = "URL", requires = "moe", conflicts_with_all = ["probe_text", "probe_file"])]
     pub probe_url: Option<String>,
 
     /// Layout strategy for arranging tensors on the canvas.
@@ -263,8 +251,7 @@ impl ModelArgs {
                 ProbeSource::Text(_) | ProbeSource::File(_) | ProbeSource::Url(_)
             );
         let opts = ModelOpts {
-            moe_summary: self.moe_summary,
-            moe_cka: self.moe_cka,
+            moe: self.moe,
             finetune: self.finetune,
             no_finetune: self.no_finetune,
             diff_metric: self.diff_metric.into(),

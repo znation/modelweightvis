@@ -17,8 +17,8 @@
 //! for the regular `--diff` flow).
 //!
 //! NB: this module is the parser only. Source construction and panel layout
-//! live in [`crate::data::prepare_moe_summary_sources`] /
-//! [`crate::data::prepare_moe_cka_sources`] and the matching
+//! live in [`crate::data::build_moe_summary_sources`] /
+//! [`crate::data::build_moe_cka_sources`] and the matching
 //! `ArchLayout::try_build_moe_{summary,cka}` builders.
 
 /// Which weight matrix of a single expert. `GateProj` / `UpProj` /

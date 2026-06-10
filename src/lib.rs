@@ -12,7 +12,7 @@
 //! - Plugin impls (`ArchLayoutPlugin`, `MoeSummaryLayoutPlugin`,
 //!   `MoeCkaLayoutPlugin`, `TensorDiffBuilder`, `ArchRegionsLoader`,
 //!   `ArchRegionsRenderer`, the `FormatPlugin` family, plus the
-//!   `MoeSummaryPrep`/`MoeCkaPrep`/`RepoDiffPrep`/
+//!   `MoeScenesPrep`/`RepoDiffPrep`/
 //!   `DirectoryTensorDiffPrep`/`FinetuneDetect`/`SingleImageArchHook` hooks)
 //!   are registered on a registry via [`register_all`].
 //!
@@ -39,7 +39,7 @@ pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{
     ArchSingleImageHook, HfModelCardFinetuneDetect, SourceMetaSidecarHook, TensorDirectoryDiffPrep,
-    TensorMoeCkaPrep, TensorMoeSummaryPrep, TensorRepoDiffPrep,
+    TensorMoeScenesPrep, TensorRepoDiffPrep,
 };
 pub use layout::{ArchLayoutPlugin, MoeCkaLayoutPlugin, MoeSummaryLayoutPlugin};
 pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
@@ -52,11 +52,11 @@ use arbvis::Registry;
 ///
 /// Populates the four Vec slots (`formats`, `layouts`, `diffs`, plus
 /// `leaf`'s loader+renderer maps) and every Option-slot hook
-/// (`moe_summary`, `moe_cka`, `repo_diff`, `dir_tensor_diff`,
-/// `finetune_detect`, `single_image_arch`). After this returns, arbvis::run
-/// handles every CLI shape the model-aware crate supports, including
-/// `--moe-summary` / `--moe-cka`, repo-level `--diff`, directory-safetensors
-/// `--diff`, single-image arch, and FormatPlugin-driven `ModelInfo` population.
+/// (`moe`, `repo_diff`, `dir_tensor_diff`, `finetune_detect`,
+/// `single_image_arch`). After this returns, arbvis::run handles every CLI
+/// shape the model-aware crate supports, including `--moe`, repo-level
+/// `--diff`, directory-safetensors `--diff`, single-image arch, and
+/// FormatPlugin-driven `ModelInfo` population.
 pub fn register_all(registry: &mut Registry) {
     // Per-format header parsers — first plugin that detects a path
     // wins. Stuff `ModelInfo` into `Source.extensions` so the arch
@@ -84,8 +84,7 @@ pub fn register_all(registry: &mut Registry) {
         .register_renderer(Arc::new(ArchRegionsRenderer));
 
     // Option-slot hooks — each one taps a single CLI dispatch.
-    registry.moe_summary = Some(Arc::new(TensorMoeSummaryPrep));
-    registry.moe_cka = Some(Arc::new(TensorMoeCkaPrep));
+    registry.moe = Some(Arc::new(TensorMoeScenesPrep));
     registry.repo_diff = Some(Arc::new(TensorRepoDiffPrep));
     registry.dir_tensor_diff = Some(Arc::new(TensorDirectoryDiffPrep));
     registry.finetune_detect = Some(Arc::new(HfModelCardFinetuneDetect));

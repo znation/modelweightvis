@@ -2,9 +2,8 @@
 //!
 //! Diverges from the byte-only `arbvis` binary on two axes:
 //! - Uses `modelweightvis::ModelArgs` (clap-flatten of `arbvis::Args` + the
-//!   tensor-aware flags `--moe-summary` / `--moe-cka`, `--probe`,
-//!   `--finetune` / `--no-finetune`, `--diff-metric`, `--layout`) instead of
-//!   `arbvis::Args` directly.
+//!   tensor-aware flags `--moe`, `--probe`, `--finetune` / `--no-finetune`,
+//!   `--diff-metric`, `--layout`) instead of `arbvis::Args` directly.
 //! - Registers tensor-aware plugins (format parsers, arch + MoE summary / CKA
 //!   layouts, tensor-diff source builder, arch leaf loader+renderer,
 //!   `SourceMetaSidecarHook`, and the option-slot hooks) on top of the

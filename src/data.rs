@@ -3,9 +3,9 @@
 //! These items use `format::*` (Dtype, TensorMeta, etc.) and the
 //! safetensors / GGUF / pickle parsers — all of which live in
 //! `modelweightvis::format`. arbvis itself stays format-agnostic; it
-//! reaches these helpers via the `MoeSummaryPrep`, `MoeCkaPrep`,
-//! `RepoDiffPrep`, `DirectoryTensorDiffPrep`, and (per-Source)
-//! `FormatPlugin` hooks registered by `modelweightvis::register_all`.
+//! reaches these helpers via the `MoeScenesPrep`, `RepoDiffPrep`,
+//! `DirectoryTensorDiffPrep`, and (per-Source) `FormatPlugin` hooks
+//! registered by `modelweightvis::register_all`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -1610,24 +1610,23 @@ fn build_fused_expert_jobs(
     (jobs, n_experts, layers)
 }
 
-/// Build per-expert summary `Source`s for `--moe-summary`. Emits one
-/// `Source` per per-weight panel (gate / up / down, plus router when the
-/// checkpoint has `mlp.gate.weight` tensors) carrying a `MoeSummaryPanel`
-/// extension tag and an in-memory `n_layers × n_experts` U8 heatmap. The
-/// `MoeSummaryLayoutPlugin` reads the tags back and lays the panels out
-/// side-by-side.
-///
-/// Reuses the same file-opening / header-fetch / per-expert grouping
-/// scaffolding as [`prepare_moe_cka_sources`]; the duplication is
-/// intentional for now (the shared scaffolding is the easy half of an
-/// eventual extraction once the summary code stabilises).
-pub async fn prepare_moe_summary_sources(
-    input: &str,
-    stat: format::SummaryStat,
-    stream: bool,
-    probe: &arbvis::ProbeOpts,
-) -> anyhow::Result<(Vec<Source>, u64)> {
-    // === File opening — identical to prepare_moe_cka_sources ============
+/// Model data shared by both `--moe` scene builders: the opened/materialized
+/// per-shard [`Data`] handles plus their parsed tensor headers. Built once by
+/// [`open_moe_model_sources`] so a combined `--moe` render loads the model a
+/// single time. `datas` is the heavy part (mmaps / downloaded shards) — both
+/// builders `.clone()` the `Vec<Arc<Data>>`, which only bumps refcounts and
+/// shares the underlying bytes; `headers` is light tensor metadata.
+struct LoadedMoe {
+    datas: Vec<Arc<Data>>,
+    headers: Vec<(usize, Vec<format::TensorMeta>)>,
+}
+
+/// Open + (for remote, materialize) every `.safetensors` / `.gguf` shard of a
+/// single MoE model and parse each shard's tensor header. Shared verbatim by
+/// the summary and CKA scene builders — this is the formerly-duplicated
+/// file-open + header-fetch preamble, factored out so `--moe` loads once.
+async fn open_moe_model_sources(input: &str, stream: bool) -> anyhow::Result<LoadedMoe> {
+    // === File opening ===================================================
     let (datas, fmts, file_names) = if hf_url::is_repo_level(input)? {
         let listed = hf_url::list_repo_as_http_specs(input)
             .await
@@ -1637,7 +1636,7 @@ pub async fn prepare_moe_summary_sources(
             .filter(|(n, _)| SourceFormat::from_name(n).is_some())
             .collect();
         if st_specs.is_empty() {
-            anyhow::bail!("--moe-summary: no .safetensors / .gguf files in {input}");
+            anyhow::bail!("--moe: no .safetensors / .gguf files in {input}");
         }
         let fmts: Vec<SourceFormat> = st_specs
             .iter()
@@ -1647,7 +1646,7 @@ pub async fn prepare_moe_summary_sources(
         let specs_owned: Vec<RemoteFileSpec> = st_specs.iter().map(|(_, s)| s.clone()).collect();
         let mut datas: Vec<Arc<Data>> = if stream {
             let pb = setup_progress(
-                "source files (xet reconstruction for moe-summary)",
+                "source files (xet reconstruction for moe)",
                 specs_owned.len() as u64,
             );
             let pb_for_workers = pb.clone();
@@ -1710,7 +1709,7 @@ pub async fn prepare_moe_summary_sources(
             materialize_remote_arcs(
                 &mut datas,
                 &specs_owned,
-                "source files (downloading for moe-summary)",
+                "source files (downloading for moe)",
             )
             .await?;
         }
@@ -1728,9 +1727,7 @@ pub async fn prepare_moe_summary_sources(
             vec![resolved]
         };
         if files.is_empty() {
-            anyhow::bail!(
-                "--moe-summary: no recognised model files (.safetensors / .gguf) in {input}"
-            );
+            anyhow::bail!("--moe: no recognised model files (.safetensors / .gguf) in {input}");
         }
         let mut datas = Vec::with_capacity(files.len());
         let mut fmts = Vec::with_capacity(files.len());
@@ -1748,7 +1745,7 @@ pub async fn prepare_moe_summary_sources(
         (datas, fmts, names)
     };
 
-    // === Header fetch — identical to prepare_moe_cka_sources ============
+    // === Header fetch ===================================================
     let total_headers = datas.len() as u64;
     let pb = setup_progress("source files (model headers)", total_headers);
     let headers: Vec<(usize, Vec<format::TensorMeta>)> = {
@@ -1763,9 +1760,10 @@ pub async fn prepare_moe_summary_sources(
             .map(|(i, d, fmt)| {
                 let pb = pb.clone();
                 async move {
-                    let r = fetch_model_header(&d, fmt).await.map(|(t, _)| t).with_context(
-                        || format!("reading {fmt:?} header for moe-summary file {i}"),
-                    );
+                    let r = fetch_model_header(&d, fmt)
+                        .await
+                        .map(|(t, _)| t)
+                        .with_context(|| format!("reading {fmt:?} header for moe file {i}"));
                     if let Some(pb) = pb.as_ref() {
                         pb.inc(1);
                     }
@@ -1784,7 +1782,7 @@ pub async fn prepare_moe_summary_sources(
         pb.finish_and_clear();
     }
 
-    // GGUF fused-expert rejection — same constraint as moe-cka.
+    // GGUF fused-expert rejection — not yet supported by either scene.
     for (shard_idx, tensors) in &headers {
         if matches!(fmts[*shard_idx], SourceFormat::Gguf)
             && tensors
@@ -1792,7 +1790,7 @@ pub async fn prepare_moe_summary_sources(
                 .any(|t| crate::format::moe::is_fused_gguf_expert(&t.name))
         {
             anyhow::bail!(
-                "--moe-summary: GGUF fused expert tensors are not yet supported \
+                "--moe: GGUF fused expert tensors are not yet supported \
                  (found `ffn_*_exps.weight` in {}).",
                 file_names
                     .get(*shard_idx)
@@ -1801,6 +1799,93 @@ pub async fn prepare_moe_summary_sources(
             );
         }
     }
+
+    Ok(LoadedMoe { datas, headers })
+}
+
+/// Build every `--moe` scene for `input` in one pass: open the model once,
+/// then render the summary and CKA scenes from the shared [`LoadedMoe`],
+/// tagging each scene's `Source`s with an [`arbvis::SceneTag`] so the tiler
+/// splits them into independent, tab-switchable pyramids.
+///
+/// Scenes are independent: a failure in one (e.g. the CKA scene declines a
+/// fused-layout checkpoint, which it doesn't yet support) is non-fatal — it's
+/// logged and skipped so the other scene still renders. Only an
+/// all-scenes-failed run is a hard error.
+///
+/// Note: when `--probe` is enabled each scene runs its own probe forward (a
+/// `RoutingCapture` carries both the routing-frequency and co-activation
+/// signals, so this is a future dedup opportunity — the static model load is
+/// already shared via [`open_moe_model_sources`]).
+pub async fn prepare_moe_scenes_sources(
+    input: &str,
+    stat: format::SummaryStat,
+    sample: u32,
+    stream: bool,
+    probe: &arbvis::ProbeOpts,
+) -> anyhow::Result<(Vec<Source>, u64)> {
+    let loaded = open_moe_model_sources(input, stream).await?;
+
+    let mut sources: Vec<Source> = Vec::new();
+
+    match build_moe_summary_sources(&loaded, stat, probe, input).await {
+        Ok(mut summary) => {
+            tag_scene(&mut summary, "summary", "Summary", 0);
+            sources.append(&mut summary);
+        }
+        Err(e) => log::warn!("--moe: summary scene could not be built ({e:#}); skipping it"),
+    }
+
+    match build_moe_cka_sources(&loaded, sample, probe, input).await {
+        Ok(mut cka) => {
+            tag_scene(&mut cka, "cka", "CKA", 1);
+            sources.append(&mut cka);
+        }
+        Err(e) => log::warn!("--moe: CKA scene could not be built ({e:#}); skipping it"),
+    }
+
+    if sources.is_empty() {
+        anyhow::bail!(
+            "--moe: neither the summary nor the CKA scene could be built from {input} \
+             (no recognised per-expert / fused MoE tensors?)"
+        );
+    }
+
+    // Per-scene byte totals are recomputed by the tiler's scene partition; this
+    // top-level figure is just the sum the dispatch / progress layer expects.
+    let total: u64 = sources.iter().map(|s| s.byte_size).sum();
+    Ok((sources, total))
+}
+
+/// Stamp every source in `sources` with an [`arbvis::SceneTag`] so the tiler
+/// renders them as their own tab-switchable pyramid under `tiles/<key>/`.
+fn tag_scene(sources: &mut [Source], key: &str, label: &str, order: u32) {
+    for s in sources {
+        s.extensions.insert(arbvis::SceneTag {
+            key: key.to_string(),
+            label: label.to_string(),
+            order,
+        });
+    }
+}
+
+/// Build the `--moe` **summary** scene from the shared [`LoadedMoe`]: per-expert
+/// scalar heatmaps, one `Source` per per-weight panel (gate / up / down, plus
+/// router when the checkpoint has `mlp.gate.weight` tensors) carrying a
+/// `MoeSummaryPanel` tag and an `n_layers × n_experts` U8 heatmap that
+/// [`crate::MoeSummaryLayoutPlugin`] lays out side-by-side. Returns the panels
+/// untagged — the caller stamps the [`arbvis::SceneTag`].
+async fn build_moe_summary_sources(
+    loaded: &LoadedMoe,
+    stat: format::SummaryStat,
+    probe: &arbvis::ProbeOpts,
+    input: &str,
+) -> anyhow::Result<Vec<Source>> {
+    // Cheap clones: `datas` only bumps Arc refcounts (shared shard bytes),
+    // `headers` is light tensor metadata. Keeps the compute below identical
+    // to the pre-refactor single-mode body.
+    let datas = loaded.datas.clone();
+    let headers = loaded.headers.clone();
 
     // === Group per-expert + router tensors ================================
     use crate::format::moe::{
@@ -2139,7 +2224,7 @@ pub async fn prepare_moe_summary_sources(
         stat,
     );
 
-    Ok((sources, total_bytes))
+    Ok(sources)
 }
 
 /// Resolve a local model directory, detect the architecture, and run the
@@ -2378,7 +2463,7 @@ async fn attach_cka_probe_panels(
 }
 
 /// Dispatch a [`format::SummaryStat`] over a contiguous tensor byte slice.
-/// Single-pass, dtype-aware. Used by [`prepare_moe_summary_sources`].
+/// Single-pass, dtype-aware. Used by [`build_moe_summary_sources`].
 fn scalar_from_buf(stat: format::SummaryStat, dtype: format::Dtype, bytes: &[u8]) -> f32 {
     match stat {
         format::SummaryStat::Rms => format::rms_from_buf(dtype, bytes),
@@ -2400,211 +2485,41 @@ fn scalar_from_buf(stat: format::SummaryStat, dtype: format::Dtype, bytes: &[u8]
 fn decode_tensor_to_f32(dtype: format::Dtype, bytes: &[u8], n_elements: usize) -> Vec<f32> {
     let mut reader = format::TensorElementReader::new(dtype, bytes);
     let mut out = vec![0.0f32; n_elements];
-    for k in 0..n_elements {
-        out[k] = reader.element(k);
+    for (k, slot) in out.iter_mut().enumerate() {
+        *slot = reader.element(k);
     }
     out
 }
 
-/// Build per-`(layer, weight)` similarity Sources for `--moe-cka`.
-/// Emits one `Source` per panel carrying a [`MoeCkaPanel`] extension
-/// tag and an in-memory `n_experts × n_experts` U8 heatmap of linear
-/// CKA between every expert pair. The [`crate::MoeCkaLayoutPlugin`]
-/// reads the tags back and lays out the panels in a `n_layers × 3`
-/// grid (one row per layer, three columns for gate / up / down).
+/// Build the `--moe` **CKA** scene from the shared [`LoadedMoe`]: per-`(layer,
+/// weight)` `n_experts × n_experts` linear-CKA similarity matrices. Emits one
+/// `Source` per panel carrying a [`MoeCkaPanel`] tag and an in-memory U8 heatmap
+/// of linear CKA between every expert pair; [`crate::MoeCkaLayoutPlugin`] lays
+/// them out in an `n_layers × 3` grid (one row per layer; gate / up / down
+/// columns). Returns the panels untagged — the caller stamps the
+/// [`arbvis::SceneTag`].
 ///
-/// Uses Gaussian random projection on the input dim (controlled by
-/// `sample`, defaulting to 128 via the CLI) so the per-pair compute
-/// drops from `O(d_in² · d_out)` to `O(k² · d_out)` — see
-/// [`crate::cka`] for the math and accuracy notes.
+/// Uses Gaussian random projection on the input dim (controlled by `sample`,
+/// defaulting to 128 via the CLI) so the per-pair compute drops from
+/// `O(d_in² · d_out)` to `O(k² · d_out)` — see [`crate::cka`] for the math and
+/// accuracy notes.
 ///
-/// Router weights are intentionally excluded: CKA needs a shared
-/// input space, and the router maps tokens → expert logits (different
-/// space from the FFN weights). A per-row stat for the router is
-/// available via `--moe-summary`; pairwise router-row CKA would be
-/// well-defined but doesn't fit the per-`(layer, weight)` panel
-/// shape, so it's deferred.
-pub async fn prepare_moe_cka_sources(
-    input: &str,
+/// Router weights are intentionally excluded: CKA needs a shared input space,
+/// and the router maps tokens → expert logits (a different space from the FFN
+/// weights). The router's per-row stat lives in the summary scene instead;
+/// pairwise router-row CKA would be well-defined but doesn't fit the
+/// per-`(layer, weight)` panel shape, so it's deferred.
+async fn build_moe_cka_sources(
+    loaded: &LoadedMoe,
     sample: u32,
-    stream: bool,
     probe: &arbvis::ProbeOpts,
-) -> anyhow::Result<(Vec<Source>, u64)> {
-    // === File opening — identical to the other two MoE prep helpers ======
-    let (datas, fmts, file_names) = if hf_url::is_repo_level(input)? {
-        let listed = hf_url::list_repo_as_http_specs(input)
-            .await
-            .with_context(|| format!("listing files in {input}"))?;
-        let st_specs: Vec<&(String, hf_url::RemoteFileSpec)> = listed
-            .iter()
-            .filter(|(n, _)| SourceFormat::from_name(n).is_some())
-            .collect();
-        if st_specs.is_empty() {
-            anyhow::bail!("--moe-cka: no .safetensors / .gguf files in {input}");
-        }
-        let fmts: Vec<SourceFormat> = st_specs
-            .iter()
-            .map(|(n, _)| SourceFormat::from_name(n).unwrap_or(SourceFormat::Safetensors))
-            .collect();
-        let names: Vec<String> = st_specs.iter().map(|(n, _)| n.clone()).collect();
-        let specs_owned: Vec<RemoteFileSpec> = st_specs.iter().map(|(_, s)| s.clone()).collect();
-        let mut datas: Vec<Arc<Data>> = if stream {
-            let pb = setup_progress(
-                "source files (xet reconstruction for moe-cka)",
-                specs_owned.len() as u64,
-            );
-            let pb_for_workers = pb.clone();
-            let mut out: Vec<(usize, anyhow::Result<Arc<Data>>)> =
-                stream::iter(specs_owned.iter().cloned().enumerate())
-                    .map(|(i, spec)| {
-                        let pb = pb_for_workers.clone();
-                        async move {
-                            let r: anyhow::Result<Arc<Data>> = if spec.xet_hash.is_some() {
-                                match XetReader::new(&spec).await {
-                                    Ok(reader) => Ok(Arc::new(Data::Xet(reader))),
-                                    Err(e) => {
-                                        log::warn!(
-                                    "{}: XetReader build failed ({e}); falling back to Data::Http",
-                                    spec.filename,
-                                );
-                                        Ok(Arc::new(Data::Http {
-                                            repo: spec.repo.clone(),
-                                            filename: Arc::clone(&spec.filename),
-                                            revision: Arc::clone(&spec.revision),
-                                        }))
-                                    }
-                                }
-                            } else {
-                                Ok(Arc::new(Data::Http {
-                                    repo: spec.repo.clone(),
-                                    filename: Arc::clone(&spec.filename),
-                                    revision: Arc::clone(&spec.revision),
-                                }))
-                            };
-                            if let Some(pb) = pb.as_ref() {
-                                pb.inc(1);
-                            }
-                            (i, r)
-                        }
-                    })
-                    .buffer_unordered(SETUP_FETCH_CONCURRENCY)
-                    .collect()
-                    .await;
-            if let Some(pb) = pb.as_ref() {
-                pb.finish_and_clear();
-            }
-            out.sort_by_key(|(i, _)| *i);
-            out.into_iter()
-                .map(|(_, r)| r)
-                .collect::<anyhow::Result<Vec<_>>>()?
-        } else {
-            specs_owned
-                .iter()
-                .map(|spec| {
-                    Arc::new(Data::Http {
-                        repo: spec.repo.clone(),
-                        filename: Arc::clone(&spec.filename),
-                        revision: Arc::clone(&spec.revision),
-                    })
-                })
-                .collect()
-        };
-        if !stream {
-            materialize_remote_arcs(
-                &mut datas,
-                &specs_owned,
-                "source files (downloading for moe-cka)",
-            )
-            .await?;
-        }
-        (datas, fmts, names)
-    } else {
-        let resolved = hf_url::resolve(Path::new(input))
-            .await
-            .with_context(|| format!("resolving {input}"))?;
-        let files: Vec<PathBuf> = if resolved.is_dir() {
-            collect_files_recursive(&resolved)
-                .into_iter()
-                .filter(|p| SourceFormat::from_path(p).is_some())
-                .collect()
-        } else {
-            vec![resolved]
-        };
-        if files.is_empty() {
-            anyhow::bail!(
-                "--moe-cka: no recognised model files (.safetensors / .gguf) in {input}"
-            );
-        }
-        let mut datas = Vec::with_capacity(files.len());
-        let mut fmts = Vec::with_capacity(files.len());
-        let mut names = Vec::with_capacity(files.len());
-        for p in &files {
-            let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
-            datas.push(Arc::new(Data::Mapped(unsafe { Mmap::map(&f) }?)));
-            fmts.push(SourceFormat::from_path(p).unwrap_or(SourceFormat::Safetensors));
-            names.push(
-                p.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            );
-        }
-        (datas, fmts, names)
-    };
+    input: &str,
+) -> anyhow::Result<Vec<Source>> {
+    // Cheap clones: see [`build_moe_summary_sources`].
+    let datas = loaded.datas.clone();
+    let headers = loaded.headers.clone();
 
-    // === Header fetch + expert grouping ===================================
-    let total_headers = datas.len() as u64;
-    let pb = setup_progress("source files (model headers)", total_headers);
-    let headers: Vec<(usize, Vec<format::TensorMeta>)> = {
-        let pb = pb.clone();
-        let items: Vec<(usize, Arc<Data>, SourceFormat)> = datas
-            .iter()
-            .zip(fmts.iter())
-            .enumerate()
-            .map(|(i, (d, fmt))| (i, Arc::clone(d), *fmt))
-            .collect();
-        let mut out: Vec<(usize, anyhow::Result<Vec<format::TensorMeta>>)> = stream::iter(items)
-            .map(|(i, d, fmt)| {
-                let pb = pb.clone();
-                async move {
-                    let r = fetch_model_header(&d, fmt)
-                        .await
-                        .map(|(t, _)| t)
-                        .with_context(|| format!("reading {fmt:?} header for moe-cka file {i}"));
-                    if let Some(pb) = pb.as_ref() {
-                        pb.inc(1);
-                    }
-                    (i, r)
-                }
-            })
-            .buffer_unordered(SETUP_FETCH_CONCURRENCY)
-            .collect()
-            .await;
-        out.sort_by_key(|(i, _)| *i);
-        out.into_iter()
-            .map(|(i, r)| r.map(|t| (i, t)))
-            .collect::<anyhow::Result<Vec<_>>>()?
-    };
-    if let Some(pb) = pb.as_ref() {
-        pb.finish_and_clear();
-    }
-
-    for (shard_idx, tensors) in &headers {
-        if matches!(fmts[*shard_idx], SourceFormat::Gguf)
-            && tensors
-                .iter()
-                .any(|t| crate::format::moe::is_fused_gguf_expert(&t.name))
-        {
-            anyhow::bail!(
-                "--moe-cka: GGUF fused expert tensors are not yet supported \
-                 (found `ffn_*_exps.weight` in {}).",
-                file_names
-                    .get(*shard_idx)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>"),
-            );
-        }
-    }
-
+    // === Expert grouping ==================================================
     use crate::format::moe::{parse_hf_expert, ExpertWeight as EW};
     use std::collections::BTreeMap;
     type LayerKey = (u32, EW);
@@ -2771,7 +2686,7 @@ pub async fn prepare_moe_cka_sources(
         sample,
     );
 
-    Ok((sources, total_bytes))
+    Ok(sources)
 }
 
 /// One panel of CKA: project every expert in `experts` and compute the
