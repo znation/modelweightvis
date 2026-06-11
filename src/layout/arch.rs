@@ -181,6 +181,14 @@ pub struct ArchLayout {
     /// tile count on the long axis).
     pub content_w: u32,
     pub content_h: u32,
+    /// When `true`, plain-mode rendering colours each element through the
+    /// perceptual [`crate::colormap::CIVIDIS_LUT`] instead of arbvis's
+    /// Stairwell byte LUT. Set by the MoE builders ([`Self::try_build_moe_summary`],
+    /// [`Self::try_build_moe_cka`]) whose U8 cells are normalised *magnitudes*
+    /// — a monotonic, CVD-safe ramp reads them honestly and stays visually
+    /// distinct from the diff scale. Regular weight layouts leave it `false`
+    /// to keep the byte/Hilbert-consistent Stairwell colouring.
+    pub magnitude_lut: bool,
 }
 
 impl ArchLayout {
@@ -516,6 +524,7 @@ impl ArchLayout {
             layer_bounds,
             architecture,
             sorted_idx,
+            magnitude_lut: false,
         })
     }
 
@@ -792,6 +801,7 @@ impl ArchLayout {
                 n_experts,
             ),
             sorted_idx,
+            magnitude_lut: true,
         })
     }
 
@@ -982,6 +992,7 @@ impl ArchLayout {
                 n_layers, n_cols,
             ),
             sorted_idx,
+            magnitude_lut: true,
         })
     }
 }

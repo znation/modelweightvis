@@ -63,6 +63,11 @@ pub struct LoadedArchTile {
     ///   `iter_region_pixels_compact` in that case. `false` is the default
     ///   element-bounding-box layout consumed by `iter_region_pixels`.
     pub regions: Vec<(TileRegion, Vec<u8>, usize, bool)>,
+    /// Mirror of [`ArchLayout::magnitude_lut`](crate::layout::arch::ArchLayout)
+    /// for this tile, stamped at load time (the renderer's `RenderCtx` can't
+    /// see the layout). When `true`, [`render_arch_tile_plain`] colours through
+    /// the cividis magnitude LUT instead of the passed-in Stairwell LUT.
+    pub magnitude_lut: bool,
 }
 
 /// Compute the absolute byte span of `region` inside the source plus the
@@ -150,7 +155,10 @@ pub async fn load_arch_tile_regions(
     source_data: &[Data],
     cumulative_offsets: &[u64],
 ) -> anyhow::Result<LoadedArchTile> {
-    let mut out = LoadedArchTile::default();
+    let mut out = LoadedArchTile {
+        magnitude_lut: layout.magnitude_lut,
+        ..Default::default()
+    };
     let regions = layout.regions_in_tile(zoom, tx, ty);
     for region in regions {
         // `tensor_byte_start` is absolute across the concatenated source
@@ -300,11 +308,21 @@ fn blank_tile() -> image::ImageBuffer<Rgb<u8>, Vec<u8>> {
 }
 
 /// Plain-mode (single source, byte-value coloring via pixel_lut).
+///
+/// When `tile.magnitude_lut` is set (MoE summary / CKA panels, whose U8 cells
+/// are normalised magnitudes), the passed-in Stairwell `pixel_lut` is replaced
+/// by the perceptual [`crate::colormap::CIVIDIS_LUT`]; all other plain renders
+/// keep the byte/Hilbert-consistent Stairwell colouring.
 pub fn render_arch_tile_plain(
     tile: &LoadedArchTile,
     pixel_lut: &[Rgb<u8>; 256],
     fmt: TileFormat,
 ) -> TileResult {
+    let pixel_lut: &[Rgb<u8>; 256] = if tile.magnitude_lut {
+        &crate::colormap::CIVIDIS_LUT
+    } else {
+        pixel_lut
+    };
     let mut img = blank_tile();
     for (region, bytes, leading, is_compact) in &tile.regions {
         let dtype = region.dtype;

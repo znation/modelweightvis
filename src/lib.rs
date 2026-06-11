@@ -17,12 +17,13 @@
 //!   are registered on a registry via [`register_all`].
 //!
 //! The `modelweightvis` binary builds `arbvis::Registry::with_defaults()`,
-//! calls `register_all(&mut registry)`, and hands off to `arbvis::run`.
+//! calls `register_all(&mut registry, moe_norm)`, and hands off to `arbvis::run`.
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod args;
 mod cka;
+mod colormap;
 mod data;
 mod diff;
 mod finetune;
@@ -34,7 +35,8 @@ mod probe;
 mod single_arch;
 mod tiled;
 
-pub use args::{DiffMetricArg, LayoutArg, ModelArgs};
+pub use args::{DiffMetricArg, LayoutArg, ModelArgs, MoeNormArg};
+pub use data::MoeNorm;
 pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{
@@ -57,7 +59,7 @@ use arbvis::Registry;
 /// shape the model-aware crate supports, including `--moe`, repo-level
 /// `--diff`, directory-safetensors `--diff`, single-image arch, and
 /// FormatPlugin-driven `ModelInfo` population.
-pub fn register_all(registry: &mut Registry) {
+pub fn register_all(registry: &mut Registry, moe_norm: MoeNorm) {
     // Per-format header parsers — first plugin that detects a path
     // wins. Stuff `ModelInfo` into `Source.extensions` so the arch
     // layout / arch tile loader / renderer pick it up downstream.
@@ -83,8 +85,10 @@ pub fn register_all(registry: &mut Registry) {
         .leaf
         .register_renderer(Arc::new(ArchRegionsRenderer));
 
-    // Option-slot hooks — each one taps a single CLI dispatch.
-    registry.moe = Some(Arc::new(TensorMoeScenesPrep));
+    // Option-slot hooks — each one taps a single CLI dispatch. The MoE prep
+    // carries the `--moe-norm` mode (arbvis's `ModelOpts`/`MoeScenesPrep` has
+    // no slot for it, so it rides on the hook instead).
+    registry.moe = Some(Arc::new(TensorMoeScenesPrep { norm: moe_norm }));
     registry.repo_diff = Some(Arc::new(TensorRepoDiffPrep));
     registry.dir_tensor_diff = Some(Arc::new(TensorDirectoryDiffPrep));
     registry.finetune_detect = Some(Arc::new(HfModelCardFinetuneDetect));

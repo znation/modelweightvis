@@ -256,6 +256,32 @@ pub struct MoeSummaryPanel {
     pub n_experts: u32,
 }
 
+/// How a `--moe` summary panel's per-cell scalars are mapped onto the U8
+/// `0..=255` heatmap range before colouring. Each panel is normalised
+/// independently (a quiet panel shouldn't be crushed by a noisy one), so this
+/// only controls the *within-panel* mapping. Surfaced as `--moe-norm`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MoeNorm {
+    /// Linear `0 → panel-max`. Keeps an absolute-zero anchor (a dead expert
+    /// reads as the colormap's low end) but crushes contrast when values
+    /// cluster near the max — the original behaviour.
+    Max,
+    /// Linear `panel-min → panel-max`. Stretches the panel's actual range
+    /// across the full ramp, revealing per-expert spread when values cluster —
+    /// at the cost of the zero anchor (the dimmest cell is the low end even if
+    /// its value isn't ~0). The single panel max still maps to the top of the
+    /// ramp, so the argmax "pop" survives.
+    MinMax,
+    /// Robust min-max: clip to the 2nd/98th percentiles, then stretch. Reveals
+    /// the bulk spread while ignoring a lone dominant or dead outlier expert
+    /// that would otherwise compress everyone else. Top/bottom outliers
+    /// saturate (so the unique-argmax pop is lost — use `max`/`min-max` to
+    /// pinpoint it). The default: most MoE panels cluster, so this is what
+    /// actually reveals per-expert structure out of the box.
+    #[default]
+    Percentile,
+}
+
 /// Per-panel tag attached to each `--moe-cka` source. One source per
 /// `(layer, weight)` pair present in the model; the source's bytes
 /// are an `n_experts × n_experts` U8 CKA-similarity heatmap, row-major,
@@ -1820,6 +1846,7 @@ async fn open_moe_model_sources(input: &str, stream: bool) -> anyhow::Result<Loa
 pub async fn prepare_moe_scenes_sources(
     input: &str,
     stat: format::SummaryStat,
+    norm: MoeNorm,
     sample: u32,
     stream: bool,
     probe: &arbvis::ProbeOpts,
@@ -1850,7 +1877,7 @@ pub async fn prepare_moe_scenes_sources(
 
     let mut sources: Vec<Source> = Vec::new();
 
-    match build_moe_summary_sources(&loaded, stat, capture.as_ref(), input).await {
+    match build_moe_summary_sources(&loaded, stat, norm, capture.as_ref(), input).await {
         Ok(mut summary) => {
             tag_scene(&mut summary, "summary", "Summary", 0);
             sources.append(&mut summary);
@@ -1900,6 +1927,7 @@ fn tag_scene(sources: &mut [Source], key: &str, label: &str, order: u32) {
 async fn build_moe_summary_sources(
     loaded: &LoadedMoe,
     stat: format::SummaryStat,
+    norm: MoeNorm,
     probe_capture: Option<&crate::probe::RoutingCapture>,
     input: &str,
 ) -> anyhow::Result<Vec<Source>> {
@@ -2171,11 +2199,7 @@ async fn build_moe_summary_sources(
                 }
             }
         }
-        let max = scalars.iter().copied().fold(0.0_f32, f32::max).max(1e-12);
-        let bytes_u8: Vec<u8> = scalars
-            .iter()
-            .map(|&s| ((s / max).clamp(0.0, 1.0) * 255.0) as u8)
-            .collect();
+        let bytes_u8 = normalize_panel_u8(&scalars, norm);
         let nbytes = bytes_u8.len() as u64;
         let label = match weight {
             EW::Router => format!(
@@ -2224,7 +2248,7 @@ async fn build_moe_summary_sources(
     // produced a capture, turn its routing-frequency signal into one extra
     // `MoeProbePanel` source. The layout merges it alongside the static panels.
     if let Some(capture) = probe_capture {
-        match attach_probe_panel(capture, n_layers, n_experts) {
+        match attach_probe_panel(capture, n_layers, n_experts, norm) {
             Ok(source) => {
                 total_bytes += source.byte_size;
                 sources.push(source);
@@ -2338,24 +2362,16 @@ fn attach_probe_panel(
     capture: &crate::probe::RoutingCapture,
     n_layers: u32,
     n_experts: u32,
+    norm: MoeNorm,
 ) -> anyhow::Result<Source> {
-    // Normalize freq to U8 per-panel (same convention as the static
-    // summary panels): max → 255, 0 → 0.
-    let max = capture
-        .freq
-        .iter()
-        .copied()
-        .fold(0.0_f32, f32::max)
-        .max(1e-12);
-    let bytes_u8: Vec<u8> = capture
-        .freq
-        .iter()
-        .map(|&v| ((v / max).clamp(0.0, 1.0) * 255.0) as u8)
-        .collect();
+    // Normalize freq to U8 per-panel under the same `--moe-norm` mode as the
+    // static summary panels.
+    let bytes_u8 = normalize_panel_u8(&capture.freq, norm);
     let nbytes = bytes_u8.len() as u64;
+    let max_freq = capture.freq.iter().copied().fold(0.0_f32, f32::max);
     log::info!(
         "--probe: routing-frequency capture from {} tokens ({} layers × {} experts), \
-         max_freq = {max:.3}",
+         max_freq = {max_freq:.3}",
         capture.n_tokens,
         capture.n_layers,
         capture.n_experts,
@@ -2498,6 +2514,66 @@ fn scalar_from_buf(stat: format::SummaryStat, dtype: format::Dtype, bytes: &[u8]
         // knob if a user reports it being wrong for their dtype mix.
         format::SummaryStat::Sparsity => format::sparsity_from_buf(dtype, bytes, 1e-6),
     }
+}
+
+/// Map one panel's per-cell scalars to a `0..=255` U8 heatmap under `norm`.
+/// Row-major layout is preserved (the caller owns the `layers × experts`
+/// shape); this only rescales values. Each panel is normalised independently —
+/// see [`MoeNorm`] for what the modes trade off. The resulting byte is coloured
+/// downstream by the cividis magnitude LUT.
+fn normalize_panel_u8(scalars: &[f32], norm: MoeNorm) -> Vec<u8> {
+    // Finite max doubles as the `Max` upper bound and the degenerate-range
+    // fall-back bound below.
+    let max = scalars
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(0.0_f32, f32::max);
+    let (lo, hi) = match norm {
+        MoeNorm::Max => (0.0, max),
+        MoeNorm::MinMax => {
+            let min = scalars
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f32::INFINITY, f32::min);
+            (if min.is_finite() { min } else { 0.0 }, max)
+        }
+        MoeNorm::Percentile => percentile_bounds(scalars, 0.02, 0.98),
+    };
+    // A collapsed range (uniform panel, or percentiles that coincide) would
+    // map everything to one end — fall back to `0 → max` so a flat panel keeps
+    // a sensible mid-to-high tone instead of going uniformly dark.
+    let (lo, hi) = if hi - lo > 1e-12 {
+        (lo, hi)
+    } else {
+        (0.0, max)
+    };
+    let span = (hi - lo).max(1e-12);
+    scalars
+        .iter()
+        .map(|&s| (((s - lo) / span).clamp(0.0, 1.0) * 255.0) as u8)
+        .collect()
+}
+
+/// Lower/upper bounds at quantiles `q_lo`/`q_hi` (each in `0.0..=1.0`) of the
+/// finite values in `scalars`, using nearest-rank on the sorted values. Backs
+/// [`MoeNorm::Percentile`]'s outlier clipping. Returns `(0, 0)` for an all-empty
+/// / all-non-finite input, which [`normalize_panel_u8`] treats as a collapsed
+/// range (→ `Max` fall-back).
+fn percentile_bounds(scalars: &[f32], q_lo: f32, q_hi: f32) -> (f32, f32) {
+    let mut v: Vec<f32> = scalars.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    // `total_cmp` gives a total order over the (already finite-only) values, so
+    // no `partial_cmp` unwrap is needed.
+    v.sort_by(f32::total_cmp);
+    let at = |q: f32| {
+        let pos = (q.clamp(0.0, 1.0) * (v.len() - 1) as f32).round() as usize;
+        v[pos.min(v.len() - 1)]
+    };
+    (at(q_lo), at(q_hi))
 }
 
 /// Decode `bytes` (one expert's whole weight tensor, dtype `dtype`) to
@@ -3013,6 +3089,63 @@ mod tests {
             shape,
             packed_sidecars: None,
         }
+    }
+
+    #[test]
+    fn max_norm_matches_legacy_and_handles_degenerate_panels() {
+        // Legacy behaviour: 0 → 0, max → 255, half → ~127.
+        let b = normalize_panel_u8(&[0.0, 0.5, 1.0], MoeNorm::Max);
+        assert_eq!(b[0], 0);
+        assert_eq!(b[2], 255);
+        assert!((b[1] as i32 - 127).abs() <= 1);
+        // A uniform nonzero panel under MinMax has a collapsed range → falls
+        // back to `0 → max`, so cells stay at the top instead of going dark.
+        let uni = normalize_panel_u8(&[3.0, 3.0, 3.0], MoeNorm::MinMax);
+        assert!(
+            uni.iter().all(|&x| x == 255),
+            "uniform panel went dark: {uni:?}"
+        );
+        // An all-zero / empty panel stays black.
+        assert!(normalize_panel_u8(&[0.0, 0.0], MoeNorm::Max)
+            .iter()
+            .all(|&x| x == 0));
+    }
+
+    #[test]
+    fn minmax_norm_reveals_clustered_spread() {
+        // Values clustered high: `Max` squashes them near the top; `MinMax`
+        // stretches the [min, max] band across the full ramp.
+        let scalars = [0.80, 0.90, 1.00];
+        let max_bytes = normalize_panel_u8(&scalars, MoeNorm::Max);
+        let mm_bytes = normalize_panel_u8(&scalars, MoeNorm::MinMax);
+        let spread = |b: &[u8]| b[2] - b[0];
+        assert!(spread(&mm_bytes) > spread(&max_bytes));
+        assert_eq!(mm_bytes[0], 0);
+        assert_eq!(mm_bytes[2], 255);
+        // The panel max still anchors the top of the ramp under both modes.
+        assert_eq!(max_bytes[2], 255);
+    }
+
+    #[test]
+    fn percentile_norm_resists_outlier_crush() {
+        // 98 bulk values 0..=97 plus one dominant outlier. `Max` lets the
+        // outlier crush the bulk toward black; `percentile` clips it first and
+        // keeps the bulk in the visible mid-range.
+        let mut scalars: Vec<f32> = (0..98).map(|i| i as f32).collect();
+        scalars.push(10_000.0);
+        let idx = 50; // scalars[50] == 50.0, a representative bulk value
+        let max_bytes = normalize_panel_u8(&scalars, MoeNorm::Max);
+        let pct_bytes = normalize_panel_u8(&scalars, MoeNorm::Percentile);
+        assert!(
+            max_bytes[idx] < 5,
+            "Max should crush the bulk near black, got {}",
+            max_bytes[idx]
+        );
+        assert!(
+            pct_bytes[idx] > 80,
+            "Percentile should keep the bulk mid-range, got {}",
+            pct_bytes[idx]
+        );
     }
 
     #[test]

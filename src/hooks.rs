@@ -29,7 +29,13 @@ use crate::format::SourceFormat;
 /// [`crate::MoeSummaryLayoutPlugin`]) and an N×N "cka" similarity grid (panels
 /// carrying `MoeCkaPanel` tags, read by [`crate::MoeCkaLayoutPlugin`]) — each
 /// stamped with an `arbvis::SceneTag` so the tiler renders a tab switcher.
-pub struct TensorMoeScenesPrep;
+///
+/// Carries the `--moe-norm` mode: arbvis's `MoeScenesPrep::prepare` /
+/// `ModelOpts` predate the option and have no slot for it, so it rides on the
+/// hook (set by [`crate::register_all`]) rather than through arbvis's plumbing.
+pub struct TensorMoeScenesPrep {
+    pub norm: crate::data::MoeNorm,
+}
 
 #[async_trait(?Send)]
 impl MoeScenesPrep for TensorMoeScenesPrep {
@@ -41,7 +47,7 @@ impl MoeScenesPrep for TensorMoeScenesPrep {
         stream: bool,
         probe: &ProbeOpts,
     ) -> anyhow::Result<(Vec<Source>, u64)> {
-        prepare_moe_scenes_sources(input, stat, sample, stream, probe).await
+        prepare_moe_scenes_sources(input, stat, self.norm, sample, stream, probe).await
     }
 }
 

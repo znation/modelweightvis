@@ -75,6 +75,34 @@ impl From<SummaryStatArg> for SummaryStat {
     }
 }
 
+/// CLI mirror of [`crate::data::MoeNorm`] — how each `--moe` summary panel's
+/// per-cell scalars are scaled into the heatmap range. Kept separate from the
+/// core enum so the clap derive's variant-doc help text stays out of the
+/// library API (same rationale as [`SummaryStatArg`]).
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum MoeNormArg {
+    /// Linear `0 → panel-max`. Keeps a zero anchor; crushes contrast when
+    /// values cluster near the max. The original behaviour.
+    Max,
+    /// Linear `panel-min → panel-max`. Stretches the actual range to reveal
+    /// per-expert spread; drops the zero anchor.
+    MinMax,
+    /// Robust min-max: clip to the 2nd/98th percentiles, then stretch. Reveals
+    /// the bulk spread while ignoring a lone outlier expert. Default.
+    #[default]
+    Percentile,
+}
+
+impl From<MoeNormArg> for crate::data::MoeNorm {
+    fn from(a: MoeNormArg) -> Self {
+        match a {
+            MoeNormArg::Max => crate::data::MoeNorm::Max,
+            MoeNormArg::MinMax => crate::data::MoeNorm::MinMax,
+            MoeNormArg::Percentile => crate::data::MoeNorm::Percentile,
+        }
+    }
+}
+
 /// CLI choice for layout strategy. Mirrors [`arbvis::LayoutMode`].
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
 pub enum LayoutArg {
@@ -170,6 +198,16 @@ pub struct ModelArgs {
     /// experts.
     #[arg(long, value_enum, default_value_t = SummaryStatArg::Rms)]
     pub summary_stat: SummaryStatArg,
+
+    /// How each `--moe` summary panel's per-cell scalars are scaled into the
+    /// heatmap colour range (panels are normalised independently).
+    /// `percentile` (default) is a robust min-max that clips the 2nd/98th
+    /// percentiles first so one dominant or dead expert doesn't compress
+    /// everyone else; `min-max` stretches `panel-min → panel-max` to reveal
+    /// per-expert spread; `max` maps `0 → panel-max`, keeping a zero anchor
+    /// but crushing contrast when experts cluster near the max.
+    #[arg(long, value_enum, default_value_t = MoeNormArg::Percentile)]
+    pub moe_norm: MoeNormArg,
 
     /// Random-projection dimension for the `--moe` CKA scene. Trades CKA estimation
     /// accuracy for compute: smaller is faster (per-pair cost is O(k² · d_out)),

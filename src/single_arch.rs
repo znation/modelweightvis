@@ -82,7 +82,16 @@ pub fn run_single_arch(
         .map(load_source_data)
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let pixel_lut = build_pixel_lut();
+    // MoE summary / CKA layouts carry normalised-magnitude U8 cells; colour
+    // them through the perceptual cividis ramp instead of the Stairwell byte
+    // LUT (kept for regular weight / byte-consistent layouts). Mirrors the
+    // tiled path's selection in `render_arch_tile_plain`.
+    let stairwell_lut = build_pixel_lut();
+    let pixel_lut: &[Rgb<u8>; 256] = if arch.magnitude_lut {
+        &crate::colormap::CIVIDIS_LUT
+    } else {
+        &stairwell_lut
+    };
 
     // Per tensor, sample every `scale`-th element in row-major order and
     // paint it into the output image. The sampling is intentionally simple
@@ -139,7 +148,7 @@ pub fn run_single_arch(
                 }
                 let ec = disp_x * cols / disp_w.max(1);
                 let flat = (er * cols + ec) as usize;
-                let color = plain_element_color(t.dtype, tensor_bytes, flat, &pixel_lut);
+                let color = plain_element_color(t.dtype, tensor_bytes, flat, pixel_lut);
                 img.put_pixel(ox, oy, color);
             }
         }
