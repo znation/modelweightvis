@@ -1885,7 +1885,7 @@ pub async fn prepare_moe_scenes_sources(
         Err(e) => log::warn!("--moe: summary scene could not be built ({e:#}); skipping it"),
     }
 
-    match build_moe_cka_sources(&loaded, sample, capture.as_ref(), input).await {
+    match build_moe_cka_sources(&loaded, sample, norm, capture.as_ref(), input).await {
         Ok(mut cka) => {
             tag_scene(&mut cka, "cka", "CKA", 1);
             sources.append(&mut cka);
@@ -2516,15 +2516,13 @@ fn scalar_from_buf(stat: format::SummaryStat, dtype: format::Dtype, bytes: &[u8]
     }
 }
 
-/// Map one panel's per-cell scalars to a `0..=255` U8 heatmap under `norm`.
-/// Row-major layout is preserved (the caller owns the `layers × experts`
-/// shape); this only rescales values. Each panel is normalised independently —
-/// see [`MoeNorm`] for what the modes trade off. The resulting byte is coloured
-/// downstream by the cividis magnitude LUT.
-fn normalize_panel_u8(scalars: &[f32], norm: MoeNorm) -> Vec<u8> {
-    // Finite max doubles as the `Max` upper bound and the degenerate-range
-    // fall-back bound below.
-    let max = scalars
+/// Lower/upper bounds for mapping `values` into the heatmap range under `norm`.
+/// A collapsed range (uniform input, or coincident percentiles) falls back to
+/// `0 → finite-max` so a flat panel keeps a sensible tone instead of going
+/// uniformly dark. Shared by [`normalize_panel_u8`] and [`normalize_cka_u8`].
+fn norm_bounds(values: &[f32], norm: MoeNorm) -> (f32, f32) {
+    // Finite max doubles as the `Max` upper bound and the fall-back bound.
+    let max = values
         .iter()
         .copied()
         .filter(|v| v.is_finite())
@@ -2532,23 +2530,29 @@ fn normalize_panel_u8(scalars: &[f32], norm: MoeNorm) -> Vec<u8> {
     let (lo, hi) = match norm {
         MoeNorm::Max => (0.0, max),
         MoeNorm::MinMax => {
-            let min = scalars
+            let min = values
                 .iter()
                 .copied()
                 .filter(|v| v.is_finite())
                 .fold(f32::INFINITY, f32::min);
             (if min.is_finite() { min } else { 0.0 }, max)
         }
-        MoeNorm::Percentile => percentile_bounds(scalars, 0.02, 0.98),
+        MoeNorm::Percentile => percentile_bounds(values, 0.02, 0.98),
     };
-    // A collapsed range (uniform panel, or percentiles that coincide) would
-    // map everything to one end — fall back to `0 → max` so a flat panel keeps
-    // a sensible mid-to-high tone instead of going uniformly dark.
-    let (lo, hi) = if hi - lo > 1e-12 {
+    if hi - lo > 1e-12 {
         (lo, hi)
     } else {
         (0.0, max)
-    };
+    }
+}
+
+/// Map one panel's per-cell scalars to a `0..=255` U8 heatmap under `norm`.
+/// Row-major layout is preserved (the caller owns the `layers × experts`
+/// shape); this only rescales values. Each panel is normalised independently —
+/// see [`MoeNorm`] for what the modes trade off. The resulting byte is coloured
+/// downstream by the cividis magnitude LUT.
+fn normalize_panel_u8(scalars: &[f32], norm: MoeNorm) -> Vec<u8> {
+    let (lo, hi) = norm_bounds(scalars, norm);
     let span = (hi - lo).max(1e-12);
     scalars
         .iter()
@@ -2556,11 +2560,43 @@ fn normalize_panel_u8(scalars: &[f32], norm: MoeNorm) -> Vec<u8> {
         .collect()
 }
 
+/// Map an `n × n` symmetric CKA score matrix (row-major, values in `[0, 1]`)
+/// to a `0..=255` U8 heatmap under `norm`, *diagonal-aware*.
+///
+/// CKA's diagonal is a trivial constant — `CKA(e, e) = 1.0` — that carries no
+/// information but, if included in the scale, pins the upper bound at 1.0 and
+/// crushes the off-diagonal signal (the redundant-expert structure we actually
+/// want) into the bottom sliver of the ramp. So the scale is derived from the
+/// **off-diagonal** cells only; the diagonal is then painted at the top of the
+/// ramp (byte 255) as a bright reference line. With `n_experts` independent of
+/// the result, this reveals off-diagonal structure for any panel size (unlike
+/// percentile-over-the-whole-matrix, whose diagonal clip depends on `n`).
+fn normalize_cka_u8(scores: &[f32], n: usize, norm: MoeNorm) -> Vec<u8> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let offdiag: Vec<f32> = (0..n * n)
+        .filter(|&idx| idx / n != idx % n)
+        .map(|idx| scores[idx])
+        .collect();
+    let (lo, hi) = norm_bounds(&offdiag, norm);
+    let span = (hi - lo).max(1e-12);
+    (0..n * n)
+        .map(|idx| {
+            if idx / n == idx % n {
+                255 // diagonal: reference, always at the top of the ramp
+            } else {
+                (((scores[idx] - lo) / span).clamp(0.0, 1.0) * 255.0) as u8
+            }
+        })
+        .collect()
+}
+
 /// Lower/upper bounds at quantiles `q_lo`/`q_hi` (each in `0.0..=1.0`) of the
 /// finite values in `scalars`, using nearest-rank on the sorted values. Backs
 /// [`MoeNorm::Percentile`]'s outlier clipping. Returns `(0, 0)` for an all-empty
-/// / all-non-finite input, which [`normalize_panel_u8`] treats as a collapsed
-/// range (→ `Max` fall-back).
+/// / all-non-finite input, which [`norm_bounds`] treats as a collapsed range
+/// (→ `Max` fall-back).
 fn percentile_bounds(scalars: &[f32], q_lo: f32, q_hi: f32) -> (f32, f32) {
     let mut v: Vec<f32> = scalars.iter().copied().filter(|x| x.is_finite()).collect();
     if v.is_empty() {
@@ -2612,6 +2648,7 @@ fn decode_tensor_to_f32(dtype: format::Dtype, bytes: &[u8], n_elements: usize) -
 async fn build_moe_cka_sources(
     loaded: &LoadedMoe,
     sample: u32,
+    norm: MoeNorm,
     probe_capture: Option<&crate::probe::RoutingCapture>,
     input: &str,
 ) -> anyhow::Result<Vec<Source>> {
@@ -2687,6 +2724,7 @@ async fn build_moe_cka_sources(
                         datas_ref,
                         n_experts,
                         sample as usize,
+                        norm,
                     )
                     .await;
                     if let Some(pb) = pb.as_ref() {
@@ -2784,7 +2822,10 @@ async fn build_moe_cka_sources(
 
 /// One panel of CKA: project every expert in `experts` and compute the
 /// pairwise similarity matrix. Returns the row-major `n_experts × n_experts`
-/// U8 heatmap. CKA values in `[0, 1]` map to `0..=255` linearly.
+/// U8 heatmap. CKA scores in `[0, 1]` are mapped to `0..=255` by the
+/// diagonal-aware [`normalize_cka_u8`] under `norm` — the constant `1.0`
+/// diagonal is held at the top of the ramp and the off-diagonal structure is
+/// stretched across the rest.
 async fn compute_cka_panel(
     layer_idx: u32,
     weight: crate::format::moe::ExpertWeight,
@@ -2792,6 +2833,7 @@ async fn compute_cka_panel(
     datas: &[Arc<Data>],
     n_experts: u32,
     k: usize,
+    norm: MoeNorm,
 ) -> anyhow::Result<Vec<u8>> {
     use rayon::prelude::*;
 
@@ -2875,14 +2917,16 @@ async fn compute_cka_panel(
         })
         .collect();
 
-    let mut matrix = vec![0u8; n * n];
+    // Materialise the symmetric f32 score matrix, then map to U8 with the
+    // diagonal-aware normaliser so the off-diagonal structure isn't crushed
+    // by the constant 1.0 diagonal.
+    let mut score_mat = vec![0.0f32; n * n];
     for (idx, &(i, j)) in pairs.iter().enumerate() {
-        // CKA already in [0, 1]; scale into 0..=255.
-        let v = (scores[idx].clamp(0.0, 1.0) * 255.0) as u8;
-        matrix[i * n + j] = v;
-        matrix[j * n + i] = v;
+        let v = scores[idx].clamp(0.0, 1.0);
+        score_mat[i * n + j] = v;
+        score_mat[j * n + i] = v;
     }
-    Ok(matrix)
+    Ok(normalize_cka_u8(&score_mat, n, norm))
 }
 
 /// Build per-tensor diff Sources from two single .safetensors files.
@@ -3146,6 +3190,32 @@ mod tests {
             "Percentile should keep the bulk mid-range, got {}",
             pct_bytes[idx]
         );
+    }
+
+    #[test]
+    fn cka_norm_is_diagonal_aware() {
+        // 3×3 symmetric CKA: 1.0 diagonal + small off-diagonal structure.
+        let n = 3;
+        let scores = [
+            1.0, 0.1, 0.2, //
+            0.1, 1.0, 0.05, //
+            0.2, 0.05, 1.0,
+        ];
+        let b = normalize_cka_u8(&scores, n, MoeNorm::Max);
+        // The diagonal is always pinned at the top of the ramp as a reference.
+        assert_eq!((b[0], b[4], b[8]), (255, 255, 255));
+        // The scale ignores the 1.0 diagonal, so the largest off-diagonal (0.2)
+        // reaches the top — where a naive cka*255 would crush it to ~51.
+        assert_eq!(b[2], 255);
+        assert_eq!(b[6], 255); // symmetric
+        assert!(b[2] as u32 > (0.2_f32 * 255.0) as u32 + 100);
+        // Smaller off-diagonals stay proportionally dimmer but nonzero.
+        assert!(b[5] > 0 && b[5] < b[1] && b[1] < b[2]); // 0.05 < 0.1 < 0.2
+                                                         // The diagonal stays at the top under every mode.
+        for mode in [MoeNorm::MinMax, MoeNorm::Percentile] {
+            let b = normalize_cka_u8(&scores, n, mode);
+            assert_eq!((b[0], b[4], b[8]), (255, 255, 255));
+        }
     }
 
     #[test]
