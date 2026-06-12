@@ -238,6 +238,11 @@ impl ArchLayout {
         let names: Vec<&str> = all.iter().map(|(_, t, _)| t.name.as_str()).collect();
         let profile = name_tree::classify(&names);
 
+        // If this is a split per-expert MoE checkpoint, nudge toward the
+        // purpose-built view — the generic layout renders it faithfully but as
+        // a dense wall of tiny per-expert tiles.
+        maybe_log_moe_hint(&names);
+
         // Group: each `layer_idx` -> { sub_path -> (source_idx, tensor, abs_byte_start) }.
         // Top-level singletons collect into `top_level`.
         let mut blocks: BTreeMap<u32, BTreeMap<String, (usize, &TensorMeta, u64)>> =
@@ -1018,8 +1023,44 @@ const MOE_CKA_CELL_PX: u32 = 8;
 /// and vertically between layers).
 const MOE_CKA_PANEL_PAD: u32 = 12;
 
+/// Build a lexicographically-comparable key that orders embedded integer runs
+/// *numerically*: `experts.2.x` sorts before `experts.10.x`, where a plain
+/// string compare would put `10` first. Each maximal digit run is left-padded
+/// with zeros to a fixed width; non-digit text passes through unchanged. Width
+/// 12 covers any realistic layer/expert/shard index without overflow. Runs
+/// longer than the width pass through unpadded — harmless for real indices.
+fn natural_sort_key(s: &str) -> String {
+    const WIDTH: usize = 12;
+    let mut out = String::with_capacity(s.len() + WIDTH);
+    let mut digits = String::new();
+    let flush = |digits: &mut String, out: &mut String| {
+        for _ in 0..WIDTH.saturating_sub(digits.len()) {
+            out.push('0');
+        }
+        out.push_str(digits);
+        digits.clear();
+    };
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            if !digits.is_empty() {
+                flush(&mut digits, &mut out);
+            }
+            out.push(ch);
+        }
+    }
+    if !digits.is_empty() {
+        flush(&mut digits, &mut out);
+    }
+    out
+}
+
 /// Order key for sub-paths within a layer: attention, then MLP, then norms,
-/// then "other". Within attention, q/k/v/o; within MLP, gate/up/down.
+/// then "other". Within attention, q/k/v/o; within MLP, gate/up/down. The
+/// final tiebreak is a [`natural_sort_key`] so repeated indexed sub-tensors —
+/// MoE experts especially (`experts.0`, `experts.1`, …, `experts.10`) — order
+/// numerically rather than lexicographically.
 fn sub_path_order_key(s: &str) -> (u8, u8, String) {
     let lower = s.to_lowercase();
     let group: u8 = if lower.contains("attn") || lower.contains("attention") {
@@ -1053,12 +1094,38 @@ fn sub_path_order_key(s: &str) -> (u8, u8, String) {
     } else {
         7
     };
-    (group, sub_order, s.to_string())
+    (group, sub_order, natural_sort_key(s))
 }
 
 fn is_input_side_name(name: &str) -> bool {
     let l = name.to_lowercase();
     l.contains("embed") || l.contains("wte") || l.contains("wpe")
+}
+
+/// Log a one-line pointer to `--moe` when the default arch layout is asked to
+/// render a checkpoint that stores experts as individual per-expert tensors
+/// (`…experts.{E}.{gate|up|down}_proj.weight`). That split export is exactly
+/// the case the generic layout renders as a dense wall of tiny per-expert tiles
+/// — and the one `--moe` fully supports (summary + CKA). Fused exports (one
+/// tensor per layer) render compactly here, so they aren't flagged.
+fn maybe_log_moe_hint(names: &[&str]) {
+    use crate::format::moe::parse_hf_expert;
+    use std::collections::{HashMap, HashSet};
+    let mut by_layer: HashMap<u32, HashSet<u32>> = HashMap::new();
+    for n in names {
+        if let Some(r) = parse_hf_expert(n) {
+            by_layer
+                .entry(r.layer_idx)
+                .or_default()
+                .insert(r.expert_idx);
+        }
+    }
+    if let Some(max_experts) = by_layer.values().map(|s| s.len()).max() {
+        log::info!(
+            "arch layout: detected per-expert MoE tensors (up to {max_experts} expert(s)/layer); \
+             `--moe <model>` renders a per-expert summary + expert-similarity (CKA) view."
+        );
+    }
 }
 
 /// Place one top-level tensor centred horizontally at `cursor_y`, at its
@@ -1251,6 +1318,48 @@ mod tests {
         let v = sub_path_order_key("self_attn.v_proj.weight");
         let o = sub_path_order_key("self_attn.o_proj.weight");
         assert!(q < k && k < v && v < o);
+    }
+
+    #[test]
+    fn sub_path_order_experts_are_numeric_not_lexicographic() {
+        // The whole point of the natural-sort tiebreak: experts must order
+        // 0,1,2,…,10,…,100 — not the lexicographic 0,1,10,100,11,2,….
+        let key = |e: u32| sub_path_order_key(&format!("mlp.experts.{e}.gate_proj.weight"));
+        assert!(key(2) < key(10), "expert 2 must sort before expert 10");
+        assert!(key(9) < key(10) && key(10) < key(100));
+        // Sorting a shuffled expert list yields ascending numeric order.
+        let mut paths: Vec<String> = [10u32, 2, 100, 1, 11, 20, 3]
+            .iter()
+            .map(|e| format!("mlp.experts.{e}.gate_proj.weight"))
+            .collect();
+        paths.sort_by_key(|a| sub_path_order_key(a));
+        let order: Vec<&str> = paths.iter().map(String::as_str).collect();
+        assert_eq!(
+            order,
+            vec![
+                "mlp.experts.1.gate_proj.weight",
+                "mlp.experts.2.gate_proj.weight",
+                "mlp.experts.3.gate_proj.weight",
+                "mlp.experts.10.gate_proj.weight",
+                "mlp.experts.11.gate_proj.weight",
+                "mlp.experts.20.gate_proj.weight",
+                "mlp.experts.100.gate_proj.weight",
+            ],
+        );
+        // gate/up/down grouping still dominates the per-expert index: every
+        // gate_proj precedes every up_proj regardless of expert number.
+        assert!(
+            sub_path_order_key("mlp.experts.100.gate_proj.weight")
+                < sub_path_order_key("mlp.experts.0.up_proj.weight")
+        );
+    }
+
+    #[test]
+    fn natural_sort_key_orders_numbers_numerically() {
+        assert!(natural_sort_key("a2") < natural_sort_key("a10"));
+        assert!(natural_sort_key("x") < natural_sort_key("x0"));
+        // No-digit strings are unchanged in relative order.
+        assert!(natural_sort_key("abc") < natural_sort_key("abd"));
     }
 
     #[test]
