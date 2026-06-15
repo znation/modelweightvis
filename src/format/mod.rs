@@ -29,10 +29,37 @@ pub use dtype::{
     TensorElementReader,
 };
 pub use name_map::to_canonical;
-// DiffMetric / DiffFill / SummaryStat moved to arbvis; re-export so the
-// many `format::DiffMetric` call sites below keep compiling.
-pub use arbvis::{DiffMetric, SummaryStat};
 pub use types::{ModelInfo, TensorMeta, ABS_LOG_MAX, ABS_LOG_MIN, K_RMS_SAT, RMS_FLOOR};
+
+/// Per-element delta encoding for a tensor `--diff`. Selected by the
+/// `--diff-metric` CLI flag (see [`crate::DiffMetricArg`]) and carried as a
+/// field on the diff providers / `TensorDiffBuilder` that interpret it. arbvis
+/// itself is metric-agnostic — this is a modelweightvis concept.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DiffMetric {
+    /// Root-mean-square of the per-element deltas.
+    #[default]
+    Rms,
+    /// Signed log of the absolute delta.
+    AbsLog,
+    /// Exact signed delta (no rescaling).
+    Exact,
+}
+
+/// Per-expert scalar for the `--moe` summary scene. Selected by the
+/// `--summary-stat` CLI flag (see [`crate::SummaryStatArg`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryStat {
+    /// √(mean(x²)). Default — comparable across tensors of different scale.
+    #[default]
+    Rms,
+    /// √(sum(x²)). Honest about total magnitude; varies with tensor size.
+    Frobenius,
+    /// mean(|x|). Stable, dominated by typical-magnitude entries.
+    MeanAbs,
+    /// Fraction of entries with |x| < ε. Surfaces dead / near-dead experts.
+    Sparsity,
+}
 
 /// Which model file format produced a [`ModelInfo`].
 ///

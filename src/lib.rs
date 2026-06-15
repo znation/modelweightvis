@@ -11,13 +11,14 @@
 //! - `finetune` — HF model-card finetune auto-detection.
 //! - Plugin impls (`ArchLayoutPlugin`, `MoeSummaryLayoutPlugin`,
 //!   `MoeCkaLayoutPlugin`, `TensorDiffBuilder`, `ArchRegionsLoader`,
-//!   `ArchRegionsRenderer`, the `FormatPlugin` family, plus the
-//!   `MoeScenesPrep`/`RepoDiffPrep`/
-//!   `DirectoryTensorDiffPrep`/`FinetuneDetect`/`SingleImageArchHook` hooks)
-//!   are registered on a registry via [`register_all`].
+//!   `ArchRegionsRenderer`, the `FormatPlugin` family, the `"arch"`
+//!   `SingleImageRenderer`, the `SourceMetaSidecarHook`, and the
+//!   `MoeSceneProvider`/`RepoDiffProvider`/`TensorDiffProvider` source
+//!   providers) are registered on a registry via [`register_all`].
 //!
 //! The `modelweightvis` binary builds `arbvis::Registry::with_defaults()`,
-//! calls `register_all(&mut registry, moe_norm)`, and hands off to `arbvis::run`.
+//! calls `register_all(&mut registry, &model_args)`, and hands off to
+//! `arbvis::run`.
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
@@ -40,8 +41,8 @@ pub use data::MoeNorm;
 pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{
-    ArchSingleImageHook, HfModelCardFinetuneDetect, SourceMetaSidecarHook, TensorDirectoryDiffPrep,
-    TensorMoeScenesPrep, TensorRepoDiffPrep,
+    ArchSingleImageHook, MoeSceneProvider, RepoDiffProvider, SourceMetaSidecarHook,
+    TensorDiffProvider,
 };
 pub use layout::{ArchLayoutPlugin, MoeCkaLayoutPlugin, MoeSummaryLayoutPlugin};
 pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
@@ -50,26 +51,28 @@ use std::sync::Arc;
 
 use arbvis::Registry;
 
-/// Register every tensor-aware plugin on `registry`.
+use crate::finetune::FinetuneForce;
+use crate::format::DiffMetric;
+
+/// Register every tensor-aware plugin on `registry` and wire the parsed CLI
+/// flags (`args`) into it.
 ///
-/// Populates the four Vec slots (`formats`, `layouts`, `diffs`, plus
-/// `leaf`'s loader+renderer maps) and every Option-slot hook
-/// (`moe`, `repo_diff`, `dir_tensor_diff`, `finetune_detect`,
-/// `single_image_arch`). After this returns, arbvis::run handles every CLI
-/// shape the model-aware crate supports, including `--moe`, repo-level
-/// `--diff`, directory-safetensors `--diff`, single-image arch, and
-/// FormatPlugin-driven `ModelInfo` population.
-pub fn register_all(registry: &mut Registry, moe_norm: MoeNorm) {
-    // Per-format header parsers — first plugin that detects a path
-    // wins. Stuff `ModelInfo` into `Source.extensions` so the arch
-    // layout / arch tile loader / renderer pick it up downstream.
+/// Populates the Vec slots (`formats`, `layouts`, `diffs`, `providers`), the
+/// id-keyed maps (`leaf`'s loader+renderer pair and the `"arch"`
+/// `single_renderers` entry), the `prepare_sources_extension` hook, the
+/// `layout_mode`, and the viewer branding. After this returns, `arbvis::run`
+/// handles every CLI shape the model-aware crate supports: `--moe`, repo-level
+/// `--diff`, directory-safetensors `--diff`, file-pair tensor `--diff`,
+/// single-image arch, and FormatPlugin-driven `ModelInfo` population.
+pub fn register_all(registry: &mut Registry, args: &ModelArgs) {
+    // --- Static plugins (independent of the parsed flags) ---
+
+    // Per-format header parsers — first plugin that detects a path wins. Stuff
+    // `ModelInfo` into `Source.extensions` so the arch layout / arch tile
+    // loader / renderer pick it up downstream.
     registry.formats.push(Arc::new(SafetensorsFormatPlugin));
     registry.formats.push(Arc::new(GgufFormatPlugin));
     registry.formats.push(Arc::new(PickleFormatPlugin));
-
-    // Tensor-aware diff (.safetensors / .gguf file pairs) — priority 300 so
-    // it wins over the JSON / plain-byte fallbacks for matching pairs.
-    registry.diffs.push(Arc::new(TensorDiffBuilder));
 
     // Architectural + MoE summary + MoE CKA layouts. `select_layout` sorts by
     // `priority()` descending. The MoE plugins can't collide — they look for
@@ -79,25 +82,18 @@ pub fn register_all(registry: &mut Registry, moe_norm: MoeNorm) {
     registry.layouts.push(Arc::new(MoeSummaryLayoutPlugin));
     registry.layouts.push(Arc::new(MoeCkaLayoutPlugin));
 
-    // Tile loader+renderer pair for the `"arch"` layout id.
+    // Tile loader+renderer pair, and single-image renderer, for the `"arch"`
+    // layout id.
     registry.leaf.register_loader(Arc::new(ArchRegionsLoader));
     registry
         .leaf
         .register_renderer(Arc::new(ArchRegionsRenderer));
+    registry.register_single_renderer(Arc::new(ArchSingleImageHook));
 
-    // Option-slot hooks — each one taps a single CLI dispatch. The MoE prep
-    // carries the `--moe-norm` mode (arbvis's `ModelOpts`/`MoeScenesPrep` has
-    // no slot for it, so it rides on the hook instead).
-    registry.moe = Some(Arc::new(TensorMoeScenesPrep { norm: moe_norm }));
-    registry.repo_diff = Some(Arc::new(TensorRepoDiffPrep));
-    registry.dir_tensor_diff = Some(Arc::new(TensorDirectoryDiffPrep));
-    registry.finetune_detect = Some(Arc::new(HfModelCardFinetuneDetect));
-    registry.single_image_arch = Some(Arc::new(ArchSingleImageHook));
-    // Cross-source sidecar enrichment. Runs once per render at the top
-    // of `dispatch_render`, after every source has been built. Fetches
-    // `config.json` / `model.safetensors.index.json` next to each source
-    // and inserts a `SourceMeta` extension that `ArchLayoutPlugin` reads
-    // back for transformer-aware grouping.
+    // Cross-source sidecar enrichment. Runs once per render after every source
+    // is built. Fetches `config.json` / `model.safetensors.index.json` next to
+    // each source and inserts a `SourceMeta` extension that `ArchLayoutPlugin`
+    // reads back for transformer-aware grouping.
     registry.prepare_sources_extension = Some(Arc::new(SourceMetaSidecarHook));
 
     // Rebrand the viewer arbvis generates: title fallback ("modelweightvis
@@ -107,4 +103,36 @@ pub fn register_all(registry: &mut Registry, moe_norm: MoeNorm) {
         "modelweightvis",
         "https://github.com/znation/modelweightvis",
     );
+
+    // --- Wired from the parsed CLI flags ---
+    registry.layout_mode = args.layout.into();
+    let diff_metric: DiffMetric = args.diff_metric.into();
+    let finetune = FinetuneForce::from_flags(args.finetune, args.no_finetune);
+
+    // Tensor-aware file-pair diff builder (priority 300, consulted by arbvis's
+    // byte-diff provider for a local `.safetensors` / `.gguf` file pair).
+    registry
+        .diffs
+        .push(Arc::new(TensorDiffBuilder { diff_metric }));
+
+    // Source providers, all higher priority than arbvis's byte built-ins. The
+    // MoE provider is registered ONLY when `--moe` is present so its
+    // `applicable` ("no diff, no inputs") can't shadow a bare stdin invocation.
+    if let Some(moe) = &args.moe {
+        registry.providers.push(Arc::new(MoeSceneProvider {
+            target: moe.clone(),
+            stat: args.summary_stat.into(),
+            norm: args.moe_norm.into(),
+            cka_sample: args.cka_sample,
+            probe: args.probe_opts(),
+        }));
+    }
+    registry.providers.push(Arc::new(RepoDiffProvider {
+        diff_metric,
+        finetune,
+    }));
+    registry.providers.push(Arc::new(TensorDiffProvider {
+        diff_metric,
+        finetune,
+    }));
 }

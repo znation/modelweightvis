@@ -17,12 +17,10 @@ fn main() -> anyhow::Result<()> {
     // lifetime (drop stops the monitor). See `perf_monitor::spawn_if_enabled`.
     let _perf_monitor_stop = arbvis::perf_monitor_spawn_if_enabled();
     let model_args = modelweightvis::ModelArgs::parse();
-    // `--moe-norm` can't ride through arbvis's `ModelOpts`/`MoeScenesPrep`
-    // (it predates the option), so pull it off before `split` and hand it to
-    // `register_all`, which bakes it into the MoE prep hook.
-    let moe_norm: modelweightvis::MoeNorm = model_args.moe_norm.into();
-    let (args, opts) = model_args.split();
+    // `register_all` registers the tensor-aware plugins and wires every parsed
+    // model-side flag (providers, layout mode, diff metric, finetune, probe)
+    // into the registry. `run` then takes only the byte-only `arbvis::Args`.
     let mut registry = arbvis::Registry::with_defaults();
-    modelweightvis::register_all(&mut registry, moe_norm);
-    rt.block_on(arbvis::run(args, opts, registry))
+    modelweightvis::register_all(&mut registry, &model_args);
+    rt.block_on(arbvis::run(model_args.into_arbvis_args(), registry))
 }

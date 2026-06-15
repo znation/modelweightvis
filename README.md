@@ -120,10 +120,11 @@ modelweightvis extends arbvis through its plugin / hook surface — no fork, no 
 - `FormatPlugin` impls (`SafetensorsFormatPlugin`, `GgufFormatPlugin`, `PickleFormatPlugin`) parse each format's header and stuff a `ModelInfo` (tensors + dtype color ranges) into the source's `extensions` map.
 - `LayoutPlugin` impls (`ArchLayoutPlugin`, `MoeSummaryLayoutPlugin`, `MoeCkaLayoutPlugin`) register the architectural canvas and the MoE summary / CKA panel layouts; arbvis's plugin-iteration `select_layout` picks them by priority.
 - `LeafLoader` + `LeafRenderer` pair (`ArchRegionsLoader`, `ArchRegionsRenderer`) drive per-tensor tile rendering at element granularity.
-- `DiffSourceBuilder` (`TensorDiffBuilder`) handles tensor-aware `--diff` at priority above arbvis's JSON / plain-byte fallbacks.
-- Option-slot hooks (`MoeScenesPrep`, `RepoDiffPrep`, `DirectoryTensorDiffPrep`, `FinetuneDetect`, `SingleImageArchHook`, `PrepareSourcesExtension`) tap arbvis's CLI dispatch points so `--moe`, repo-level `--diff`, single-image arch render, and HF model-card finetune detection slot in cleanly.
+- `DiffSourceBuilder` (`TensorDiffBuilder`) handles tensor-aware file-pair `--diff` at priority above arbvis's JSON / plain-byte fallbacks.
+- `SourceProvider` impls (`MoeSceneProvider`, `RepoDiffProvider`, `TensorDiffProvider`) turn an invocation into render sources — `--moe`, a repo-level `hf://` `--diff`, and a directory `--diff` — each registered above arbvis's byte-diff / normal-bytes built-ins. Finetune detection (HF model card) is resolved inside the diff providers.
+- `SingleImageRenderer` (`ArchSingleImageHook`, keyed to the `"arch"` layout id) draws the single-image arch render, and `PrepareSourcesExtension` (`SourceMetaSidecarHook`) fetches `config.json` / index sidecars.
 
-The `modelweightvis` binary itself is tiny — it builds an `arbvis::Registry::with_defaults()`, calls `modelweightvis::register_all(&mut registry)`, and hands off to `arbvis::run`. Same renderer, same Hub I/O, same tile pyramid; the tensor awareness comes entirely through the registered plugins.
+The `modelweightvis` binary itself is tiny — it builds an `arbvis::Registry::with_defaults()`, calls `modelweightvis::register_all(&mut registry, &args)` (which also wires the parsed CLI flags into the providers and the registry's layout mode), and hands off to `arbvis::run`. Same renderer, same Hub I/O, same tile pyramid; the tensor awareness comes entirely through the registered plugins.
 
 **Which to use:**
 - **modelweightvis** — for `.safetensors` / `.gguf` / `.bin` model checkpoints, architectural transformer layout, `--moe` (tabbed summary + CKA scenes) / `--probe`, `--diff-metric`, `--finetune` / `--no-finetune`, `--layout`, dtype-aware coloring. Inherits arbvis's full CLI surface.

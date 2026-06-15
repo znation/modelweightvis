@@ -37,13 +37,12 @@ const SPARSE_WASTE_THRESHOLD: u64 = 8;
 
 use image::Rgb;
 
-use arbvis::{encode_tile, Data, DiffMetric, TileFormat, TILE};
+use arbvis::{encode_tile, Data, TileFormat, TILE};
 
-use crate::format::ElementStride;
+use crate::format::{DiffMetric, ElementStride};
 use crate::layout::arch::ArchLayout;
 use crate::layout::render::{
-    diff_element_color, plain_element_color, xet_dtype_element_color, xet_element_color,
-    PADDING_RGB,
+    diff_element_color, plain_element_color, xet_element_color, PADDING_RGB,
 };
 use crate::layout::TileRegion;
 
@@ -341,26 +340,6 @@ pub fn render_arch_tile_plain(
     encode_tile(img, fmt)
 }
 
-/// Dtype-mode (single source, position-based dtype color, no byte read).
-///
-/// For architectural mode this is just "paint each region with its dtype
-/// color flat" — there are no inter-tensor bytes, the gaps are padding.
-pub fn render_arch_tile_dtype(tile: &LoadedArchTile, fmt: TileFormat) -> TileResult {
-    let mut img = blank_tile();
-    // The compact-vs-full distinction doesn't matter here — this renderer
-    // never reads the buffer, it just paints a flat dtype color across the
-    // region's tile rectangle.
-    for (region, _bytes, _leading, _is_compact) in &tile.regions {
-        let color = region.dtype.to_color();
-        for py in region.tile_y0..region.tile_y1 {
-            for px in region.tile_x0..region.tile_x1 {
-                img.put_pixel(px, py, color);
-            }
-        }
-    }
-    encode_tile(img, fmt)
-}
-
 /// Diff-mode. Each region carries paired byte ranges — fetched in
 /// architectural mode via twin layouts on the two sources. For v1, we
 /// piggyback on the existing `TensorDiff` source kind so the underlying
@@ -435,37 +414,6 @@ pub fn render_arch_tile_xet(
             iter_region_pixels(region, *leading, |px, py, elem_off| {
                 let color =
                     xet_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut);
-                img.put_pixel(px, py, color);
-            });
-        }
-    }
-    encode_tile(img, fmt)
-}
-
-/// Combined xet+safetensors mode — dtype hue × xorb tableau hue, modulated
-/// by per-element intensity proxy.
-pub fn render_arch_tile_xet_dtype(
-    tile: &LoadedArchTile,
-    xorb_ranges: &[(u64, u64, u8)],
-    tableau: &[Rgb<u8>; 20],
-    fmt: TileFormat,
-) -> TileResult {
-    let mut img = blank_tile();
-    for (region, bytes, leading, is_compact) in &tile.regions {
-        let dtype = region.dtype;
-        let tbs = region.tensor_byte_start
-            + region.row_first * region.tensor_cols * dtype.element_size() as u64
-            + region.col_first * dtype.element_size() as u64;
-        if *is_compact {
-            iter_region_pixels_compact(region, |px, py, elem_off| {
-                let color =
-                    xet_dtype_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau);
-                img.put_pixel(px, py, color);
-            });
-        } else {
-            iter_region_pixels(region, *leading, |px, py, elem_off| {
-                let color =
-                    xet_dtype_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau);
                 img.put_pixel(px, py, color);
             });
         }

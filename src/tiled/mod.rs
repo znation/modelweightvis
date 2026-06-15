@@ -10,8 +10,8 @@ use arbvis::{EncodedTile, LeafLoader, LeafMode, LeafRenderer, LoadCtx, LoadedTil
 
 use crate::layout::arch::ArchLayout;
 use crate::tiled::leaf_arch::{
-    load_arch_tile_regions, render_arch_tile_diff, render_arch_tile_dtype, render_arch_tile_plain,
-    render_arch_tile_xet, render_arch_tile_xet_dtype, LoadedArchTile,
+    load_arch_tile_regions, render_arch_tile_diff, render_arch_tile_plain, render_arch_tile_xet,
+    LoadedArchTile,
 };
 
 /// Architectural leaf loader: fetches one coalesced byte range per tensor
@@ -92,18 +92,12 @@ impl LeafRenderer for ArchRegionsRenderer {
                 xorb_ranges,
                 tableau,
             } => render_arch_tile_xet(&at, pixel_lut, xorb_ranges, tableau, fmt)?,
-            LeafMode::Dtype { .. } => render_arch_tile_dtype(&at, fmt)?,
             LeafMode::Diff {
                 pixel_lut,
                 fills: _,
                 plain_lut: _,
                 tints: _,
             } => render_arch_tile_diff(&at, pixel_lut, fmt)?,
-            LeafMode::XetDtype {
-                xorb_ranges,
-                tableau,
-                dtype_ranges: _,
-            } => render_arch_tile_xet_dtype(&at, xorb_ranges, tableau, fmt)?,
         };
         Ok(EncodedTile {
             tx,

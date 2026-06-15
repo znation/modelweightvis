@@ -20,10 +20,13 @@
 
 use std::path::PathBuf;
 
-use arbvis::{DiffMetric, LayoutMode, ModelOpts, ProbeOpts, ProbeSource, SummaryStat};
+use arbvis::LayoutMode;
 use clap::{Parser, ValueEnum};
 
-/// CLI mirror of [`arbvis::DiffMetric`]. Kept separate from the core type so
+use crate::format::{DiffMetric, SummaryStat};
+use crate::probe::{ProbeOpts, ProbeSource};
+
+/// CLI mirror of [`crate::format::DiffMetric`]. Kept separate from the core type so
 /// the clap derive's variant-doc strings and enum-discoverable help text
 /// don't leak into the library API.
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
@@ -48,7 +51,7 @@ impl From<DiffMetricArg> for DiffMetric {
     }
 }
 
-/// CLI mirror of [`arbvis::SummaryStat`]. Kept separate from the core type
+/// CLI mirror of [`crate::format::SummaryStat`]. Kept separate from the core type
 /// for the same reason as [`DiffMetricArg`] — the clap derive's
 /// variant-doc strings shouldn't leak into the library API.
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
@@ -122,7 +125,9 @@ impl From<LayoutArg> for LayoutMode {
     fn from(a: LayoutArg) -> Self {
         match a {
             LayoutArg::Auto => LayoutMode::Auto,
-            LayoutArg::Arch => LayoutMode::Arch,
+            // arbvis treats the forced layout id opaquely; "arch" names this
+            // crate's `ArchLayoutPlugin`.
+            LayoutArg::Arch => LayoutMode::Forced("arch"),
             LayoutArg::Hilbert => LayoutMode::Hilbert,
         }
     }
@@ -130,9 +135,11 @@ impl From<LayoutArg> for LayoutMode {
 
 /// Tensor-aware visualization built on `arbvis`.
 ///
-/// Flattens [`arbvis::Args`] (the byte-only CLI surface) and adds four
-/// tensor-aware flags. Use [`ModelArgs::split`] to peel out the inner
-/// `arbvis::Args` + `arbvis::ModelOpts` for the call into `arbvis::run`.
+/// Flattens [`arbvis::Args`] (the byte-only CLI surface) and adds the
+/// tensor-aware flags. [`crate::register_all`] reads the model-side fields to
+/// build the source providers / set the registry layout mode;
+/// [`ModelArgs::into_arbvis_args`] yields the inner `arbvis::Args` for the call
+/// into `arbvis::run`.
 ///
 /// Named `ModelArgs` rather than `Args` because clap's `#[command(flatten)]`
 /// creates an implicit `ArgGroup` keyed on the inner struct's type name.
@@ -266,41 +273,33 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
-    /// Peel the flattened struct into the two halves `arbvis::run` takes:
-    /// the byte-only `arbvis::Args` and the tensor-aware `ModelOpts`.
-    pub fn split(self) -> (arbvis::Args, ModelOpts) {
-        // The `--probe-*` flags imply `--probe`. The bare `--probe` falls
-        // through to `ProbeSource::Default`.
-        let probe_source = if let Some(text) = self.probe_text {
-            ProbeSource::Text(text)
-        } else if let Some(file) = self.probe_file {
-            ProbeSource::File(file)
-        } else if let Some(url) = self.probe_url {
-            ProbeSource::Url(url)
+    /// The flattened byte-only [`arbvis::Args`] half, for the call into
+    /// `arbvis::run`. The model-side flags are read off the struct separately
+    /// (by [`crate::register_all`]) to construct the source providers and set
+    /// the registry's layout mode.
+    pub fn into_arbvis_args(self) -> arbvis::Args {
+        self.arbvis
+    }
+
+    /// Resolve the `--probe` family into a [`ProbeOpts`]. The `--probe-*`
+    /// overrides imply `--probe`; bare `--probe` uses the bundled default text.
+    pub fn probe_opts(&self) -> ProbeOpts {
+        let source = if let Some(text) = &self.probe_text {
+            ProbeSource::Text(text.clone())
+        } else if let Some(file) = &self.probe_file {
+            ProbeSource::File(file.clone())
+        } else if let Some(url) = &self.probe_url {
+            ProbeSource::Url(url.clone())
         } else {
             ProbeSource::Default
         };
-        // `--probe` plus any source override turns it on; without any of
-        // them `probe.enabled = self.probe` (false unless the bare flag was
-        // explicitly passed).
-        let probe_enabled = self.probe
+        // `--probe` plus any source override turns it on; without any of them
+        // `enabled = self.probe` (false unless the bare flag was passed).
+        let enabled = self.probe
             || matches!(
-                probe_source,
+                source,
                 ProbeSource::Text(_) | ProbeSource::File(_) | ProbeSource::Url(_)
             );
-        let opts = ModelOpts {
-            moe: self.moe,
-            finetune: self.finetune,
-            no_finetune: self.no_finetune,
-            diff_metric: self.diff_metric.into(),
-            summary_stat: self.summary_stat.into(),
-            cka_sample: self.cka_sample,
-            probe: ProbeOpts {
-                enabled: probe_enabled,
-                source: probe_source,
-            },
-            layout_mode: self.layout.into(),
-        };
-        (self.arbvis, opts)
+        ProbeOpts { enabled, source }
     }
 }

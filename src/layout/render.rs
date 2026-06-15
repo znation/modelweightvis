@@ -168,45 +168,6 @@ pub fn diff_element_color(
     pixel_lut[byte as usize]
 }
 
-/// Look up an xorb colour for a byte offset, then blend it 50/50 with the
-/// tensor's dtype hue and modulate by the per-element intensity proxy.
-/// Mirrors `tiled::leaf::render_leaf_tile_xet_dtype_from_buf`.
-#[inline]
-pub fn xet_dtype_element_color(
-    dtype: Dtype,
-    bytes: &[u8],
-    elem_idx: usize,
-    tensor_byte_start: u64,
-    xorb_ranges: &[(u64, u64, u8)],
-    tableau: &[Rgb<u8>; 20],
-) -> Rgb<u8> {
-    let (byte, abs_byte_pos) =
-        element_intensity_and_position(dtype, bytes, elem_idx, tensor_byte_start);
-    let Some((byte, abs_byte_pos)) = byte.zip(Some(abs_byte_pos)) else {
-        return PADDING_RGB;
-    };
-    let d = dtype.to_color();
-    match xorb_color_idx(xorb_ranges, abs_byte_pos) {
-        Some(idx) => {
-            let t = tableau[idx as usize];
-            let s = byte as u32;
-            Rgb([
-                (((d[0] as u32 + t[0] as u32) * s + 255) / 510) as u8,
-                (((d[1] as u32 + t[1] as u32) * s + 255) / 510) as u8,
-                (((d[2] as u32 + t[2] as u32) * s + 255) / 510) as u8,
-            ])
-        }
-        None => {
-            let s = byte as u16;
-            Rgb([
-                ((d[0] as u16 * s + 127) / 255) as u8,
-                ((d[1] as u16 * s + 127) / 255) as u8,
-                ((d[2] as u16 * s + 127) / 255) as u8,
-            ])
-        }
-    }
-}
-
 /// Plain xet colour: byte intensity × xorb tableau hue (no dtype blend).
 /// Mirrors `tiled::leaf::render_leaf_tile_xet_from_buf`.
 #[inline]

@@ -8,101 +8,240 @@
 //!
 //! Wired up by [`crate::register_all`].
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use arbvis::hf_url::RemoteFileSpec;
+use anyhow::Context;
+use arbvis::hf_url;
 use arbvis::{
-    DiffMetric, DirectoryTensorDiffPrep, FinetuneDetect, LayoutShape, MoeScenesPrep,
-    PrepareSourcesExtension, ProbeOpts, RepoDiffPrep, SingleImageArchHook, Source, SummaryStat,
+    DestKind, LayoutShape, PrepareSourcesExtension, RenderHints, SingleImageRenderer, Source,
+    SourceCtx, SourceKind, SourceProvider,
 };
 use async_trait::async_trait;
 
 use crate::data::{
-    build_multi_safetensors_diff_sources, load_meta_for_sources, prepare_diff_sources_from_http,
-    prepare_moe_scenes_sources,
+    build_multi_safetensors_diff_sources, collect_files_recursive, load_meta_for_sources,
+    prepare_diff_sources_from_http, prepare_moe_scenes_sources, MoeNorm,
 };
-use crate::format::SourceFormat;
+use crate::finetune::FinetuneForce;
+use crate::format::{DiffMetric, SourceFormat, SummaryStat};
+use crate::probe::ProbeOpts;
 
-/// `--moe <model>` source preparer. Delegates to [`prepare_moe_scenes_sources`],
-/// which loads the model once and builds two scenes — a per-expert scalar
-/// "summary" (panels carrying `MoeSummaryPanel` tags, read by
-/// [`crate::MoeSummaryLayoutPlugin`]) and an N×N "cka" similarity grid (panels
-/// carrying `MoeCkaPanel` tags, read by [`crate::MoeCkaLayoutPlugin`]) — each
-/// stamped with an `arbvis::SceneTag` so the tiler renders a tab switcher.
+/// `--moe <model>` source provider (priority 400). Loads the model once and
+/// builds two scenes — a per-expert scalar "summary" (panels tagged
+/// `MoeSummaryPanel`, read by [`crate::MoeSummaryLayoutPlugin`]) and an N×N
+/// "cka" similarity grid (panels tagged `MoeCkaPanel`, read by
+/// [`crate::MoeCkaLayoutPlugin`]) — each stamped with an `arbvis::SceneTag` so
+/// the tiler renders a tab switcher.
 ///
-/// Carries the `--moe-norm` mode: arbvis's `MoeScenesPrep::prepare` /
-/// `ModelOpts` predate the option and have no slot for it, so it rides on the
-/// hook (set by [`crate::register_all`]) rather than through arbvis's plumbing.
-pub struct TensorMoeScenesPrep {
-    pub norm: crate::data::MoeNorm,
+/// Carries its lens config (summary stat, normalization, CKA sample, probe) as
+/// fields, set from the CLI flags by [`crate::register_all`]. Registered only
+/// when `--moe` was passed, so [`applicable`](SourceProvider::applicable) can
+/// simply check "no diff, no positional inputs" without shadowing the normal
+/// byte path of a bare invocation.
+pub struct MoeSceneProvider {
+    pub target: PathBuf,
+    pub stat: SummaryStat,
+    pub norm: MoeNorm,
+    pub cka_sample: u32,
+    pub probe: ProbeOpts,
 }
 
 #[async_trait(?Send)]
-impl MoeScenesPrep for TensorMoeScenesPrep {
-    async fn prepare(
-        &self,
-        input: &str,
-        stat: SummaryStat,
-        sample: u32,
-        stream: bool,
-        probe: &ProbeOpts,
-    ) -> anyhow::Result<(Vec<Source>, u64)> {
-        prepare_moe_scenes_sources(input, stat, self.norm, sample, stream, probe).await
+impl SourceProvider for MoeSceneProvider {
+    fn id(&self) -> &'static str {
+        "moe-scenes"
     }
-}
-
-/// Repo-level `--diff hf://... hf://...` preparer. Routes the file
-/// listing through [`prepare_diff_sources_from_http`], which lazily
-/// diffs safetensors shards over HTTP range requests and eagerly byte-
-/// diffs the small non-safetensors siblings (config.json, tokenizer.*).
-pub struct TensorRepoDiffPrep;
-
-#[async_trait(?Send)]
-impl RepoDiffPrep for TensorRepoDiffPrep {
-    async fn prepare(
-        &self,
-        orig_specs: &[(String, RemoteFileSpec)],
-        mod_specs: &[(String, RemoteFileSpec)],
-        is_finetune: bool,
-        metric: DiffMetric,
-        stream: bool,
-    ) -> anyhow::Result<(Vec<Source>, u64)> {
-        prepare_diff_sources_from_http(orig_specs, mod_specs, is_finetune, metric, stream).await
+    fn priority(&self) -> i32 {
+        400
     }
-}
-
-/// Directory `--diff <dir> <dir>` tensor-file preparer. arbvis's
-/// directory walk hands us only the entries this hook's
-/// [`Self::is_tensor_file`] approved; we run them through
-/// [`build_multi_safetensors_diff_sources`] (the multi-shard
-/// safetensors / GGUF diff path) and return the resulting per-tensor
-/// sources.
-pub struct TensorDirectoryDiffPrep;
-
-#[async_trait(?Send)]
-impl DirectoryTensorDiffPrep for TensorDirectoryDiffPrep {
-    fn is_tensor_file(&self, p: &Path) -> bool {
-        SourceFormat::from_path(p).is_some()
+    fn applicable(&self, ctx: &SourceCtx<'_>) -> bool {
+        ctx.diff.is_none() && ctx.inputs.is_empty()
     }
     async fn prepare(
         &self,
-        orig_files: &[PathBuf],
-        mod_files: &[PathBuf],
-        is_finetune: bool,
-        metric: DiffMetric,
-    ) -> anyhow::Result<(Vec<Source>, u64)> {
-        build_multi_safetensors_diff_sources(orig_files, mod_files, is_finetune, metric).await
+        ctx: &SourceCtx<'_>,
+    ) -> anyhow::Result<(Vec<Source>, u64, RenderHints)> {
+        // The MoE viewer is a tabbed, multi-scene render; the tab switcher only
+        // exists in the interactive Leaflet viewer, so a single-PNG / window
+        // destination can't represent it.
+        if ctx.dest_kind != DestKind::Tiles {
+            anyhow::bail!(
+                "--moe renders a tabbed multi-scene viewer and needs a tile destination; \
+                 pass --tiles <DIR> (or --space <OWNER/REPO>)"
+            );
+        }
+        let input = self.target.to_string_lossy().into_owned();
+        let (sources, total) = prepare_moe_scenes_sources(
+            &input,
+            self.stat,
+            self.norm,
+            self.cka_sample,
+            ctx.stream,
+            &self.probe,
+        )
+        .await
+        .with_context(|| format!("--moe {input}"))?;
+        let hints = RenderHints {
+            diff_mode: false,
+            title_suffix: Cow::Borrowed("moe"),
+            show_xet_xorbs: false,
+            inputs: vec![input],
+        };
+        Ok((sources, total, hints))
     }
 }
 
-/// HF model-card finetune auto-detection. Wraps the pure-async lookup
-/// in [`crate::finetune::detect_relation`].
-pub struct HfModelCardFinetuneDetect;
+/// Repo-level `--diff hf://… hf://…` provider (priority 300). Lists both repos
+/// over the HF API and lazily diffs safetensors shards over HTTP range requests
+/// (small non-safetensors siblings are eagerly byte-diffed) via
+/// [`prepare_diff_sources_from_http`]. Resolves the finetune relation itself
+/// (see [`crate::finetune`]).
+pub struct RepoDiffProvider {
+    pub diff_metric: DiffMetric,
+    pub finetune: FinetuneForce,
+}
 
 #[async_trait(?Send)]
-impl FinetuneDetect for HfModelCardFinetuneDetect {
-    async fn detect(&self, orig_url: &str, mod_url: &str) -> Option<bool> {
-        crate::finetune::detect_relation(orig_url, mod_url).await
+impl SourceProvider for RepoDiffProvider {
+    fn id(&self) -> &'static str {
+        "repo-diff"
+    }
+    fn priority(&self) -> i32 {
+        300
+    }
+    fn applicable(&self, ctx: &SourceCtx<'_>) -> bool {
+        ctx.diff.as_ref().is_some_and(|d| {
+            hf_url::is_repo_level(d.original).unwrap_or(false)
+                && hf_url::is_repo_level(d.modified).unwrap_or(false)
+        })
+    }
+    async fn prepare(
+        &self,
+        ctx: &SourceCtx<'_>,
+    ) -> anyhow::Result<(Vec<Source>, u64, RenderHints)> {
+        let d = ctx
+            .diff
+            .as_ref()
+            .expect("repo-diff applies only when --diff is set");
+        let is_finetune = crate::finetune::resolve(self.finetune, d.original, d.modified).await;
+        let (orig_specs, mod_specs) = tokio::try_join!(
+            async {
+                hf_url::list_repo_as_http_specs(d.original)
+                    .await
+                    .with_context(|| format!("listing files in {}", d.original))
+            },
+            async {
+                hf_url::list_repo_as_http_specs(d.modified)
+                    .await
+                    .with_context(|| format!("listing files in {}", d.modified))
+            },
+        )?;
+        let (sources, total) = prepare_diff_sources_from_http(
+            &orig_specs,
+            &mod_specs,
+            is_finetune,
+            self.diff_metric,
+            ctx.stream,
+        )
+        .await?;
+        let hints = RenderHints {
+            diff_mode: true,
+            title_suffix: Cow::Borrowed("diff"),
+            show_xet_xorbs: false,
+            inputs: vec![d.original.to_string(), d.modified.to_string()],
+        };
+        Ok((sources, total, hints))
+    }
+}
+
+/// Local directory `--diff <dir> <dir>` provider (priority 250). Diffs the
+/// tensor files (matched across shards by tensor name) via
+/// [`build_multi_safetensors_diff_sources`], then hands the non-tensor
+/// remainder to arbvis's [`arbvis::byte_directory_diff`] (which renders
+/// crosshatched unmatched / size-mismatched siblings).
+pub struct TensorDiffProvider {
+    pub diff_metric: DiffMetric,
+    pub finetune: FinetuneForce,
+}
+
+#[async_trait(?Send)]
+impl SourceProvider for TensorDiffProvider {
+    fn id(&self) -> &'static str {
+        "tensor-diff"
+    }
+    fn priority(&self) -> i32 {
+        250
+    }
+    fn applicable(&self, ctx: &SourceCtx<'_>) -> bool {
+        ctx.diff
+            .as_ref()
+            .is_some_and(|d| Path::new(d.original).is_dir() && Path::new(d.modified).is_dir())
+    }
+    async fn prepare(
+        &self,
+        ctx: &SourceCtx<'_>,
+    ) -> anyhow::Result<(Vec<Source>, u64, RenderHints)> {
+        let d = ctx
+            .diff
+            .as_ref()
+            .expect("tensor-diff applies only when --diff is set");
+        let orig = Path::new(d.original);
+        let mod_ = Path::new(d.modified);
+        let is_finetune = crate::finetune::resolve(self.finetune, d.original, d.modified).await;
+
+        let is_tensor = |p: &Path| SourceFormat::from_path(p).is_some();
+        let orig_tensor: Vec<PathBuf> = collect_files_recursive(orig)
+            .into_iter()
+            .filter(|p| is_tensor(p))
+            .collect();
+        let mod_tensor: Vec<PathBuf> = collect_files_recursive(mod_)
+            .into_iter()
+            .filter(|p| is_tensor(p))
+            .collect();
+
+        // Tensor files first (their own 0-based `file_idx`), matched across
+        // shards by tensor name.
+        let mut sources = Vec::new();
+        let mut total = 0u64;
+        if !orig_tensor.is_empty() || !mod_tensor.is_empty() {
+            match build_multi_safetensors_diff_sources(
+                &orig_tensor,
+                &mod_tensor,
+                is_finetune,
+                self.diff_metric,
+            )
+            .await
+            {
+                Ok((tensor_sources, bytes)) => {
+                    sources.extend(tensor_sources);
+                    total += bytes;
+                }
+                Err(e) => log::warn!("tensor-aware directory diff failed: {e} — skipping"),
+            }
+        }
+
+        // Non-tensor remainder: byte-diff by relative path, skipping the tensor
+        // files we just handled. Offset their `file_idx` past the tensor block.
+        let (mut byte_sources, byte_total) =
+            arbvis::byte_directory_diff(orig, mod_, is_finetune, &is_tensor)?;
+        let base_idx = sources.len();
+        for s in &mut byte_sources {
+            s.file_idx += base_idx;
+        }
+        sources.extend(byte_sources);
+        total += byte_total;
+
+        if sources.is_empty() {
+            anyhow::bail!("--diff: no matching file pairs found between the two directories");
+        }
+        let hints = RenderHints {
+            diff_mode: true,
+            title_suffix: Cow::Borrowed("diff"),
+            show_xet_xorbs: false,
+            inputs: vec![d.original.to_string(), d.modified.to_string()],
+        };
+        Ok((sources, total, hints))
     }
 }
 
@@ -132,14 +271,33 @@ impl PrepareSourcesExtension for SourceMetaSidecarHook {
     }
 }
 
-/// Single-image arch-layout renderer hook. arbvis's
-/// `single::run_single` invokes this when the chosen layout's id is
-/// `"arch"`. We delegate to the model-side single-image renderer that
-/// lifts the per-tensor color buffers from the `ArchLayout` and paints
-/// them via the dtype-aware element colorizer.
+/// Single-image renderer for the `"arch"` layout. arbvis's
+/// `single::run_single` looks this up by layout id and invokes it when
+/// [`SingleImageRenderer::applicable`] is true. We delegate to the model-side
+/// single-image renderer that lifts the per-tensor color buffers from the
+/// `ArchLayout` and paints them via the dtype-aware element colorizer.
 pub struct ArchSingleImageHook;
 
-impl SingleImageArchHook for ArchSingleImageHook {
+impl SingleImageRenderer for ArchSingleImageHook {
+    fn id(&self) -> &'static str {
+        "arch"
+    }
+
+    fn applicable(&self, sources: &[Source], diff_mode: bool, show_xet_xorbs: bool) -> bool {
+        // The arch single-image renderer is synchronous and only handles local
+        // (mmap'd / owned) data — it can't block a worker on per-pixel HTTP
+        // fetches — and has no diff / xet-xorb drawing path. arbvis falls back
+        // to byte-Hilbert when this returns false.
+        !diff_mode
+            && !show_xet_xorbs
+            && sources.iter().all(|s| {
+                matches!(
+                    s.kind,
+                    SourceKind::File(_) | SourceKind::Buffered(_) | SourceKind::Diff { .. }
+                )
+            })
+    }
+
     fn render(
         &self,
         files: &[PathBuf],

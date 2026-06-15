@@ -8,8 +8,9 @@
 use std::path::Path;
 
 use anyhow::Context;
-use arbvis::ProbeSource;
 use tokenizers::Tokenizer;
+
+use crate::probe::ProbeSource;
 
 /// Embedded default probe corpus — ~300 tokens of varied prose, code,
 /// math, and multilingual text. Diverse on purpose so the router sees

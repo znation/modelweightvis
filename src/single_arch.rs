@@ -1,7 +1,7 @@
 //! Architectural single-image renderer. Lifted from the pre-split
 //! arbvis::single::run_single_arch — the byte-only fork of single.rs
 //! drops the arch branch and delegates to this module via
-//! [`arbvis::SingleImageArchHook`] (registered as
+//! [`arbvis::SingleImageRenderer`] (registered as
 //! [`crate::hooks::ArchSingleImageHook`]).
 //!
 //! The arch single-image is a downsampled overview that fits inside a
@@ -57,7 +57,8 @@ pub fn run_single_arch(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "ArchSingleImageHook invoked with a non-ArchLayout `LayoutShape` \
-             (id={:?}); arbvis should have gated on layout.id() == \"arch\"",
+             (id={:?}); it is registered under the \"arch\" layout id so arbvis \
+             should only dispatch it for an ArchLayout",
                 layout.id()
             )
         })?;

@@ -28,6 +28,28 @@ pub mod mixtral;
 pub mod qwen2_moe;
 pub mod text;
 
+/// `--probe` configuration: whether the routing-faithful forward pass runs,
+/// and where its probe text comes from. Carried as a field on
+/// [`crate::hooks::MoeSceneProvider`]. arbvis is probe-agnostic — this is a
+/// modelweightvis concept.
+#[derive(Clone, Debug, Default)]
+pub struct ProbeOpts {
+    pub enabled: bool,
+    pub source: ProbeSource,
+}
+
+/// Where the probe text comes from. `Default` uses a small bundled snippet
+/// (~300 tokens of varied prose / code / dialogue); the others are the
+/// mutually-exclusive `--probe-text` / `--probe-file` / `--probe-url` overrides.
+#[derive(Clone, Debug, Default)]
+pub enum ProbeSource {
+    #[default]
+    Default,
+    Text(String),
+    File(PathBuf),
+    Url(String),
+}
+
 use crate::layout::model_config::ModelConfig;
 
 /// Architectures the routing-faithful forward supports. New entries get

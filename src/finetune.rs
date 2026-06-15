@@ -1,12 +1,71 @@
 //! HF model-card "is mod a finetune of orig" auto-detection.
 //!
-//! Step 11 of the arbvis/modelweightvis split. The logic is model-specific
-//! (walks `cardData.base_model` / `base_model_relation` fields produced by
-//! the HF transformers training scripts) so it moves to `modelweightvis`
-//! wholesale in step 12. For now it lives in arbvis and depends only on
-//! [`crate::hf_url`]'s generic `fetch_model_card`.
+//! Finetune is a model-card concept arbvis has no notion of, so the diff
+//! providers ([`crate::hooks::RepoDiffProvider`] / [`crate::hooks::TensorDiffProvider`])
+//! resolve it here — honoring a forced `--finetune` / `--no-finetune`, else
+//! auto-detecting via [`detect_relation`] (`cardData.base_model` /
+//! `base_model_relation`, produced by the HF training scripts).
 
 use arbvis::hf_url::{self, RepoKind};
+
+/// The user's `--finetune` / `--no-finetune` choice, before auto-detection.
+#[derive(Clone, Copy, Debug)]
+pub enum FinetuneForce {
+    /// `--finetune`: treat the diff as a finetune unconditionally.
+    On,
+    /// `--no-finetune`: treat the diff as NOT a finetune unconditionally.
+    Off,
+    /// Neither flag: auto-detect from the HF model card, defaulting to off.
+    Auto,
+}
+
+impl FinetuneForce {
+    /// Build from the two mutually-exclusive CLI flags.
+    pub fn from_flags(finetune: bool, no_finetune: bool) -> Self {
+        if finetune {
+            Self::On
+        } else if no_finetune {
+            Self::Off
+        } else {
+            Self::Auto
+        }
+    }
+}
+
+/// Resolve whether a `--diff` is a finetune: honor a forced choice, else
+/// auto-detect via the HF model card (defaulting to off). Logs the decision.
+pub async fn resolve(force: FinetuneForce, orig_url: &str, mod_url: &str) -> bool {
+    match force {
+        FinetuneForce::On => {
+            log::info!("--diff finetune mode: forced on by --finetune");
+            true
+        }
+        FinetuneForce::Off => {
+            log::info!("--diff finetune mode: forced off by --no-finetune");
+            false
+        }
+        FinetuneForce::Auto => match detect_relation(orig_url, mod_url).await {
+            Some(true) => {
+                log::info!(
+                    "--diff finetune mode: auto-detected ON ({mod_url} declares {orig_url} as its base in its HF model card)"
+                );
+                true
+            }
+            Some(false) => {
+                log::info!(
+                    "--diff finetune mode: auto-detected OFF ({mod_url} does not declare {orig_url} as a finetune base)"
+                );
+                false
+            }
+            None => {
+                log::info!(
+                    "--diff finetune mode: auto-detect skipped (not both hf:// model URLs, or API lookup failed); defaulting to OFF — pass --finetune to override"
+                );
+                false
+            }
+        },
+    }
+}
 
 /// Auto-detect whether `mod_url` is a HuggingFace-declared finetune of
 /// `orig_url`, by reading the modified-side model card metadata via the HF

@@ -52,7 +52,7 @@ fn setup_progress(label: &str, total: u64) -> Option<ProgressBar> {
 }
 
 /// Recursively collect all files under `root`, sorted.
-fn collect_files_recursive(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn collect_files_recursive(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_recursive(root, &mut files);
     files.sort();
@@ -1849,7 +1849,7 @@ pub async fn prepare_moe_scenes_sources(
     norm: MoeNorm,
     sample: u32,
     stream: bool,
-    probe: &arbvis::ProbeOpts,
+    probe: &crate::probe::ProbeOpts,
 ) -> anyhow::Result<(Vec<Source>, u64)> {
     let loaded = open_moe_model_sources(input, stream).await?;
 
@@ -2282,7 +2282,7 @@ async fn build_moe_summary_sources(
 /// Errors on any other failure (bad input, missing shards, forward panic).
 async fn run_probe_capture(
     input: &str,
-    probe: &arbvis::ProbeOpts,
+    probe: &crate::probe::ProbeOpts,
 ) -> anyhow::Result<Option<crate::probe::RoutingCapture>> {
     // Currently only local-directory inputs are supported for the probe:
     // we need tokenizer.json + per-shard paths to hand to candle's
