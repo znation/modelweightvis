@@ -34,14 +34,89 @@ pub struct GgufHeader {
     pub metadata: HashMap<String, Value>,
 }
 
+/// Canonical name for a raw GGML tensor dtype code that candle-core's
+/// `GgmlDType::from_u32` rejects.
+///
+/// candle implements only F32/F16/BF16 and the Q-series / K-series quants
+/// (even on `main`); every other code — the whole IQ ("imatrix") family,
+/// the integer types, F64, ternary, MXFP4 — bails out of `Content::read`.
+/// We map the rejected codes to names purely so the *warning* can say what
+/// the file actually uses; we still can't decode them. Codes candle *does*
+/// support are intentionally absent (we only ever look up rejected ones).
+/// Values per ggml's `enum ggml_type`.
+fn unsupported_ggml_dtype_name(code: u32) -> Option<&'static str> {
+    Some(match code {
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        19 => "IQ1_S",
+        20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
+        23 => "IQ4_XS",
+        24 => "I8",
+        25 => "I16",
+        26 => "I32",
+        27 => "I64",
+        28 => "F64",
+        29 => "IQ1_M",
+        34 => "TQ1_0",
+        35 => "TQ2_0",
+        39 => "MXFP4",
+        _ => return None,
+    })
+}
+
+/// If `candle_msg` is candle's "unknown dtype for tensor {code}" error,
+/// produce a clearer replacement message.
+///
+/// candle's wording is misleading twice over: the trailing number is the raw
+/// GGML *dtype code*, not a tensor index, and "unknown" reads like a corrupt
+/// file when it really means "candle doesn't implement this quant". candle
+/// also appends a backtrace to the Display string, so we scan for the marker
+/// and take only the leading digits after it. Returns `None` for any other
+/// error (e.g. the EOF "failed to fill whole buffer") so the caller keeps the
+/// original.
+fn rewrite_unknown_dtype_message(candle_msg: &str) -> Option<String> {
+    const MARK: &str = "unknown dtype for tensor ";
+    let pos = candle_msg.find(MARK)?;
+    let code: u32 = candle_msg[pos + MARK.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    // No "falls back to plain binary" clause here: arbvis's generic
+    // plugin-failure handler already appends "— treating as plain binary", so
+    // we only state the cause and let that suffix complete the sentence.
+    Some(match unsupported_ggml_dtype_name(code) {
+        Some(name) => {
+            format!("gguf: tensor uses GGML dtype {name} (code {code}), which candle cannot decode")
+        }
+        None => format!(
+            "gguf: tensor uses unsupported GGML dtype code {code}, which candle cannot decode"
+        ),
+    })
+}
+
+/// Translate candle-core's GGUF parse error into something actionable, then
+/// wrap it as an `anyhow::Error`. The IQ-family case (see
+/// [`rewrite_unknown_dtype_message`]) gets a precise message; everything else
+/// keeps candle's original text.
+fn explain_gguf_error(e: candle_core::Error) -> anyhow::Error {
+    match rewrite_unknown_dtype_message(&e.to_string()) {
+        Some(m) => anyhow::anyhow!(m),
+        None => anyhow::anyhow!("gguf: header parse failed: {}", e),
+    }
+}
+
 /// Parse a GGUF file header from raw bytes. The bytes must cover the magic,
 /// the KV table, and the tensor info table — at minimum
 /// `tensor_data_offset` bytes. `Content::read` errors if the prefix is too
 /// short; callers should catch that and retry with a larger fetch.
 pub fn parse_header(data: &[u8]) -> anyhow::Result<GgufHeader> {
     let mut reader = Cursor::new(data);
-    let content = Content::read(&mut reader)
-        .map_err(|e| anyhow::anyhow!("gguf: header parse failed: {}", e))?;
+    let content = Content::read(&mut reader).map_err(explain_gguf_error)?;
 
     let mut tensors = Vec::with_capacity(content.tensor_infos.len());
     for (name, info) in &content.tensor_infos {
@@ -181,6 +256,32 @@ mod tests {
         // where we padded to; both will be at the same 32-byte boundary).
         assert!(header.tensor_data_offset > 0);
         assert!(header.tensor_data_offset.is_multiple_of(32));
+    }
+
+    #[test]
+    fn rewrites_iq_dtype_error_with_quant_name() {
+        // candle's Display prints the bail! message then a backtrace; we pull
+        // the dtype code out of the leading line and name the quant. Code 16
+        // is IQ2_XXS — exactly the Unsloth UD-IQ2_XXS case.
+        let msg = "unknown dtype for tensor 16\n   1: candle_core::error::Error::bt";
+        let out = rewrite_unknown_dtype_message(msg).expect("rewrites");
+        assert!(out.contains("IQ2_XXS"), "got {out}");
+        assert!(out.contains("code 16"), "got {out}");
+        assert!(out.contains("cannot decode"), "got {out}");
+    }
+
+    #[test]
+    fn rewrites_unmapped_dtype_code_without_a_name() {
+        let out = rewrite_unknown_dtype_message("unknown dtype for tensor 250").expect("rewrites");
+        assert!(out.contains("250"), "got {out}");
+        assert!(!out.contains("IQ"), "got {out}");
+    }
+
+    #[test]
+    fn leaves_non_dtype_errors_untouched() {
+        // The EOF case (prefix too short) must NOT be rewritten — the data
+        // layer relies on it to trigger a larger fetch.
+        assert!(rewrite_unknown_dtype_message("failed to fill whole buffer").is_none());
     }
 
     #[test]

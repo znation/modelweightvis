@@ -33,11 +33,16 @@ const SETUP_FETCH_CONCURRENCY: usize = 16;
 /// per-call descriptor download (~50–65 MB before dedup) is heavy.
 const RMS_SAMPLE_FETCH_CONCURRENCY: usize = 4;
 
-/// Initial header-fetch size for GGUF. Most files fit in 1 MiB; if
-/// `Content::read` errors with "unexpected EOF" we retry with the larger
-/// size below.
+/// Header-fetch sizing for remote GGUF. The header has no up-front length
+/// prefix (unlike safetensors), so [`fetch_gguf_header`] fetches an initial
+/// prefix and doubles it until the parse stops hitting EOF. Most files fit in
+/// 1 MiB, but a large-vocab tokenizer's `tokenizer.ggml.{merges,tokens}`
+/// arrays live in the KV table and can push the header past 8 MiB (Devstral's
+/// Tekken `merges` array alone is ~5 MiB), so we grow up to a generous ceiling
+/// before giving up and treating the file as plain binary. Local files skip
+/// all this and mmap the whole file — see [`parse_gguf_header_local`].
 const GGUF_HEADER_FETCH_INITIAL: usize = 1024 * 1024;
-const GGUF_HEADER_FETCH_LARGE: usize = 8 * 1024 * 1024;
+const GGUF_HEADER_FETCH_MAX: usize = 64 * 1024 * 1024;
 
 /// Build a one-shot indicatif progress bar attached to a fresh
 /// `MultiProgress` (modelweightvis-local — the moved-from helpers all
@@ -348,6 +353,43 @@ pub struct MoeCkaProbePanel {
 }
 
 // === extracted from arbvis::data (load_model_info,fetch_model_header) ===
+/// Parse a local GGUF file's header by mmapping the whole file.
+///
+/// The GGUF header has no up-front length prefix, so we can't size a read
+/// buffer ahead of time — and a fixed cap is fragile (large-vocab tokenizers
+/// push the KV table past any guess). candle's `Content::read` stops at the
+/// tensor-info table and never touches tensor data, so the mmap only faults in
+/// the ~header pages, not the multi-GB body. Robust for any header size.
+fn parse_gguf_header_local(path: &Path) -> anyhow::Result<format::gguf::GgufHeader> {
+    let f = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&f) }?;
+    format::gguf::parse_header(&mmap)
+}
+
+/// Fetch and parse a remote GGUF header, growing the prefix until the parse
+/// stops hitting EOF.
+///
+/// The header has no up-front length and large-vocab tokenizers can push it
+/// past 8 MiB, so we double the fetch from [`GGUF_HEADER_FETCH_INITIAL`] up to
+/// [`GGUF_HEADER_FETCH_MAX`] rather than relying on a single fixed cap. A short
+/// fetch means we've already read the whole file, so a bigger request can't add
+/// bytes — the file is genuinely not parseable as GGUF and we surface the error.
+async fn fetch_gguf_header(data: &Data) -> anyhow::Result<format::gguf::GgufHeader> {
+    let mut want = GGUF_HEADER_FETCH_INITIAL;
+    loop {
+        let buf = data.fetch_range(0, want).await?;
+        match format::gguf::parse_header(&buf) {
+            Ok(h) => return Ok(h),
+            Err(e) => {
+                if buf.len() < want || want >= GGUF_HEADER_FETCH_MAX {
+                    return Err(e);
+                }
+                want = (want * 2).min(GGUF_HEADER_FETCH_MAX);
+            }
+        }
+    }
+}
+
 /// Read just the header of a recognised model file and return parsed
 /// metadata. Dispatches on `format`.
 pub fn load_model_info(
@@ -379,21 +421,11 @@ pub fn load_model_info(
             })
         }
         SourceFormat::Gguf => {
-            // For GGUF the header size isn't known up-front. Read a 1 MiB
-            // prefix first; if parsing fails on EOF, retry with 8 MiB.
-            let mut buf = vec![0u8; GGUF_HEADER_FETCH_INITIAL.min(file_size as usize)];
-            let mut f = File::open(path)?;
-            f.read_exact(&mut buf)?;
-            let header = match format::gguf::parse_header(&buf) {
-                Ok(h) => h,
-                Err(_) if file_size as usize > buf.len() => {
-                    let mut bigger = vec![0u8; GGUF_HEADER_FETCH_LARGE.min(file_size as usize)];
-                    let mut f = File::open(path)?;
-                    f.read_exact(&mut bigger)?;
-                    format::gguf::parse_header(&bigger)?
-                }
-                Err(e) => return Err(e),
-            };
+            // The GGUF header size isn't known up-front and can exceed any
+            // fixed prefix cap, so mmap the whole file and let the parser read
+            // exactly as far as the tensor-info table (see
+            // `parse_gguf_header_local`).
+            let header = parse_gguf_header_local(path)?;
             let color_ranges = format::gguf::build_color_ranges(
                 &header.tensors,
                 header.tensor_data_offset,
@@ -473,14 +505,7 @@ async fn fetch_model_header(
             format::safetensors::parse_header(&header_bytes)
         }
         SourceFormat::Gguf => {
-            let buf = data.fetch_range(0, GGUF_HEADER_FETCH_INITIAL).await?;
-            let header = match format::gguf::parse_header(&buf) {
-                Ok(h) => h,
-                Err(_) => {
-                    let bigger = data.fetch_range(0, GGUF_HEADER_FETCH_LARGE).await?;
-                    format::gguf::parse_header(&bigger)?
-                }
-            };
+            let header = fetch_gguf_header(data).await?;
             Ok((header.tensors, header.tensor_data_offset))
         }
         SourceFormat::Pickle => {
@@ -2977,22 +3002,14 @@ pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
     match &source.kind {
         SourceKind::File(p) => {
             // For local GGUF files, the equivalent of `config.json` is
-            // embedded in the binary header. Re-parse the prefix to extract
-            // it; this is cheap (~1 MiB read at setup time only).
+            // embedded in the binary header. Re-parse it (mmap-backed, so only
+            // the header pages fault in) to extract the architecture KV pairs.
             if matches!(SourceFormat::from_path(p), Some(SourceFormat::Gguf)) {
-                if let Ok(meta_size) = std::fs::metadata(p).map(|m| m.len()) {
-                    let want = GGUF_HEADER_FETCH_INITIAL.min(meta_size as usize);
-                    if let Ok(mut f) = File::open(p) {
-                        let mut buf = vec![0u8; want];
-                        if f.read_exact(&mut buf).is_ok() {
-                            if let Ok(h) = format::gguf::parse_header(&buf) {
-                                return SourceMeta {
-                                    config: Some(ModelConfig::from_gguf_metadata(&h.metadata)),
-                                    index: None,
-                                };
-                            }
-                        }
-                    }
+                if let Ok(h) = parse_gguf_header_local(p) {
+                    return SourceMeta {
+                        config: Some(ModelConfig::from_gguf_metadata(&h.metadata)),
+                        index: None,
+                    };
                 }
             }
             if let Some(dir) = p.parent() {
@@ -3018,13 +3035,11 @@ pub async fn try_load_source_meta(source: &Source) -> SourceMeta {
                     filename: Arc::clone(&spec.filename),
                     revision: Arc::clone(&spec.revision),
                 };
-                if let Ok(buf) = data.fetch_range(0, GGUF_HEADER_FETCH_INITIAL).await {
-                    if let Ok(h) = format::gguf::parse_header(&buf) {
-                        return SourceMeta {
-                            config: Some(ModelConfig::from_gguf_metadata(&h.metadata)),
-                            index: None,
-                        };
-                    }
+                if let Ok(h) = fetch_gguf_header(&data).await {
+                    return SourceMeta {
+                        config: Some(ModelConfig::from_gguf_metadata(&h.metadata)),
+                        index: None,
+                    };
                 }
                 return SourceMeta::default();
             }
