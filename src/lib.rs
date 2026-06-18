@@ -110,6 +110,9 @@ pub fn register_all(registry: &mut Registry, args: &ModelArgs) {
 
     // --- Wired from the parsed CLI flags ---
     registry.layout_mode = args.layout.into();
+    // `--strict-layout`: turn a forced-layout fallback into a hard error
+    // (honored by both `select_layout` and `select_volume_shape`).
+    registry.strict_layout = args.strict_layout;
     let diff_metric: DiffMetric = args.diff_metric.into();
     let finetune = FinetuneForce::from_flags(args.finetune, args.no_finetune);
 

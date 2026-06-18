@@ -271,6 +271,14 @@ pub struct ModelArgs {
     /// pre-architectural output for regression checks.
     #[arg(long, value_enum, default_value_t = LayoutArg::Auto)]
     pub layout: LayoutArg,
+
+    /// Fail instead of silently falling back when a forced `--layout` can't be
+    /// built for the inputs — e.g. `--layout arch` on a non-safetensors input,
+    /// where the default would quietly render a byte-Hilbert layout. No effect
+    /// under `--layout auto` (which has nothing to fall back from). Applies to
+    /// both the 2D tile render and the `--3d` volume.
+    #[arg(long)]
+    pub strict_layout: bool,
 }
 
 impl ModelArgs {
