@@ -40,8 +40,8 @@ pub use data::MoeNorm;
 pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
 pub use hooks::{MoeSceneProvider, RepoDiffProvider, SourceMetaSidecarHook, TensorDiffProvider};
-pub use layout::{ArchLayoutPlugin, MoeCkaLayoutPlugin, MoeSummaryLayoutPlugin};
-pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
+pub use layout::{ArchLayoutPlugin, ArchVolumePlugin, MoeCkaLayoutPlugin, MoeSummaryLayoutPlugin};
+pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer, ArchVoxelRenderer};
 
 use std::sync::Arc;
 
@@ -83,6 +83,16 @@ pub fn register_all(registry: &mut Registry, args: &ModelArgs) {
     registry
         .leaf
         .register_renderer(Arc::new(ArchRegionsRenderer));
+
+    // 3D (`--3d`) counterparts: a structure-aware volume layout (transformer
+    // blocks stacked along Z) and the matching voxel renderer that bakes
+    // per-tensor magnitude into the cube. Both keyed on the same `"arch"` id;
+    // `select_volume_shape` picks the plugin over arbvis's byte-Hilbert floor
+    // when `--layout` isn't `hilbert`.
+    registry.volume_shapes.push(Arc::new(ArchVolumePlugin));
+    registry
+        .voxel
+        .register_renderer(Arc::new(ArchVoxelRenderer));
 
     // Cross-source sidecar enrichment. Runs once per render after every source
     // is built. Fetches `config.json` / `model.safetensors.index.json` next to

@@ -3,10 +3,13 @@
 //! and the matching `LayoutPlugin` impls.
 
 pub mod arch;
+pub mod arch_volume;
 pub mod bin_pack;
 pub mod model_config;
 pub mod name_tree;
 pub mod render;
+
+pub use arch_volume::ArchVolumePlugin;
 
 use std::any::Any;
 

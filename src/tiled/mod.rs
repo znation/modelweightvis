@@ -2,7 +2,10 @@
 //! `leaf_arch` submodule (per-tile tensor-region loader + dtype-aware
 //! renderers).
 
+pub mod arch_voxel;
 pub mod leaf_arch;
+
+pub use arch_voxel::ArchVoxelRenderer;
 
 use futures::future::BoxFuture;
 
