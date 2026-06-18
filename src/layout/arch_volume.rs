@@ -24,7 +24,8 @@
 use std::any::Any;
 
 use arbvis::{
-    LayoutBuildCtx, LayoutMode, Source, VolumeEntity, VolumeShape, VolumeShapePlugin, VoxelBox,
+    LayoutBuildCtx, LayoutMode, Source, VolumeEntity, VolumeLabel, VolumeShape, VolumeShapePlugin,
+    VoxelBox,
 };
 
 use crate::data::SourceMeta;
@@ -42,6 +43,9 @@ struct EntityDesc {
     byte_len: u64,
     bbox: VoxelBox,
     extra: ArchVoxelExtra,
+    /// Display name + coarse group for the viewer's click-to-pick manifest.
+    name: String,
+    group: String,
 }
 
 /// A structure-aware 3D volume layout (the `"arch"` [`VolumeShape`]).
@@ -75,6 +79,16 @@ impl VolumeShape for ArchVolume {
     }
     fn focus(&self) -> Option<([f32; 3], f32)> {
         Some(self.focus)
+    }
+    fn manifest(&self) -> Vec<VolumeLabel> {
+        self.descs
+            .iter()
+            .map(|d| VolumeLabel {
+                name: d.name.clone(),
+                group: d.group.clone(),
+                bbox: d.bbox,
+            })
+            .collect()
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -192,6 +206,10 @@ impl ArchVolume {
                 continue;
             }
 
+            let group = match t.layer_idx {
+                Some(l) => format!("layer {l}"),
+                None => "top-level".to_string(),
+            };
             descs.push(EntityDesc {
                 source_idx: t.source_idx,
                 byte_start: local_start,
@@ -209,6 +227,8 @@ impl ArchVolume {
                     rows: t.tensor_rows,
                     cols: t.tensor_cols,
                 },
+                name: t.name.clone(),
+                group,
             });
         }
 
