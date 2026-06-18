@@ -11,8 +11,8 @@
 //! - `finetune` — HF model-card finetune auto-detection.
 //! - Plugin impls (`ArchLayoutPlugin`, `MoeSummaryLayoutPlugin`,
 //!   `MoeCkaLayoutPlugin`, `TensorDiffBuilder`, `ArchRegionsLoader`,
-//!   `ArchRegionsRenderer`, the `FormatPlugin` family, the `"arch"`
-//!   `SingleImageRenderer`, the `SourceMetaSidecarHook`, and the
+//!   `ArchRegionsRenderer`, the `FormatPlugin` family, the
+//!   `SourceMetaSidecarHook`, and the
 //!   `MoeSceneProvider`/`RepoDiffProvider`/`TensorDiffProvider` source
 //!   providers) are registered on a registry via [`register_all`].
 //!
@@ -33,17 +33,13 @@ mod format_plugin;
 mod hooks;
 mod layout;
 mod probe;
-mod single_arch;
 mod tiled;
 
 pub use args::{DiffMetricArg, LayoutArg, ModelArgs, MoeNormArg};
 pub use data::MoeNorm;
 pub use diff::TensorDiffBuilder;
 pub use format_plugin::{GgufFormatPlugin, PickleFormatPlugin, SafetensorsFormatPlugin};
-pub use hooks::{
-    ArchSingleImageHook, MoeSceneProvider, RepoDiffProvider, SourceMetaSidecarHook,
-    TensorDiffProvider,
-};
+pub use hooks::{MoeSceneProvider, RepoDiffProvider, SourceMetaSidecarHook, TensorDiffProvider};
 pub use layout::{ArchLayoutPlugin, MoeCkaLayoutPlugin, MoeSummaryLayoutPlugin};
 pub use tiled::{ArchRegionsLoader, ArchRegionsRenderer};
 
@@ -58,12 +54,12 @@ use crate::format::DiffMetric;
 /// flags (`args`) into it.
 ///
 /// Populates the Vec slots (`formats`, `layouts`, `diffs`, `providers`), the
-/// id-keyed maps (`leaf`'s loader+renderer pair and the `"arch"`
-/// `single_renderers` entry), the `prepare_sources_extension` hook, the
-/// `layout_mode`, and the viewer branding. After this returns, `arbvis::run`
-/// handles every CLI shape the model-aware crate supports: `--moe`, repo-level
-/// `--diff`, directory-safetensors `--diff`, file-pair tensor `--diff`,
-/// single-image arch, and FormatPlugin-driven `ModelInfo` population.
+/// id-keyed maps (`leaf`'s loader+renderer pair for the `"arch"` layout), the
+/// `prepare_sources_extension` hook, the `layout_mode`, and the viewer
+/// branding. After this returns, `arbvis::run` handles every CLI shape the
+/// model-aware crate supports: `--moe`, repo-level `--diff`,
+/// directory-safetensors `--diff`, file-pair tensor `--diff`, and
+/// FormatPlugin-driven `ModelInfo` population.
 pub fn register_all(registry: &mut Registry, args: &ModelArgs) {
     // --- Static plugins (independent of the parsed flags) ---
 
@@ -82,13 +78,11 @@ pub fn register_all(registry: &mut Registry, args: &ModelArgs) {
     registry.layouts.push(Arc::new(MoeSummaryLayoutPlugin));
     registry.layouts.push(Arc::new(MoeCkaLayoutPlugin));
 
-    // Tile loader+renderer pair, and single-image renderer, for the `"arch"`
-    // layout id.
+    // Tile loader+renderer pair for the `"arch"` layout id.
     registry.leaf.register_loader(Arc::new(ArchRegionsLoader));
     registry
         .leaf
         .register_renderer(Arc::new(ArchRegionsRenderer));
-    registry.register_single_renderer(Arc::new(ArchSingleImageHook));
 
     // Cross-source sidecar enrichment. Runs once per render after every source
     // is built. Fetches `config.json` / `model.safetensors.index.json` next to

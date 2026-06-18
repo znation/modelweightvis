@@ -167,8 +167,9 @@ pub struct ModelArgs {
     ///   reveal redundant expert clusters. Uses Gaussian random projection on
     ///   the input axis (see `--cka-sample`).
     ///
-    /// `--probe` adds a behavioral panel to each scene. Requires a tile
-    /// destination (`--tiles` / `--space`) — the tab switcher is viewer-only.
+    /// `--probe` adds a behavioral panel to each scene. Renders the 2D tabbed
+    /// viewer (`--out` / `--space`); incompatible with `--3d`, whose volume
+    /// bundle has no tab switcher.
     #[arg(
         long,
         value_name = "MODEL",

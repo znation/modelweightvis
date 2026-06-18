@@ -13,10 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use arbvis::hf_url;
-use arbvis::{
-    DestKind, LayoutShape, PrepareSourcesExtension, RenderHints, SingleImageRenderer, Source,
-    SourceCtx, SourceKind, SourceProvider,
-};
+use arbvis::{PrepareSourcesExtension, RenderHints, Source, SourceCtx, SourceProvider};
 use async_trait::async_trait;
 
 use crate::data::{
@@ -63,12 +60,13 @@ impl SourceProvider for MoeSceneProvider {
         ctx: &SourceCtx<'_>,
     ) -> anyhow::Result<(Vec<Source>, u64, RenderHints)> {
         // The MoE viewer is a tabbed, multi-scene render; the tab switcher only
-        // exists in the interactive Leaflet viewer, so a single-PNG / window
-        // destination can't represent it.
-        if ctx.dest_kind != DestKind::Tiles {
+        // exists in the interactive 2D Leaflet viewer. The `--3d` volume bundle
+        // lays every byte along one Hilbert curve with no notion of scenes, so
+        // it can't represent the summary / CKA lenses.
+        if ctx.three_d {
             anyhow::bail!(
-                "--moe renders a tabbed multi-scene viewer and needs a tile destination; \
-                 pass --tiles <DIR> (or --space <OWNER/REPO>)"
+                "--moe renders a tabbed multi-scene 2D viewer and is incompatible with --3d; \
+                 drop --3d to render the MoE scenes"
             );
         }
         let input = self.target.to_string_lossy().into_owned();
@@ -268,43 +266,5 @@ impl PrepareSourcesExtension for SourceMetaSidecarHook {
             s.extensions.insert(m);
         }
         Ok(())
-    }
-}
-
-/// Single-image renderer for the `"arch"` layout. arbvis's
-/// `single::run_single` looks this up by layout id and invokes it when
-/// [`SingleImageRenderer::applicable`] is true. We delegate to the model-side
-/// single-image renderer that lifts the per-tensor color buffers from the
-/// `ArchLayout` and paints them via the dtype-aware element colorizer.
-pub struct ArchSingleImageHook;
-
-impl SingleImageRenderer for ArchSingleImageHook {
-    fn id(&self) -> &'static str {
-        "arch"
-    }
-
-    fn applicable(&self, sources: &[Source], diff_mode: bool, show_xet_xorbs: bool) -> bool {
-        // The arch single-image renderer is synchronous and only handles local
-        // (mmap'd / owned) data — it can't block a worker on per-pixel HTTP
-        // fetches — and has no diff / xet-xorb drawing path. arbvis falls back
-        // to byte-Hilbert when this returns false.
-        !diff_mode
-            && !show_xet_xorbs
-            && sources.iter().all(|s| {
-                matches!(
-                    s.kind,
-                    SourceKind::File(_) | SourceKind::Buffered(_) | SourceKind::Diff { .. }
-                )
-            })
-    }
-
-    fn render(
-        &self,
-        files: &[PathBuf],
-        output: Option<PathBuf>,
-        sources: &[Source],
-        layout: &dyn LayoutShape,
-    ) -> anyhow::Result<()> {
-        crate::single_arch::run_single_arch(files, output, sources, layout)
     }
 }

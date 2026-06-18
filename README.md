@@ -2,12 +2,12 @@
 
 Tensor-format-aware visualization for ML model weights, built on [arbvis](https://github.com/znation/arbvis). Renders `.safetensors` / `.gguf` / PyTorch `.bin` / `.pth` / `.pt` checkpoints at each tensor's natural element shape — 1 px = 1 element — and stacks transformer blocks vertically so corresponding sub-tensors (`q_proj`, `gate_proj`, etc.) line up across every layer. Block-to-block changes — quantization steps, finetune deltas, dead heads — appear as horizontal bands.
 
-**For non-tensor files** (binaries, JSON, anything else), use [**arbvis**](https://github.com/znation/arbvis) directly. modelweightvis is a thin crate that adds tensor awareness on top of arbvis: it registers `FormatPlugin` / `LayoutPlugin` / `DiffSourceBuilder` impls and CLI dispatch hooks against arbvis's registry, then hands the actual rendering, Hub I/O, tile pyramid, and Space deploy off to arbvis. The `modelweightvis` binary inherits arbvis's full CLI surface — `--tiles`, `--space`, `--stream`, `--show-xet-xorbs`, etc. — so you don't need to use both. See [Relationship to arbvis](#relationship-to-arbvis) below for the architectural picture.
+**For non-tensor files** (binaries, JSON, anything else), use [**arbvis**](https://github.com/znation/arbvis) directly. modelweightvis is a thin crate that adds tensor awareness on top of arbvis: it registers `FormatPlugin` / `LayoutPlugin` / `DiffSourceBuilder` impls and CLI dispatch hooks against arbvis's registry, then hands the actual rendering, Hub I/O, tile pyramid, and Space deploy off to arbvis. The `modelweightvis` binary inherits arbvis's full CLI surface — `--out`, `--space`, `--3d`, `--stream`, `--show-xet-xorbs`, etc. — so you don't need to use both. See [Relationship to arbvis](#relationship-to-arbvis) below for the architectural picture.
 
 ## Quick start
 
 ```sh
-modelweightvis hf://meta-llama/Llama-3.2-1B --tiles ./out
+modelweightvis hf://meta-llama/Llama-3.2-1B --out ./out
 # then open out/index.html in a browser
 ```
 
@@ -44,7 +44,7 @@ This applies in both the normal arch render and the `--show-xet-xorbs` xet-color
 ## Comparing two models: `--diff`
 
 ```sh
-modelweightvis --diff hf://meta-llama/Llama-3.2-1B hf://meta-llama/Llama-3.2-1B-Instruct --tiles ./out
+modelweightvis --diff hf://meta-llama/Llama-3.2-1B hf://meta-llama/Llama-3.2-1B-Instruct --out ./out
 ```
 
 Per-tensor element-wise diff between two checkpoints (local files, directories, or `hf://` URLs). Each pixel encodes a signed delta: **black** for identical, **green** for values that grew, **red** for values that shrank, **white** for non-finite results.
@@ -64,11 +64,11 @@ Non-tensor files in a `--diff` between repos or directories (READMEs, tokenizer 
 ## MoE viewer: `--moe`
 
 ```sh
-modelweightvis --moe hf://Qwen/Qwen1.5-MoE-A2.7B --tiles ./out
+modelweightvis --moe hf://Qwen/Qwen1.5-MoE-A2.7B --out ./out
 # then open out/index.html — toggle the Summary / CKA tabs (top-right)
 ```
 
-`--moe` loads the model **once** and renders two complementary lenses as separate, tab-switchable scenes in the viewer (the tab switcher is the Leaflet base-layer control top-right). It needs a tile destination — `--tiles` (or `--space`); a single-PNG / window output can't host the tabs.
+`--moe` loads the model **once** and renders two complementary lenses as separate, tab-switchable scenes in the viewer (the tab switcher is the Leaflet base-layer control top-right). It renders the 2D tabbed viewer (`--out` or `--space`); it's incompatible with `--3d`, whose volume bundle can't host the tabs.
 
 ### Summary scene
 
@@ -88,7 +88,7 @@ One `n_experts × n_experts` linear-CKA similarity heatmap per `(layer, weight)`
 ### Routing probe: `--probe`
 
 ```sh
-modelweightvis --moe /path/to/Qwen1.5-MoE --probe --tiles ./out
+modelweightvis --moe /path/to/Qwen1.5-MoE --probe --out ./out
 ```
 
 Adds one behavioral panel to **each** scene from a routing-faithful forward pass over a probe input — the one signal that reflects which experts the router actually fires on real tokens, not just static weights:
@@ -102,12 +102,12 @@ Override the bundled probe text with `--probe-text "…"`, `--probe-file <path>`
 
 modelweightvis inherits arbvis's full CLI surface. The output destinations, Hub I/O, and viewer-side flags work the same on tensor-aware renders:
 
-- `--tiles DIR` — zoomable Leaflet tile pyramid (recommended).
-- `--output FILE` — single PNG (capped at 4096×4096; for full resolution use `--tiles`).
-- `--space OWNER/REPO` — deploy a Docker Space serving the Leaflet viewer.
+- `--out DIR` — write the viewer bundle here: a zoomable Leaflet tile pyramid (2D), or the Three.js volume bundle under `--3d`. Accepts a local dir or an `hf://` URL.
+- `--3d` (with `--grid N`) — render bytes along a 3D Hilbert curve into a cube and emit a Three.js volume + point-cloud viewer instead of the 2D pyramid.
+- `--space OWNER/REPO` — deploy a Docker Space serving the viewer (works for both 2D and `--3d`).
 - `--stream` — keep `hf://` inputs remote and push tiles to the Hub as they're produced.
 - `--show-xet-xorbs` — color regions by xorb ID for xet-backed inputs (hue per xorb).
-- `--tile-format avif|png`, `--regen-html DIR`, `--title TEXT`, `-l/--file-list FILE`, and `hf://` output for both `--output` and `--tiles`.
+- `--tile-format avif|png`, `--regen-html DIR`, `--title TEXT`, `-l/--file-list FILE`.
 
 See the [arbvis README](https://github.com/znation/arbvis#readme) for the full reference on all of these.
 
@@ -122,7 +122,7 @@ modelweightvis extends arbvis through its plugin / hook surface — no fork, no 
 - `LeafLoader` + `LeafRenderer` pair (`ArchRegionsLoader`, `ArchRegionsRenderer`) drive per-tensor tile rendering at element granularity.
 - `DiffSourceBuilder` (`TensorDiffBuilder`) handles tensor-aware file-pair `--diff` at priority above arbvis's JSON / plain-byte fallbacks.
 - `SourceProvider` impls (`MoeSceneProvider`, `RepoDiffProvider`, `TensorDiffProvider`) turn an invocation into render sources — `--moe`, a repo-level `hf://` `--diff`, and a directory `--diff` — each registered above arbvis's byte-diff / normal-bytes built-ins. Finetune detection (HF model card) is resolved inside the diff providers.
-- `SingleImageRenderer` (`ArchSingleImageHook`, keyed to the `"arch"` layout id) draws the single-image arch render, and `PrepareSourcesExtension` (`SourceMetaSidecarHook`) fetches `config.json` / index sidecars.
+- `PrepareSourcesExtension` (`SourceMetaSidecarHook`) fetches `config.json` / index sidecars after the sources are built, enriching each with transformer hyperparameters the arch layout reads back.
 
 The `modelweightvis` binary itself is tiny — it builds an `arbvis::Registry::with_defaults()`, calls `modelweightvis::register_all(&mut registry, &args)` (which also wires the parsed CLI flags into the providers and the registry's layout mode), and hands off to `arbvis::run`. Same renderer, same Hub I/O, same tile pyramid; the tensor awareness comes entirely through the registered plugins.
 
@@ -136,7 +136,7 @@ Requires Rust (stable).
 
 ```sh
 cargo build --release
-./target/release/modelweightvis <model.safetensors> --tiles ./output
+./target/release/modelweightvis <model.safetensors> --out ./output
 ```
 
 Or install into your `PATH`:
