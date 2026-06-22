@@ -12,11 +12,14 @@ pub mod render;
 pub use arch_volume::ArchVolumePlugin;
 
 use std::any::Any;
+use std::path::Path;
 
-use arbvis::{CanvasGeom, LayoutBuildCtx, LayoutMode, LayoutPlugin, LayoutShape};
+use arbvis::{
+    CanvasGeom, LayoutBuildCtx, LayoutMode, LayoutPlugin, LayoutShape, Source, SourceKind,
+};
 
 use crate::data::{MoeCkaPanel, MoeCkaProbePanel, MoeSummaryPanel, SourceMeta};
-use crate::format::{Dtype, ModelInfo};
+use crate::format::{Dtype, ModelInfo, SourceFormat};
 pub use arch::ArchLayout;
 
 // Constant arbvis-side; redefining here to avoid pulling in arbvis::tiled.
@@ -156,35 +159,67 @@ pub struct TileRegion {
     pub tile_y1: u32,
 }
 
+/// The tensor file format a source's path claims by extension, if any — the
+/// same extension check the [`crate::format_plugin`] `FormatPlugin::detects_path`
+/// impls use. `None` for non-tensor siblings (config.json, tokenizer.json,
+/// README), stdin buffers, and the synthetic diff / unmatched source kinds.
+/// Shared by the 2D ([`ArchLayoutPlugin`]) and 3D
+/// ([`arch_volume::ArchVolumePlugin`]) eligibility checks.
+pub(crate) fn source_tensor_format(s: &Source) -> Option<SourceFormat> {
+    let path: &Path = match &s.kind {
+        SourceKind::File(p) => p.as_path(),
+        SourceKind::Http(spec) => Path::new(spec.filename.as_str()),
+        _ => return None,
+    };
+    SourceFormat::from_path(path)
+}
+
+/// Whether the architectural layout applies to this run. Shared eligibility for
+/// the 2D ([`ArchLayoutPlugin`]) and 3D ([`arch_volume::ArchVolumePlugin`])
+/// arch layouts.
+///
+/// Diff mode: it's enough that *any* source carries tensor info — the typical
+/// case is a model-repo diff where the tensor sources are the point and
+/// tokenizer/config diffs are incidental.
+///
+/// Plain (non-diff) mode: there must be at least one tensor-format source, and
+/// *every* tensor-format source must have parsed (carry `ModelInfo`). Non-tensor
+/// siblings (config.json, tokenizer.json, README) are ignored — `ArchLayout`
+/// already skips them on the canvas. A tensor file that matched a format plugin
+/// but failed to parse has no `ModelInfo`, so it makes the layout ineligible;
+/// under the forced+strict default (see [`crate::register_all`]) that surfaces
+/// as a hard error instead of a silent byte-Hilbert fallback.
+pub(crate) fn arch_eligible(ctx: &LayoutBuildCtx<'_>) -> bool {
+    if matches!(ctx.mode, LayoutMode::Hilbert) {
+        return false;
+    }
+    if ctx.diff_mode {
+        return ctx
+            .sources
+            .iter()
+            .any(|s| s.extensions.get::<ModelInfo>().is_some());
+    }
+    let mut saw_tensor = false;
+    for s in ctx.sources {
+        if source_tensor_format(s).is_none() {
+            continue; // non-tensor sibling — not part of the arch canvas
+        }
+        saw_tensor = true;
+        if s.extensions.get::<ModelInfo>().is_none() {
+            return false; // matched a format plugin but failed to parse
+        }
+    }
+    saw_tensor
+}
+
 /// Architectural plugin — applies when sources carry safetensors metadata
 /// and `--layout` doesn't force hilbert. Build returns `None` if no
 /// transformer-style structure is detectable.
 pub struct ArchLayoutPlugin;
 
 impl ArchLayoutPlugin {
-    /// In non-diff mode every source must be safetensors (otherwise the user
-    /// has explicitly mixed in non-tensor inputs they'd expect to see). In
-    /// diff mode it's enough that any source carries safetensors info: the
-    /// typical case is a model-repo diff where the tensor sources are the
-    /// point and tokenizer/config diffs are incidental.
     fn eligible(ctx: &LayoutBuildCtx<'_>) -> bool {
-        if matches!(ctx.mode, LayoutMode::Hilbert) {
-            return false;
-        }
-        let all = !ctx.sources.is_empty()
-            && ctx
-                .sources
-                .iter()
-                .all(|s| s.extensions.get::<ModelInfo>().is_some());
-        let any = ctx
-            .sources
-            .iter()
-            .any(|s| s.extensions.get::<ModelInfo>().is_some());
-        if ctx.diff_mode {
-            any
-        } else {
-            all
-        }
+        arch_eligible(ctx)
     }
 }
 
@@ -297,5 +332,103 @@ impl LayoutPlugin for MoeCkaLayoutPlugin {
     fn build(&self, ctx: &LayoutBuildCtx<'_>) -> Option<Box<dyn LayoutShape>> {
         ArchLayout::try_build_moe_cka(ctx.sources, ctx.cumulative_offsets)
             .map(|l| Box::new(l) as Box<dyn LayoutShape>)
+    }
+}
+
+#[cfg(test)]
+mod eligible_tests {
+    use super::*;
+    use arbvis::Extensions;
+    use std::path::PathBuf;
+
+    /// A local-file source named `name`, optionally carrying a (parsed)
+    /// `ModelInfo`. `with_info == false` models a tensor file whose format
+    /// plugin failed to parse (or a non-tensor sibling).
+    fn file_source(name: &str, with_info: bool) -> Source {
+        let mut extensions = Extensions::default();
+        if with_info {
+            extensions.insert(ModelInfo {
+                format: SourceFormat::Safetensors,
+                tensors: Vec::new(),
+                color_ranges: Vec::new(),
+            });
+        }
+        Source {
+            file_idx: 0,
+            kind: SourceKind::File(PathBuf::from(name)),
+            byte_size: 0,
+            name_override: None,
+            xet_terms: None,
+            extensions,
+        }
+    }
+
+    fn ctx<'a>(sources: &'a [Source], diff_mode: bool) -> LayoutBuildCtx<'a> {
+        LayoutBuildCtx {
+            sources,
+            cumulative_offsets: &[],
+            total_bytes: 0,
+            mode: LayoutMode::Forced("arch"),
+            diff_mode,
+            grid_side: 0,
+        }
+    }
+
+    #[test]
+    fn tensor_source_with_modelinfo_is_eligible() {
+        let s = [file_source("model.safetensors", true)];
+        assert!(arch_eligible(&ctx(&s, false)));
+    }
+
+    #[test]
+    fn tensor_source_without_modelinfo_is_ineligible() {
+        // A `.gguf` that matched the format plugin but failed to parse.
+        let s = [file_source("model.gguf", false)];
+        assert!(!arch_eligible(&ctx(&s, false)));
+    }
+
+    #[test]
+    fn non_tensor_siblings_are_ignored() {
+        // config.json / tokenizer.json carry no ModelInfo but must not block arch.
+        let s = [
+            file_source("model.safetensors", true),
+            file_source("config.json", false),
+            file_source("tokenizer.json", false),
+        ];
+        assert!(arch_eligible(&ctx(&s, false)));
+    }
+
+    #[test]
+    fn one_failed_shard_among_good_ones_is_ineligible() {
+        let s = [
+            file_source("model-00001-of-00002.safetensors", true),
+            file_source("model-00002-of-00002.safetensors", false),
+        ];
+        assert!(!arch_eligible(&ctx(&s, false)));
+    }
+
+    #[test]
+    fn no_tensor_sources_is_ineligible() {
+        let s = [file_source("config.json", false)];
+        assert!(!arch_eligible(&ctx(&s, false)));
+    }
+
+    #[test]
+    fn hilbert_mode_is_never_eligible() {
+        let s = [file_source("model.safetensors", true)];
+        let mut c = ctx(&s, false);
+        c.mode = LayoutMode::Hilbert;
+        assert!(!arch_eligible(&c));
+    }
+
+    #[test]
+    fn diff_mode_any_modelinfo_is_eligible() {
+        // Diff keeps the lenient `any` gate: a non-tensor sibling alongside one
+        // parsed tensor source still applies.
+        let s = [
+            file_source("config.json", false),
+            file_source("model.safetensors", true),
+        ];
+        assert!(arch_eligible(&ctx(&s, true)));
     }
 }

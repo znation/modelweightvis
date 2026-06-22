@@ -24,12 +24,10 @@
 use std::any::Any;
 
 use arbvis::{
-    LayoutBuildCtx, LayoutMode, Source, VolumeEntity, VolumeLabel, VolumeShape, VolumeShapePlugin,
-    VoxelBox,
+    LayoutBuildCtx, Source, VolumeEntity, VolumeLabel, VolumeShape, VolumeShapePlugin, VoxelBox,
 };
 
 use crate::data::SourceMeta;
-use crate::format::ModelInfo;
 use crate::layout::arch::ArchLayout;
 use crate::tiled::arch_voxel::ArchVoxelExtra;
 
@@ -276,23 +274,11 @@ pub struct ArchVolumePlugin;
 
 impl ArchVolumePlugin {
     fn eligible(ctx: &LayoutBuildCtx<'_>) -> bool {
-        if matches!(ctx.mode, LayoutMode::Hilbert) {
-            return false;
-        }
-        let any = ctx
-            .sources
-            .iter()
-            .any(|s| s.extensions.get::<ModelInfo>().is_some());
-        let all = !ctx.sources.is_empty()
-            && ctx
-                .sources
-                .iter()
-                .all(|s| s.extensions.get::<ModelInfo>().is_some());
-        if ctx.diff_mode {
-            any
-        } else {
-            all
-        }
+        // Same tensor-aware eligibility as the 2D arch layout: at least one
+        // tensor-format source, and every tensor-format source parsed
+        // (non-tensor siblings ignored). Under the forced+strict default a
+        // failed parse aborts instead of byte-falling-back.
+        crate::layout::arch_eligible(ctx)
     }
 }
 
@@ -331,7 +317,7 @@ mod tests {
 
     use arbvis::{Extensions, SourceKind};
 
-    use crate::format::{Dtype, SourceFormat, TensorMeta};
+    use crate::format::{Dtype, ModelInfo, SourceFormat, TensorMeta};
 
     fn tensor(name: &str, rows: u64, cols: u64, start: u64) -> TensorMeta {
         TensorMeta {

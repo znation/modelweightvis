@@ -109,10 +109,25 @@ pub fn register_all(registry: &mut Registry, args: &ModelArgs) {
     );
 
     // --- Wired from the parsed CLI flags ---
-    registry.layout_mode = args.layout.into();
-    // `--strict-layout`: turn a forced-layout fallback into a hard error
-    // (honored by both `select_layout` and `select_volume_shape`).
-    registry.strict_layout = args.strict_layout;
+
+    // Strict-by-default. A bare `modelweightvis <model>` forces the `arch`
+    // layout and makes a failed parse fatal: arbvis's `strict_layout` aborts
+    // when a forced layout can't be built (no `ModelInfo`) instead of silently
+    // falling back to byte-Hilbert. `--layout auto`/`hilbert` opt out (strict is
+    // a no-op there — neither is a forced layout that can fall back). This
+    // covers the 2D render, the `--3d` arch volume, and `--diff` uniformly.
+    //
+    // `--moe` is the one carve-out: it renders its own multi-scene layouts
+    // (higher priority than `arch`), so a forced "arch" would always lose and
+    // abort. Fall it back to the auto selector; an explicit `--layout` still
+    // applies otherwise.
+    let layout_mode: arbvis::LayoutMode = if args.moe.is_some() {
+        arbvis::LayoutMode::Auto
+    } else {
+        args.layout.into()
+    };
+    registry.layout_mode = layout_mode;
+    registry.strict_layout = matches!(layout_mode, arbvis::LayoutMode::Forced("arch"));
     let diff_metric: DiffMetric = args.diff_metric.into();
     let finetune = FinetuneForce::from_flags(args.finetune, args.no_finetune);
 
@@ -142,4 +157,67 @@ pub fn register_all(registry: &mut Registry, args: &ModelArgs) {
         diff_metric,
         finetune,
     }));
+}
+
+#[cfg(test)]
+mod register_all_tests {
+    use super::*;
+    use arbvis::LayoutMode;
+    use clap::Parser;
+
+    /// Parse `argv` and run `register_all`, returning the resulting layout
+    /// wiring. `register_all` does no I/O, so the (non-existent) paths are fine.
+    fn wiring(argv: &[&str]) -> (LayoutMode, bool) {
+        let args = ModelArgs::parse_from(argv);
+        let mut registry = Registry::with_defaults();
+        register_all(&mut registry, &args);
+        (registry.layout_mode, registry.strict_layout)
+    }
+
+    #[test]
+    fn bare_render_forces_arch_and_is_strict() {
+        let (mode, strict) = wiring(&["modelweightvis", "model.safetensors"]);
+        assert_eq!(mode, LayoutMode::Forced("arch"));
+        assert!(strict);
+    }
+
+    #[test]
+    fn explicit_auto_opts_out_of_strict() {
+        let (mode, strict) = wiring(&["modelweightvis", "--layout", "auto", "model.safetensors"]);
+        assert_eq!(mode, LayoutMode::Auto);
+        assert!(!strict);
+    }
+
+    #[test]
+    fn explicit_hilbert_opts_out_of_strict() {
+        let (mode, strict) =
+            wiring(&["modelweightvis", "--layout", "hilbert", "model.safetensors"]);
+        assert_eq!(mode, LayoutMode::Hilbert);
+        assert!(!strict);
+    }
+
+    #[test]
+    fn moe_is_carved_out() {
+        let (mode, strict) = wiring(&["modelweightvis", "--moe", "hf://org/moe"]);
+        assert_eq!(mode, LayoutMode::Auto);
+        assert!(!strict);
+    }
+
+    #[test]
+    fn diff_is_strict_by_default() {
+        // --diff is NOT carved out: tensor diffs build on the arch canvas;
+        // a pure non-tensor diff aborts (use --layout auto for the byte path).
+        let (mode, strict) =
+            wiring(&["modelweightvis", "--diff", "a.safetensors", "b.safetensors"]);
+        assert_eq!(mode, LayoutMode::Forced("arch"));
+        assert!(strict);
+    }
+
+    #[test]
+    fn three_d_is_strict_by_default() {
+        // --3d renders the arch volume (ArchVolumePlugin); strict applies.
+        let (mode, strict) = wiring(&["modelweightvis", "--3d", "model.safetensors"]);
+        assert_eq!(mode, LayoutMode::Forced("arch"));
+        assert!(strict);
+    }
 }

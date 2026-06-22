@@ -109,15 +109,19 @@ impl From<MoeNormArg> for crate::data::MoeNorm {
 /// CLI choice for layout strategy. Mirrors [`arbvis::LayoutMode`].
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
 pub enum LayoutArg {
-    /// Architectural layout if every input is safetensors with detectable
-    /// structure; otherwise byte-Hilbert. Default.
+    /// Force architectural (structure-aware) layout, and make a failed parse
+    /// fatal: a model file that matched a format plugin but couldn't be parsed
+    /// has no tensor metadata, so the layout can't build — instead of silently
+    /// falling back to byte-Hilbert, the run aborts. Default. Use `auto` for the
+    /// lenient fallback or `hilbert` to force the byte view.
     #[default]
-    Auto,
-    /// Force architectural (structure-aware) layout. Falls back to hilbert if
-    /// no input is safetensors.
     Arch,
+    /// Architectural layout if every tensor-format input parsed and has
+    /// detectable structure; otherwise byte-Hilbert. Lenient — never aborts on a
+    /// parse failure. (This was the default before strict-by-default.)
+    Auto,
     /// Force the legacy global-Hilbert layout (1 px = 1 byte). Useful for
-    /// non-safetensors inputs and regression-checking the old output.
+    /// non-tensor inputs and regression-checking the old output.
     Hilbert,
 }
 
@@ -257,28 +261,25 @@ pub struct ModelArgs {
 
     /// Layout strategy for arranging tensors on the canvas.
     ///
-    /// `auto` (default): structure-aware layout when every input is
-    /// safetensors and tensor names look transformer-style; otherwise the
-    /// legacy global-Hilbert curve.
+    /// `arch` (default): force structure-aware layout, and abort if it can't be
+    /// built. Each tensor is rendered at its natural 2D element shape (1 px = 1
+    /// element); transformer blocks stack vertically with corresponding
+    /// sub-tensors pixel-aligned across the stack. A model file that matched a
+    /// format plugin but failed to parse has no tensor metadata, so the run
+    /// aborts rather than silently degrading to a byte view — modelweightvis is
+    /// for tensor files (use arbvis directly for arbitrary binaries). Applies to
+    /// the 2D render, the `--3d` volume, and `--diff`; `--moe` renders its own
+    /// scene layouts.
     ///
-    /// `arch`: force structure-aware layout. Each tensor is rendered at its
-    /// natural 2D element shape (1 px = 1 element); transformer blocks stack
-    /// vertically with corresponding sub-tensors pixel-aligned across the
-    /// stack. Falls back to hilbert if no input is safetensors.
+    /// `auto`: structure-aware layout when every tensor-format input parsed and
+    /// tensor names look transformer-style; otherwise the legacy global-Hilbert
+    /// curve. Lenient — never aborts on a parse failure. (Previous default.)
     ///
     /// `hilbert`: force the legacy layout. 1 px = 1 byte along a global
     /// Hilbert curve over the concatenated source bytes. Reproduces the
     /// pre-architectural output for regression checks.
-    #[arg(long, value_enum, default_value_t = LayoutArg::Auto)]
+    #[arg(long, value_enum, default_value_t = LayoutArg::Arch)]
     pub layout: LayoutArg,
-
-    /// Fail instead of silently falling back when a forced `--layout` can't be
-    /// built for the inputs — e.g. `--layout arch` on a non-safetensors input,
-    /// where the default would quietly render a byte-Hilbert layout. No effect
-    /// under `--layout auto` (which has nothing to fall back from). Applies to
-    /// both the 2D tile render and the `--3d` volume.
-    #[arg(long)]
-    pub strict_layout: bool,
 }
 
 impl ModelArgs {
