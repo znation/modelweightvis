@@ -264,12 +264,12 @@ mod tests {
         let side = 8u32;
         let mut cells = vec![VoxelCell::default(); (side as usize).pow(3)];
         {
-            let mut grid = VoxelGridMut::new(&mut cells, side);
+            let mut grid = VoxelGridMut::new(&mut cells, [side; 3]);
             ArchVoxelRenderer.render(
                 &VoxelRenderCtx {
                     entity: &ent,
                     bytes: &bytes,
-                    side,
+                    extent: [side; 3],
                     diff_mode: true,
                 },
                 &mut grid,

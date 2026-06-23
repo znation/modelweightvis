@@ -2,16 +2,18 @@
 //! [`crate::layout::arch::ArchLayout`].
 //!
 //! arbvis's 3D path renders a [`arbvis::VolumeShape`] — a list of per-tensor
-//! [`arbvis::VolumeEntity`] boxes in a bounded voxel cube — instead of laying
+//! [`arbvis::VolumeEntity`] boxes in a bounded voxel box — instead of laying
 //! raw bytes on a blind 3D Hilbert curve. We build that shape by **reusing the
 //! 2D arch layout wholesale**: [`ArchLayout::try_build`] already classifies
 //! tensors into transformer blocks and lays each layer out as a canonical-slot
 //! arrangement (so `q_proj` sits at the same in-layer position in every block).
-//! We then project that 2D placement into the cube with one change of axis:
+//! We then project that 2D placement into the box with one change of axis:
 //!
 //! - **Z (depth) = transformer layer.** Each block becomes a Z-slab; top-level
-//!   tensors (embeddings, `lm_head`, final norms) cap the front.
-//! - **X/Y = the in-layer canonical-slot position**, mapped onto the cube face.
+//!   tensors (embeddings, `lm_head`, final norms) cap the front. The depth axis
+//!   is sized to the layer count (anisotropic), so a model's stack reads as deep
+//!   or shallow as it actually is rather than always filling a cube.
+//! - **X/Y = the in-layer canonical-slot position**, mapped onto the box face.
 //!   Because every layer shares that arrangement, a given sub-tensor forms a
 //!   column through Z — so cross-layer change reads as variation along depth.
 //!
@@ -48,7 +50,10 @@ struct EntityDesc {
 
 /// A structure-aware 3D volume layout (the `"arch"` [`VolumeShape`]).
 pub struct ArchVolume {
-    side: u32,
+    /// Voxel box `[x, y, z]`. X/Y are the per-layer face (full `grid_side`); Z
+    /// is sized to the layer count so depth tracks model depth (see
+    /// [`ArchVolume::from_arch`]) rather than every model being forced cubic.
+    extent: [u32; 3],
     descs: Vec<EntityDesc>,
     focus: ([f32; 3], f32),
 }
@@ -57,8 +62,8 @@ impl VolumeShape for ArchVolume {
     fn id(&self) -> &'static str {
         "arch"
     }
-    fn grid_side(&self) -> u32 {
-        self.side
+    fn grid_extent(&self) -> [u32; 3] {
+        self.extent
     }
     fn entities(&self) -> Option<Vec<VolumeEntity>> {
         Some(
@@ -94,8 +99,10 @@ impl VolumeShape for ArchVolume {
 }
 
 impl ArchVolume {
-    /// Project a built [`ArchLayout`] into a `side³` cube. Returns `None` when
-    /// the layout has no transformer blocks (a flat single slab isn't worth a
+    /// Project a built [`ArchLayout`] into a `side × side × z` voxel box — the
+    /// X/Y face at full `side` resolution, the depth `z` sized to the layer
+    /// count (see the `FULL_DEPTH_LAYERS` note below). Returns `None` when the
+    /// layout has no transformer blocks (a flat single slab isn't worth a
     /// structured 3D render — let arbvis's byte-Hilbert floor handle it).
     fn from_arch(
         arch: &ArchLayout,
@@ -159,6 +166,23 @@ impl ArchVolume {
         let z_off = if has_top { 1u32 } else { 0 };
         let groups = layers.len() as u32 + z_off;
 
+        // Depth axis (now that arbvis volumes can be anisotropic). Each group
+        // gets a fixed slab thickness of ~`side / FULL_DEPTH_LAYERS` voxels, so
+        // the rendered solid's depth *tracks the layer count*: a 12-layer model
+        // reads as a shallow stack, a 64-layer one as a deep column — instead of
+        // every model being squashed into a `side³` cube. The stack saturates at
+        // `side` once it would exceed the cube (the cube is already the deepest
+        // we can render within the grid budget; beyond `FULL_DEPTH_LAYERS` groups
+        // the per-layer slab simply thins to fit). X/Y keep the full `side` face.
+        // The viewer scales the longest axis to the unit cube and keeps voxels
+        // cubic, so the proportions carry through. `FULL_DEPTH_LAYERS` is purely a
+        // presentation knob — raise it for thinner slabs / more models rendered
+        // at true depth, lower it for chunkier slabs.
+        const FULL_DEPTH_LAYERS: u32 = 64;
+        let per_layer = (side / FULL_DEPTH_LAYERS).max(1);
+        let z_extent = (groups * per_layer).min(side).max(1);
+        let extent = [side, side, z_extent];
+
         // Shelf tops per group, for middle-aligning content on the Y axis.
         // Every tensor on a shelf shares the same relative top (`canvas_y - oy`),
         // so the distinct relative-Y offsets within a group *are* its shelf tops.
@@ -168,8 +192,10 @@ impl ArchVolume {
         // layer, `None` for the top-level cap. (Without this, the 2D layout's
         // shelf-top alignment renders as bottom alignment, since canvas-top maps
         // to cube Y=0 = the bottom.)
-        let mut shelf_tops: std::collections::BTreeMap<Option<u32>, std::collections::BTreeSet<u32>> =
-            std::collections::BTreeMap::new();
+        let mut shelf_tops: std::collections::BTreeMap<
+            Option<u32>,
+            std::collections::BTreeSet<u32>,
+        > = std::collections::BTreeMap::new();
         for t in &arch.tensors {
             if t.tensor_rows == 0 || t.tensor_cols == 0 {
                 continue;
@@ -194,9 +220,9 @@ impl ArchVolume {
         };
 
         let z_span = |g: u32| -> (u32, u32) {
-            let z0 = g * side / groups;
-            let z1 = ((g + 1) * side / groups).max(z0 + 1).min(side);
-            (z0, z1.max(z0 + 1).min(side))
+            let z0 = g * z_extent / groups;
+            let z1 = ((g + 1) * z_extent / groups).max(z0 + 1).min(z_extent);
+            (z0, z1.max(z0 + 1).min(z_extent))
         };
 
         let mut descs: Vec<EntityDesc> = Vec::with_capacity(arch.tensors.len());
@@ -271,15 +297,21 @@ impl ArchVolume {
         if descs.is_empty() {
             return None;
         }
-        let focus = focus_of(&descs, side);
-        Some(Self { side, descs, focus })
+        let focus = focus_of(&descs, extent);
+        Some(Self {
+            extent,
+            descs,
+            focus,
+        })
     }
 }
 
-/// Cube-space framing for the union of all entity boxes (voxel `v` on an axis →
-/// `(v + 0.5)/side - 0.5`, matching arbvis's shader). Independent of magnitude,
-/// so empty/padded slabs don't throw off the frame.
-fn focus_of(descs: &[EntityDesc], side: u32) -> ([f32; 3], f32) {
+/// World-space framing for the union of all entity boxes. Voxel `v` on axis `a`
+/// maps to `((v + 0.5)/extent[a] - 0.5) * (extent[a]/max(extent))`, matching
+/// arbvis's anisotropic shader mapping (longest axis scaled to the unit cube,
+/// voxels kept cubic). Independent of magnitude, so empty/padded slabs don't
+/// throw off the frame.
+fn focus_of(descs: &[EntityDesc], extent: [u32; 3]) -> ([f32; 3], f32) {
     let mut lo = [u32::MAX; 3];
     let mut hi = [0u32; 3];
     for d in descs {
@@ -292,13 +324,16 @@ fn focus_of(descs: &[EntityDesc], side: u32) -> ([f32; 3], f32) {
             hi[a] = hi[a].max(mx);
         }
     }
-    let s = side as f32;
-    let to_cube = |v: f32| (v + 0.5) / s - 0.5;
+    let maxext = extent[0].max(extent[1]).max(extent[2]).max(1) as f32;
+    let to_world = |v: f32, a: usize| {
+        let e = extent[a].max(1) as f32;
+        ((v + 0.5) / e - 0.5) * (e / maxext)
+    };
     let mut center = [0f32; 3];
     let mut radius = 0f32;
     for a in 0..3 {
-        let c0 = to_cube(lo[a] as f32);
-        let c1 = to_cube(hi[a].saturating_sub(1) as f32);
+        let c0 = to_world(lo[a] as f32, a);
+        let c1 = to_world(hi[a].saturating_sub(1) as f32, a);
         center[a] = (c0 + c1) * 0.5;
         radius = radius.max((center[a] - c0).max(c1 - center[a]));
     }
@@ -491,5 +526,71 @@ mod tests {
         );
         // The tallest tensor fills the band (it defines the band height).
         assert_eq!((tall.bbox.y0, tall.bbox.y1), (0, side));
+    }
+
+    /// Build a single-source model with `n_layers` transformer layers (each one
+    /// q_proj + gate_proj), for exercising the depth axis.
+    fn n_layer_sources(n_layers: u64) -> (Vec<Source>, Vec<u64>, Vec<SourceMeta>) {
+        let mut tensors = Vec::new();
+        let mut off = 0u64;
+        for l in 0..n_layers {
+            for sp in ["self_attn.q_proj.weight", "mlp.gate_proj.weight"] {
+                let t = tensor(&format!("model.layers.{l}.{sp}"), 16, 16, off);
+                off = t.file_end;
+                tensors.push(t);
+            }
+        }
+        (
+            vec![source(tensors)],
+            vec![0u64],
+            vec![SourceMeta::default()],
+        )
+    }
+
+    /// The depth (Z) axis is anisotropic: X/Y keep the full `side` face while Z
+    /// scales with the layer count, so a shallow model renders as a shallow
+    /// stack instead of a forced cube — and a model with enough layers saturates
+    /// the depth budget back at `side`.
+    #[test]
+    fn depth_axis_tracks_layer_count() {
+        let side = 512u32;
+
+        let (s4, c4, m4) = n_layer_sources(4);
+        let arch4 = ArchLayout::try_build(&s4, &c4, &m4).expect("arch builds");
+        let v4 = ArchVolume::from_arch(&arch4, &s4, &c4, side).expect("volume builds");
+        let e4 = v4.grid_extent();
+
+        let (s16, c16, m16) = n_layer_sources(16);
+        let arch16 = ArchLayout::try_build(&s16, &c16, &m16).expect("arch builds");
+        let v16 = ArchVolume::from_arch(&arch16, &s16, &c16, side).expect("volume builds");
+        let e16 = v16.grid_extent();
+
+        // X/Y are the full face for both; only Z differs.
+        assert_eq!([e4[0], e4[1]], [side, side]);
+        assert_eq!([e16[0], e16[1]], [side, side]);
+
+        // Few layers ⇒ a shallow box (not a cube), and more layers ⇒ deeper.
+        assert!(
+            e4[2] < side,
+            "4-layer model should be shallow, got z={}",
+            e4[2]
+        );
+        assert!(
+            e16[2] > e4[2],
+            "16 layers should be deeper than 4: {} vs {}",
+            e16[2],
+            e4[2]
+        );
+
+        // Enough layers saturate the depth budget back at the cube side.
+        let (s_deep, c_deep, m_deep) = n_layer_sources(200);
+        let arch_deep = ArchLayout::try_build(&s_deep, &c_deep, &m_deep).expect("arch builds");
+        let v_deep =
+            ArchVolume::from_arch(&arch_deep, &s_deep, &c_deep, side).expect("volume builds");
+        assert_eq!(
+            v_deep.grid_extent(),
+            [side, side, side],
+            "deep model saturates to cube"
+        );
     }
 }
