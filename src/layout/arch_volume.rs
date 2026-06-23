@@ -159,6 +159,40 @@ impl ArchVolume {
         let z_off = if has_top { 1u32 } else { 0 };
         let groups = layers.len() as u32 + z_off;
 
+        // Shelf tops per group, for middle-aligning content on the Y axis.
+        // Every tensor on a shelf shares the same relative top (`canvas_y - oy`),
+        // so the distinct relative-Y offsets within a group *are* its shelf tops.
+        // A tensor's "band" runs from its shelf top to the next shelf top (or the
+        // group's full height for the last shelf); centering its box within that
+        // band lifts content off the cube floor. Group key: `Some(layer)` per
+        // layer, `None` for the top-level cap. (Without this, the 2D layout's
+        // shelf-top alignment renders as bottom alignment, since canvas-top maps
+        // to cube Y=0 = the bottom.)
+        let mut shelf_tops: std::collections::BTreeMap<Option<u32>, std::collections::BTreeSet<u32>> =
+            std::collections::BTreeMap::new();
+        for t in &arch.tensors {
+            if t.tensor_rows == 0 || t.tensor_cols == 0 {
+                continue;
+            }
+            let oy = match t.layer_idx {
+                Some(l) => origin(l).1,
+                None => top_oy,
+            };
+            shelf_tops
+                .entry(t.layer_idx)
+                .or_default()
+                .insert(t.canvas_y.saturating_sub(oy));
+        }
+        // Band height for a tensor at relative top `band_top` in group `g` whose
+        // full height is `full_h`: span to the next shelf top, else to `full_h`.
+        let band_h = |g: Option<u32>, band_top: u32, full_h: u32| -> u32 {
+            let band_bot = shelf_tops
+                .get(&g)
+                .and_then(|tops| tops.range((band_top + 1)..).next().copied())
+                .unwrap_or(full_h);
+            band_bot.saturating_sub(band_top)
+        };
+
         let z_span = |g: u32| -> (u32, u32) {
             let z0 = g * side / groups;
             let z1 = ((g + 1) * side / groups).max(z0 + 1).min(side);
@@ -179,9 +213,13 @@ impl ArchVolume {
             };
             let (z0, z1) = z_span(g);
 
-            // In-layer rect → cube face.
+            // In-layer rect → cube face. Y is centered within the tensor's shelf
+            // band so short tensors float in the middle instead of sinking to the
+            // cube floor (canvas-top == cube-bottom).
             let lx = t.canvas_x.saturating_sub(ox) as u64;
-            let ly = t.canvas_y.saturating_sub(oy) as u64;
+            let band_top = t.canvas_y.saturating_sub(oy);
+            let off = band_h(t.layer_idx, band_top, lh).saturating_sub(t.disp_h) / 2;
+            let ly = (band_top + off) as u64;
             let x0 = (lx * side as u64 / lw as u64).min(side as u64 - 1) as u32;
             let y0 = (ly * side as u64 / lh as u64).min(side as u64 - 1) as u32;
             let x1 = (((lx + t.disp_w as u64) * side as u64 / lw as u64).max(x0 as u64 + 1))
@@ -398,5 +436,60 @@ mod tests {
         for e in &ents {
             assert!(e.byte_start + e.byte_len <= sources[0].byte_size);
         }
+    }
+
+    /// A short sub-tensor sharing a layer with a tall one must be *centered* on
+    /// the Y axis — its box floats off both the cube floor and ceiling, with
+    /// roughly equal top/bottom margins — rather than sinking to the bottom.
+    #[test]
+    fn short_tensor_is_vertically_centered() {
+        // q_proj is tall (64 rows), gate_proj is short (8 rows); both 16 cols
+        // land them on one shelf, so the layer's single band spans the cube.
+        let mut tensors = Vec::new();
+        let mut off = 0u64;
+        for l in 0..2u64 {
+            for (sp, rows) in [
+                ("self_attn.q_proj.weight", 64u64),
+                ("mlp.gate_proj.weight", 8u64),
+            ] {
+                let t = tensor(&format!("model.layers.{l}.{sp}"), rows, 16, off);
+                off = t.file_end;
+                tensors.push(t);
+            }
+        }
+        let sources = vec![source(tensors)];
+        let cum = vec![0u64];
+        let metas = vec![SourceMeta::default()];
+
+        let arch = ArchLayout::try_build(&sources, &cum, &metas).expect("arch layout builds");
+        let side = 64u32;
+        let vol = ArchVolume::from_arch(&arch, &sources, &cum, side).expect("arch volume builds");
+        let labels = vol.manifest();
+
+        let short = labels
+            .iter()
+            .find(|l| l.name.ends_with("gate_proj.weight"))
+            .expect("short tensor present");
+        let tall = labels
+            .iter()
+            .find(|l| l.name.ends_with("q_proj.weight"))
+            .expect("tall tensor present");
+
+        // The short box must lift off the floor and stay below the ceiling…
+        assert!(
+            short.bbox.y0 > 0 && short.bbox.y1 < side,
+            "short tensor should be centered, got y0={} y1={}",
+            short.bbox.y0,
+            short.bbox.y1
+        );
+        // …with top and bottom margins within a voxel of each other.
+        let top_margin = short.bbox.y0;
+        let bot_margin = side - short.bbox.y1;
+        assert!(
+            top_margin.abs_diff(bot_margin) <= 1,
+            "margins should match: top={top_margin} bot={bot_margin}"
+        );
+        // The tallest tensor fills the band (it defines the band height).
+        assert_eq!((tall.bbox.y0, tall.bbox.y1), (0, side));
     }
 }
