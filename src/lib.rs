@@ -113,8 +113,8 @@ pub fn register_all(registry: &mut Registry, args: &ModelArgs) {
     // Strict-by-default. A bare `modelweightvis <model>` forces the `arch`
     // layout and makes a failed parse fatal: arbvis's `strict_layout` aborts
     // when a forced layout can't be built (no `ModelInfo`) instead of silently
-    // falling back to byte-Hilbert. `--layout auto`/`hilbert` opt out (strict is
-    // a no-op there — neither is a forced layout that can fall back). This
+    // falling back to byte-Hilbert. `--layout hilbert` opts out (strict is a
+    // no-op there — it isn't a forced layout that can fall back). This
     // covers the 2D render, the `--3d` arch volume, and `--diff` uniformly.
     //
     // `--moe` is the one carve-out: it renders its own multi-scene layouts
@@ -182,13 +182,6 @@ mod register_all_tests {
     }
 
     #[test]
-    fn explicit_auto_opts_out_of_strict() {
-        let (mode, strict) = wiring(&["modelweightvis", "--layout", "auto", "model.safetensors"]);
-        assert_eq!(mode, LayoutMode::Auto);
-        assert!(!strict);
-    }
-
-    #[test]
     fn explicit_hilbert_opts_out_of_strict() {
         let (mode, strict) =
             wiring(&["modelweightvis", "--layout", "hilbert", "model.safetensors"]);
@@ -206,7 +199,7 @@ mod register_all_tests {
     #[test]
     fn diff_is_strict_by_default() {
         // --diff is NOT carved out: tensor diffs build on the arch canvas;
-        // a pure non-tensor diff aborts (use --layout auto for the byte path).
+        // a pure non-tensor diff aborts (use --layout hilbert for the byte path).
         let (mode, strict) =
             wiring(&["modelweightvis", "--diff", "a.safetensors", "b.safetensors"]);
         assert_eq!(mode, LayoutMode::Forced("arch"));

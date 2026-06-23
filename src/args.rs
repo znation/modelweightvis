@@ -112,14 +112,10 @@ pub enum LayoutArg {
     /// Force architectural (structure-aware) layout, and make a failed parse
     /// fatal: a model file that matched a format plugin but couldn't be parsed
     /// has no tensor metadata, so the layout can't build — instead of silently
-    /// falling back to byte-Hilbert, the run aborts. Default. Use `auto` for the
-    /// lenient fallback or `hilbert` to force the byte view.
+    /// falling back to byte-Hilbert, the run aborts. Default. Use `hilbert` to
+    /// force the byte view.
     #[default]
     Arch,
-    /// Architectural layout if every tensor-format input parsed and has
-    /// detectable structure; otherwise byte-Hilbert. Lenient — never aborts on a
-    /// parse failure. (This was the default before strict-by-default.)
-    Auto,
     /// Force the legacy global-Hilbert layout (1 px = 1 byte). Useful for
     /// non-tensor inputs and regression-checking the old output.
     Hilbert,
@@ -128,7 +124,6 @@ pub enum LayoutArg {
 impl From<LayoutArg> for LayoutMode {
     fn from(a: LayoutArg) -> Self {
         match a {
-            LayoutArg::Auto => LayoutMode::Auto,
             // arbvis treats the forced layout id opaquely; "arch" names this
             // crate's `ArchLayoutPlugin`.
             LayoutArg::Arch => LayoutMode::Forced("arch"),
@@ -270,10 +265,6 @@ pub struct ModelArgs {
     /// for tensor files (use arbvis directly for arbitrary binaries). Applies to
     /// the 2D render, the `--3d` volume, and `--diff`; `--moe` renders its own
     /// scene layouts.
-    ///
-    /// `auto`: structure-aware layout when every tensor-format input parsed and
-    /// tensor names look transformer-style; otherwise the legacy global-Hilbert
-    /// curve. Lenient — never aborts on a parse failure. (Previous default.)
     ///
     /// `hilbert`: force the legacy layout. 1 px = 1 byte along a global
     /// Hilbert curve over the concatenated source bytes. Reproduces the

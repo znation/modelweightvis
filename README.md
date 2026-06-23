@@ -19,9 +19,8 @@ modelweightvis hf://meta-llama/Llama-3.2-1B --out ./out
 
 When every input is safetensors with transformer-style tensor names, modelweightvis renders each tensor at its 2D element shape and stacks transformer blocks vertically. Corresponding sub-tensors (e.g. `q_proj` across every layer) are pixel-aligned, so block-to-block changes line up as horizontal bands.
 
-Override with `--layout arch|auto|hilbert`:
+Override with `--layout arch|hilbert`:
 - `arch` (default) — force architectural, and **abort if it can't be built**. A model file that matched a format plugin but couldn't be parsed (e.g. an IQ-quant GGUF candle can't decode) has no tensor metadata, so the run errors out instead of silently degrading to a byte view — modelweightvis is for tensor files; use [arbvis](https://github.com/znation/arbvis) directly for arbitrary binaries. Non-tensor siblings (`config.json`, `tokenizer.json`, README) are ignored, so a full repo still renders. Applies to the 2D render, the `--3d` arch volume, and `--diff`; `--moe` renders its own scene layouts.
-- `auto` — architectural if every tensor-format input parsed and has detectable transformer structure; otherwise byte-Hilbert. Lenient — never aborts on a parse failure. (This was the default before strict-by-default.)
 - `hilbert` — force the byte-only Hilbert layout (1 px = 1 byte) for regression checks against arbvis output.
 
 ### Tensor format parsing
