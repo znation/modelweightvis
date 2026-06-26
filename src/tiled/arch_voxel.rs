@@ -95,6 +95,99 @@ impl VoxelRenderer for ArchVoxelRenderer {
             }
         }
     }
+
+    // Element count — splits the streamed point-octree budget across tensors so
+    // bigger tensors get proportionally more points.
+    fn point_weight(&self, ctx: &VoxelRenderCtx<'_>) -> u64 {
+        ctx.entity
+            .extra
+            .downcast_ref::<ArchVoxelExtra>()
+            .map(|ex| ex.rows.saturating_mul(ex.cols))
+            .unwrap_or(0)
+    }
+
+    // Emit per-element points so the Points view drills toward one point per
+    // weight on zoom (the LOD octree streams them). A tensor is one flat sheet
+    // at mid-slab — the volume mode extrudes it through depth, but the exact
+    // points place each element on the face: column → x, row → y (matching the
+    // voxel face mapping). Coloring mirrors the voxel renderer.
+    fn render_points(
+        &self,
+        ctx: &VoxelRenderCtx<'_>,
+        budget: u64,
+        emit: &mut dyn FnMut([f32; 3], [u8; 4]),
+    ) {
+        let Some(ex) = ctx.entity.extra.downcast_ref::<ArchVoxelExtra>() else {
+            return;
+        };
+        let (rows, cols) = (ex.rows, ex.cols);
+        let total = rows.saturating_mul(cols);
+        if total == 0 || budget == 0 {
+            return;
+        }
+        let stride = (total / budget).max(1) as usize;
+        let mut reader = TensorElementReader::new(ex.dtype, ctx.bytes);
+        let pos = |k: usize| -> [f32; 3] {
+            let r = (k as u64 / cols) as f32;
+            let c = (k as u64 % cols) as f32;
+            [(c + 0.5) / cols as f32, (r + 0.5) / rows as f32, 0.5]
+        };
+
+        if ctx.diff_mode {
+            // U8 signed-delta codes (127 = unchanged, 255 = non-finite), like
+            // diff_face: color by sign, opacity = |Δ|, unchanged weights vanish.
+            let lut = arbvis::color::build_diff_signed_lut();
+            let mut k = 0usize;
+            while (k as u64) < total {
+                let code = reader.element(k);
+                if code.is_finite() {
+                    let code = code as i32;
+                    if code >= 255 {
+                        let c = lut[255].0;
+                        emit(pos(k), [c[0], c[1], c[2], 255]);
+                    } else {
+                        let signed = (code - 127) as f32 / 127.0;
+                        let a = (signed.abs() * 255.0).round() as u8;
+                        if a > 0 {
+                            let idx =
+                                (127.0 + signed * 127.0).round().clamp(0.0, 254.0) as usize;
+                            let c = lut[idx].0;
+                            emit(pos(k), [c[0], c[1], c[2], a]);
+                        }
+                    }
+                }
+                k += stride;
+            }
+        } else {
+            // Plain mode: |value| normalized by the tensor's own max, through
+            // the CIVIDIS magnitude ramp; opacity = normalized magnitude.
+            let mut maxv = 0f32;
+            let mut k = 0usize;
+            while (k as u64) < total {
+                let v = reader.element(k);
+                if v.is_finite() {
+                    maxv = maxv.max(v.abs());
+                }
+                k += stride;
+            }
+            if maxv <= 0.0 {
+                return;
+            }
+            let inv = 1.0 / maxv;
+            let mut k = 0usize;
+            while (k as u64) < total {
+                let v = reader.element(k);
+                if v.is_finite() {
+                    let byte = ((v.abs() * inv).clamp(0.0, 1.0) * 255.0).round() as u8;
+                    if byte > 0 {
+                        let c = CIVIDIS_LUT[byte as usize].0;
+                        emit(pos(k), [c[0], c[1], c[2], byte]);
+                    }
+                }
+                k += stride;
+            }
+        }
+    }
 }
 
 /// Plain mode: per voxel mean `|value|`, normalized by the tensor's own max so
