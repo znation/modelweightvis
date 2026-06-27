@@ -9,7 +9,7 @@ description = "Tensor-format-aware visualization built on arbvis"
 # `rev` when picking up arbvis changes. For local co-development against
 # a sibling arbvis checkout, add a `[patch]` block in `.cargo/config.toml`
 # (gitignored) — see README's "Local arbvis co-development" section.
-arbvis = { git = "https://github.com/znation/arbvis", rev = "a8dbc1b6afe54d3e45b45eed03e6a37487614010" }
+arbvis = { git = "https://github.com/znation/arbvis", rev = "68f8c8981125861a866e8f68261bdfc49e517aec" }
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
