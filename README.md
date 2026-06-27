@@ -103,6 +103,7 @@ modelweightvis inherits arbvis's full CLI surface. The output destinations, Hub 
 
 - `--out DIR` — write the viewer bundle here: a zoomable Leaflet tile pyramid (2D), or the Three.js volume bundle under `--3d`. Accepts a local dir or an `hf://` URL.
 - `--3d` (with `--grid N`) — render bytes along a 3D Hilbert curve into a cube and emit a Three.js volume + point-cloud viewer instead of the 2D pyramid.
+- `--volume-res N` (with `--3d`) — build the sparse brick volume at a higher virtual resolution than `--grid` (power of two, 8–2048). Only occupied bricks are stored and the viewer ray-guides them into a bounded GPU cache on demand, so VRAM tracks the visible working set rather than the data's total size — letting the volume far exceed the dense grid for sparse model weights.
 - `--space OWNER/REPO` — deploy a Docker Space serving the viewer (works for both 2D and `--3d`).
 - `--stream` — keep `hf://` inputs remote and push tiles to the Hub as they're produced.
 - `--show-xet-xorbs` — color regions by xorb ID for xet-backed inputs (hue per xorb).
