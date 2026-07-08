@@ -19,7 +19,11 @@
 //!   the delta — so unchanged regions vanish and only the changed weights light
 //!   up (green grew / red shrank), matching the 2D diff viewer.
 
-use arbvis::{VoxelCell, VoxelGridMut, VoxelRenderCtx, VoxelRenderer};
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
+
+use arbvis::{VoxelBox, VoxelCell, VoxelGridMut, VoxelRenderCtx, VoxelRenderer};
 
 use crate::colormap::CIVIDIS_LUT;
 use crate::format::{Dtype, TensorElementReader};
@@ -51,7 +55,70 @@ fn voxel_rect(fx: u64, fy: u64, bw: u64, bh: u64, rows: u64, cols: u64) -> (u64,
     (r0, r1, c0, c1)
 }
 
-pub struct ArchVoxelRenderer;
+/// Identifies a tensor entity within one build for the streamed-slab face
+/// cache: `(source_idx, byte_start, byte_len, diff_mode)`. The byte span is
+/// unique per entity and `diff_mode` picks the color path; a fresh renderer
+/// (hence a fresh, empty cache) is constructed per run, so keys never collide
+/// across models.
+type FaceKey = (usize, u64, u64, bool);
+
+/// The `"arch"` voxel renderer.
+///
+/// Output is a pure function of the entity, but it carries a small per-entity
+/// **face cache** used only by the streamed slab path
+/// ([`render_window`](VoxelRenderer::render_window)). A tensor's 2D face is
+/// z-invariant — it extrudes unchanged through its whole Z-slab — yet arbvis
+/// bricks the volume in `BRICK`-aligned Z-slabs and dispatches `render_window`
+/// once per slab an entity's bbox intersects. At the default `--grid 2048` a
+/// layer slab is ~32 voxels deep and `BRICK` is 8, so each entity is dispatched
+/// ~4×; the default `render_window` would recompute the face — the expensive
+/// decode+aggregate step — every time. Caching it decodes each face exactly
+/// once and reuses it across the slabs, then drops the entry on the last slab
+/// that touches the entity so live faces never exceed the current slab's set
+/// (mirroring arbvis's own fetch-once byte residency, keeping build RAM
+/// bounded by one slab rather than the whole volume).
+#[derive(Default)]
+pub struct ArchVoxelRenderer {
+    faces: Mutex<HashMap<FaceKey, Arc<Vec<Option<VoxelCell>>>>>,
+}
+
+impl ArchVoxelRenderer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The entity's face box dimensions `(bw, bh)`, or `None` when the box or
+    /// element grid is degenerate (nothing to render).
+    fn face_dims(ctx: &VoxelRenderCtx<'_>, ex: &ArchVoxelExtra) -> Option<(u64, u64)> {
+        let bb = ctx.entity.bbox;
+        let bw = bb.x1.saturating_sub(bb.x0) as u64;
+        let bh = bb.y1.saturating_sub(bb.y0) as u64;
+        if bw == 0 || bh == 0 || bb.z1 <= bb.z0 || ex.rows == 0 || ex.cols == 0 {
+            return None;
+        }
+        Some((bw, bh))
+    }
+
+    /// Decode + aggregate the entity's z-invariant 2D face (magnitude or diff).
+    ///
+    /// One reader over the whole entity span (arbvis fetched it). For fixed
+    /// dtypes `element(k)` is a direct read; for block-quant it dequantizes with
+    /// an internal block cache. Out-of-range indices return NaN, so a
+    /// slightly-off byte span degrades to fewer samples, never a panic.
+    fn compute_face(
+        ctx: &VoxelRenderCtx<'_>,
+        ex: &ArchVoxelExtra,
+        bw: u64,
+        bh: u64,
+    ) -> Vec<Option<VoxelCell>> {
+        let mut reader = TensorElementReader::new(ex.dtype, ctx.bytes);
+        if ctx.diff_mode {
+            diff_face(&mut reader, ex, bw, bh)
+        } else {
+            magnitude_face(&mut reader, ex, bw, bh)
+        }
+    }
+}
 
 impl VoxelRenderer for ArchVoxelRenderer {
     fn id(&self) -> &'static str {
@@ -62,129 +129,86 @@ impl VoxelRenderer for ArchVoxelRenderer {
         let Some(ex) = ctx.entity.extra.downcast_ref::<ArchVoxelExtra>() else {
             return;
         };
-        let bb = ctx.entity.bbox;
-        let bw = bb.x1.saturating_sub(bb.x0) as u64;
-        let bh = bb.y1.saturating_sub(bb.y0) as u64;
-        if bw == 0 || bh == 0 || bb.z1 <= bb.z0 || ex.rows == 0 || ex.cols == 0 {
+        let Some((bw, bh)) = Self::face_dims(ctx, ex) else {
             return;
-        }
-
-        // One reader over the whole entity span (arbvis fetched it). For fixed
-        // dtypes `element(k)` is a direct read; for block-quant it dequantizes
-        // with an internal block cache. Out-of-range indices return NaN, so a
-        // slightly-off byte span degrades to fewer samples, never a panic.
-        let mut reader = TensorElementReader::new(ex.dtype, ctx.bytes);
-
-        let face = if ctx.diff_mode {
-            diff_face(&mut reader, ex, bw, bh)
-        } else {
-            magnitude_face(&mut reader, ex, bw, bh)
         };
-
-        // Extrude the 2D face through every Z plane of the slab.
-        for fy in 0..bh {
-            for fx in 0..bw {
-                let Some(cell) = face[(fy * bw + fx) as usize] else {
-                    continue;
-                };
-                let x = bb.x0 + fx as u32;
-                let y = bb.y0 + fy as u32;
-                for z in bb.z0..bb.z1 {
-                    grid.put(x, y, z, cell);
-                }
-            }
-        }
+        // Dense (non-streamed) path: one call per entity, so decode inline —
+        // the cache would only ever hold and immediately drop a single face.
+        let bb = ctx.entity.bbox;
+        let face = Self::compute_face(ctx, ex, bw, bh);
+        extrude_face(grid, bb, bw, bh, &face, bb.z0, bb.z1);
     }
 
-    // Element count — splits the streamed point-octree budget across tensors so
-    // bigger tensors get proportionally more points.
-    fn point_weight(&self, ctx: &VoxelRenderCtx<'_>) -> u64 {
-        ctx.entity
-            .extra
-            .downcast_ref::<ArchVoxelExtra>()
-            .map(|ex| ex.rows.saturating_mul(ex.cols))
-            .unwrap_or(0)
-    }
-
-    // Emit per-element points so the Points view drills toward one point per
-    // weight on zoom (the LOD octree streams them). A tensor is one flat sheet
-    // at mid-slab — the volume mode extrudes it through depth, but the exact
-    // points place each element on the face: column → x, row → y (matching the
-    // voxel face mapping). Coloring mirrors the voxel renderer.
-    fn render_points(
+    fn render_window(
         &self,
         ctx: &VoxelRenderCtx<'_>,
-        budget: u64,
-        emit: &mut dyn FnMut([f32; 3], [u8; 4]),
+        grid: &mut VoxelGridMut<'_>,
+        z_range: Range<u32>,
     ) {
         let Some(ex) = ctx.entity.extra.downcast_ref::<ArchVoxelExtra>() else {
             return;
         };
-        let (rows, cols) = (ex.rows, ex.cols);
-        let total = rows.saturating_mul(cols);
-        if total == 0 || budget == 0 {
+        let Some((bw, bh)) = Self::face_dims(ctx, ex) else {
             return;
-        }
-        let stride = (total / budget).max(1) as usize;
-        let mut reader = TensorElementReader::new(ex.dtype, ctx.bytes);
-        let pos = |k: usize| -> [f32; 3] {
-            let r = (k as u64 / cols) as f32;
-            let c = (k as u64 % cols) as f32;
-            [(c + 0.5) / cols as f32, (r + 0.5) / rows as f32, 0.5]
+        };
+        let bb = ctx.entity.bbox;
+
+        // The face is z-invariant, so decode it on the first slab that touches
+        // this entity and reuse it for the rest instead of re-decoding per slab.
+        let key: FaceKey = (
+            ctx.entity.source_idx,
+            ctx.entity.byte_start,
+            ctx.entity.byte_len,
+            ctx.diff_mode,
+        );
+        let cached = self.faces.lock().unwrap().get(&key).cloned();
+        let face = match cached {
+            Some(f) => f,
+            None => {
+                let f = Arc::new(Self::compute_face(ctx, ex, bw, bh));
+                self.faces.lock().unwrap().insert(key, f.clone());
+                f
+            }
         };
 
-        if ctx.diff_mode {
-            // U8 signed-delta codes (127 = unchanged, 255 = non-finite), like
-            // diff_face: color by sign, opacity = |Δ|, unchanged weights vanish.
-            let lut = arbvis::color::build_diff_signed_lut();
-            let mut k = 0usize;
-            while (k as u64) < total {
-                let code = reader.element(k);
-                if code.is_finite() {
-                    let code = code as i32;
-                    if code >= 255 {
-                        let c = lut[255].0;
-                        emit(pos(k), [c[0], c[1], c[2], 255]);
-                    } else {
-                        let signed = (code - 127) as f32 / 127.0;
-                        let a = (signed.abs() * 255.0).round() as u8;
-                        if a > 0 {
-                            let idx =
-                                (127.0 + signed * 127.0).round().clamp(0.0, 254.0) as usize;
-                            let c = lut[idx].0;
-                            emit(pos(k), [c[0], c[1], c[2], a]);
-                        }
-                    }
-                }
-                k += stride;
-            }
-        } else {
-            // Plain mode: |value| normalized by the tensor's own max, through
-            // the CIVIDIS magnitude ramp; opacity = normalized magnitude.
-            let mut maxv = 0f32;
-            let mut k = 0usize;
-            while (k as u64) < total {
-                let v = reader.element(k);
-                if v.is_finite() {
-                    maxv = maxv.max(v.abs());
-                }
-                k += stride;
-            }
-            if maxv <= 0.0 {
-                return;
-            }
-            let inv = 1.0 / maxv;
-            let mut k = 0usize;
-            while (k as u64) < total {
-                let v = reader.element(k);
-                if v.is_finite() {
-                    let byte = ((v.abs() * inv).clamp(0.0, 1.0) * 255.0).round() as u8;
-                    if byte > 0 {
-                        let c = CIVIDIS_LUT[byte as usize].0;
-                        emit(pos(k), [c[0], c[1], c[2], byte]);
-                    }
-                }
-                k += stride;
+        // Extrude only the planes in both the entity's slab and this window;
+        // arbvis drops puts outside the window anyway, but clamping here avoids
+        // the wasted iterations.
+        let z0 = bb.z0.max(z_range.start);
+        let z1 = bb.z1.min(z_range.end);
+        extrude_face(grid, bb, bw, bh, &face, z0, z1);
+
+        // The slabs advance front-to-back, so once the window reaches this
+        // entity's last plane it is done — drop its face to keep the cache
+        // bounded to the entities intersecting the current slab.
+        if z_range.end >= bb.z1 {
+            self.faces.lock().unwrap().remove(&key);
+        }
+    }
+}
+
+/// Extrude a computed 2D `face` (indexed `fy * bw + fx`) through the z-planes
+/// `[z0, z1)` of `grid`, writing each non-empty cell down its column. Callers
+/// pass the entity's full `[bb.z0, bb.z1)` span (dense path) or a clamped slab
+/// window (streamed path); out-of-box puts are dropped by the grid.
+fn extrude_face(
+    grid: &mut VoxelGridMut<'_>,
+    bb: VoxelBox,
+    bw: u64,
+    bh: u64,
+    face: &[Option<VoxelCell>],
+    z0: u32,
+    z1: u32,
+) {
+    for fy in 0..bh {
+        for fx in 0..bw {
+            let Some(cell) = face[(fy * bw + fx) as usize] else {
+                continue;
+            };
+            let x = bb.x0 + fx as u32;
+            let y = bb.y0 + fy as u32;
+            for z in z0..z1 {
+                grid.put(x, y, z, cell);
             }
         }
     }
@@ -358,7 +382,7 @@ mod tests {
         let mut cells = vec![VoxelCell::default(); (side as usize).pow(3)];
         {
             let mut grid = VoxelGridMut::new(&mut cells, [side; 3]);
-            ArchVoxelRenderer.render(
+            ArchVoxelRenderer::new().render(
                 &VoxelRenderCtx {
                     entity: &ent,
                     bytes: &bytes,
@@ -377,6 +401,83 @@ mod tests {
             (v(3).r, v(3).g, v(3).b, v(3).a),
             (255, 255, 255, 255),
             "non-finite (255) → opaque white"
+        );
+    }
+
+    /// The streamed slab path drives `render_window` once per BRICK-deep Z-slab
+    /// an entity crosses; the face cache + windowed extrusion must reproduce a
+    /// single full `render()` byte-for-byte, and the cache must drain once the
+    /// slab front passes the entity (so build RAM stays bounded to one slab).
+    #[test]
+    fn windowed_render_matches_full_render_and_evicts() {
+        let (rows, cols) = (8u64, 8u64);
+        // Non-uniform bytes so the face varies across x/y (a flat face would
+        // pass even if the windowing were wrong).
+        let bytes: Vec<u8> = (0..(rows * cols) as usize)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(3))
+            .collect();
+        let side = 16u32;
+        // z-slab 11 voxels deep — deeper than BRICK (8) — so the streamed path
+        // dispatches this entity across two slabs.
+        let ent = VolumeEntity {
+            source_idx: 0,
+            byte_start: 0,
+            byte_len: bytes.len() as u64,
+            bbox: VoxelBox {
+                x0: 1,
+                y0: 2,
+                z0: 3,
+                x1: 6,
+                y1: 7,
+                z1: 14,
+            },
+            renderer_id: "arch",
+            extra: Box::new(ArchVoxelExtra {
+                dtype: Dtype::U8,
+                rows,
+                cols,
+            }),
+        };
+        let ctx = || VoxelRenderCtx {
+            entity: &ent,
+            bytes: &bytes,
+            extent: [side; 3],
+            diff_mode: false,
+        };
+        let tuples = |cells: &[VoxelCell]| -> Vec<(u8, u8, u8, u8)> {
+            cells.iter().map(|c| (c.r, c.g, c.b, c.a)).collect()
+        };
+
+        // Reference: one full render().
+        let mut full = vec![VoxelCell::default(); (side as usize).pow(3)];
+        {
+            let mut g = VoxelGridMut::new(&mut full, [side; 3]);
+            ArchVoxelRenderer::new().render(&ctx(), &mut g);
+        }
+
+        // Windowed: the same entity fed through BRICK-deep slabs, exactly as the
+        // streamed structured build path drives it.
+        let r = ArchVoxelRenderer::new();
+        let brick = 8u32;
+        let mut win = vec![VoxelCell::default(); (side as usize).pow(3)];
+        let mut z0 = 0u32;
+        while z0 < side {
+            let z1 = (z0 + brick).min(side);
+            if ent.bbox.z0 < z1 && ent.bbox.z1 > z0 {
+                let mut g = VoxelGridMut::new(&mut win, [side; 3]);
+                r.render_window(&ctx(), &mut g, z0..z1);
+            }
+            z0 = z1;
+        }
+
+        assert_eq!(
+            tuples(&full),
+            tuples(&win),
+            "windowed slab render must match the full render"
+        );
+        assert!(
+            r.faces.lock().unwrap().is_empty(),
+            "face cache must drain once the slab front passes the entity"
         );
     }
 }

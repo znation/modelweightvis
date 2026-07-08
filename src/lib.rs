@@ -92,7 +92,7 @@ pub fn register_all(registry: &mut Registry, args: &ModelArgs) {
     registry.volume_shapes.push(Arc::new(ArchVolumePlugin));
     registry
         .voxel
-        .register_renderer(Arc::new(ArchVoxelRenderer));
+        .register_renderer(Arc::new(ArchVoxelRenderer::new()));
 
     // Cross-source sidecar enrichment. Runs once per render after every source
     // is built. Fetches `config.json` / `model.safetensors.index.json` next to
