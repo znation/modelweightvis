@@ -129,7 +129,7 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 [[package]]
 name = "arbvis"
 version = "0.1.0"
-source = "git+https://github.com/znation/arbvis?rev=b8d1e1852b28331f447ff78bac68f42bcb25a16c#b8d1e1852b28331f447ff78bac68f42bcb25a16c"
+source = "git+https://github.com/znation/arbvis?rev=b547f2af13b7115647912d98e64849749e9ad645#b547f2af13b7115647912d98e64849749e9ad645"
 dependencies = [
  "anyhow",
  "async-channel",
