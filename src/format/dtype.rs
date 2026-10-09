@@ -468,9 +468,20 @@ impl Dtype {
     /// `orig_start_elem` elements into it before pairing. For safetensors
     /// fixed-stride buffers pass `0`.
     ///
+    /// `orig_sc`/`mod_sc` carry optional AWQ/GPTQ sidecar context (borrowed
+    /// whole-tensor scales/qzeros buffers, as fetched by the caller); they
+    /// are only consulted when that side's dtype is packed, letting packed
+    /// sides dequantise instead of decoding to NaN sentinels.
+    /// `orig_anchor`/`mod_anchor` are the absolute `(row, col)` of each
+    /// buffer's first element within its tensor — for the row-aligned
+    /// fetches the diff source issues, `col` is 0 and `row` is the fetched
+    /// buffer's first row. Non-packed sides ignore them; pass `None` and
+    /// `(0, 0)` for plain buffers.
+    ///
     /// Encoding: 127 = no change, 128–254 = increased, 0–126 = decreased,
     /// 255 = non-finite.
-    pub fn diff_to_u8(
+    #[allow(clippy::too_many_arguments)]
+    pub fn diff_to_u8_sidecars(
         self,
         orig: &[u8],
         orig_start_elem: usize,
@@ -480,6 +491,10 @@ impl Dtype {
         metric: DiffMetric,
         scale_orig: f32,
         elem_count: usize,
+        orig_sc: Option<PackedSidecarRefs<'_>>,
+        orig_anchor: (usize, usize),
+        mod_sc: Option<PackedSidecarRefs<'_>>,
+        mod_anchor: (usize, usize),
     ) -> Vec<u8> {
         let (rms_denom, log_min, log_max) = diff_metric_norms(scale_orig);
         // Fixed-stride fast path: chunked little-endian reads instead of the
@@ -517,7 +532,13 @@ impl Dtype {
             }
         }
         let mut o_reader = TensorElementReader::new(self, orig);
+        if let Some(sc) = orig_sc {
+            o_reader = o_reader.with_sidecars(sc).with_anchor(orig_anchor.0, orig_anchor.1);
+        }
         let mut m_reader = TensorElementReader::new(mod_dtype, mod_);
+        if let Some(sc) = mod_sc {
+            m_reader = m_reader.with_sidecars(sc).with_anchor(mod_anchor.0, mod_anchor.1);
+        }
         let mut out = Vec::with_capacity(elem_count);
         for k in 0..elem_count {
             let o = o_reader.element(orig_start_elem + k);
@@ -1200,7 +1221,7 @@ mod tests {
     fn diff_rms_zero_delta_paints_black() {
         let o = f32_bytes(&[0.1, -0.2, 0.3]);
         let m = o.clone();
-        let out = Dtype::F32.diff_to_u8(&o, 0, Dtype::F32, &m, 0, DiffMetric::Rms, 0.1, 3);
+        let out = Dtype::F32.diff_to_u8_sidecars(&o, 0, Dtype::F32, &m, 0, DiffMetric::Rms, 0.1, 3, None, (0, 0), None, (0, 0));
         assert_eq!(out, vec![127, 127, 127]);
     }
 
@@ -1209,7 +1230,7 @@ mod tests {
         let rms: f32 = 0.04;
         let o = f32_bytes(&[0.1, 0.1]);
         let m = f32_bytes(&[0.1 + 0.5 * rms, 0.1 - 0.5 * rms]);
-        let out = Dtype::F32.diff_to_u8(&o, 0, Dtype::F32, &m, 0, DiffMetric::Rms, rms, 2);
+        let out = Dtype::F32.diff_to_u8_sidecars(&o, 0, Dtype::F32, &m, 0, DiffMetric::Rms, rms, 2, None, (0, 0), None, (0, 0));
         assert_eq!(out, vec![254, 0]);
     }
 
@@ -1218,7 +1239,7 @@ mod tests {
         let o = f32_bytes(&[0.1, f32::NAN, 0.1]);
         let m = f32_bytes(&[0.1, 0.1, f32::INFINITY]);
         for metric in [DiffMetric::Rms, DiffMetric::AbsLog, DiffMetric::Exact] {
-            let out = Dtype::F32.diff_to_u8(&o, 0, Dtype::F32, &m, 0, metric, 0.1, 3);
+            let out = Dtype::F32.diff_to_u8_sidecars(&o, 0, Dtype::F32, &m, 0, metric, 0.1, 3, None, (0, 0), None, (0, 0));
             assert_eq!(out[0], 127, "{metric:?} same value");
             assert_eq!(out[1], 255, "{metric:?} NaN in orig");
             assert_eq!(out[2], 255, "{metric:?} Inf in mod");
@@ -1294,8 +1315,9 @@ mod tests {
                 // Force the reader fallback by requesting more elements than
                 // the modified buffer covers; the fast path must decline and
                 // both must agree.
-                let got = Dtype::F32.diff_to_u8(
+                let got = Dtype::F32.diff_to_u8_sidecars(
                     &orig, 0, Dtype::F32, &modd, 0, metric, 1.0, elem_count,
+                    None, (0, 0), None, (0, 0),
                 );
                 assert_eq!(got.len(), elem_count, "len n={elem_count}");
                 for (k, &byte) in got.iter().enumerate() {
@@ -1308,8 +1330,135 @@ mod tests {
         }
         // Fully covered range: exact metric on equal pixels → 127 (mid-grey).
         let a = f32_bytes(&[1.0, 2.0]);
-        let got = Dtype::F32.diff_to_u8(&a, 0, Dtype::F32, &a, 0, DiffMetric::Exact, 1.0, 2);
+        let got = Dtype::F32.diff_to_u8_sidecars(&a, 0, Dtype::F32, &a, 0, DiffMetric::Exact, 1.0, 2, None, (0, 0), None, (0, 0));
         assert_eq!(got, vec![127u8, 127]);
+    }
+
+    #[test]
+    fn diff_to_u8_sidecars_matches_dequantized_ground_truth() {
+        // 4-row × 8-col packed int4 tensor (one int32 slot per row),
+        // symmetric (no zeros), scale 1.0 → element (r, c) dequantises to
+        // its int value. orig holds c+1, mod holds c+4, so every element's
+        // delta is +3.
+        let row_word = |add: u32| {
+            (0..8u32)
+                .map(|c| (c + 1 + add) << (4 * c))
+                .fold(0u32, |a, v| a | v)
+        };
+        let qweight: Vec<u8> = (0..4u32)
+            .flat_map(|_| row_word(0).to_le_bytes())
+            .collect();
+        let mod_qweight: Vec<u8> = (0..4u32)
+            .flat_map(|_| row_word(3).to_le_bytes())
+            .collect();
+        let scales: Vec<u8> = std::iter::repeat(1.0f32.to_le_bytes())
+            .take(8)
+            .flatten()
+            .collect();
+        let refs = PackedSidecarRefs {
+            scales: &scales,
+            scales_dtype: Dtype::F32,
+            zeros: None,
+            zeros_dtype: Dtype::Unknown,
+            cols: 8,
+        };
+
+        // Ground truth: dequantise both sides, diff as f32 buffers.
+        let o_f32 = decode_prefix_f32_sidecars(Dtype::Int4Packed, &qweight, 32, Some(refs));
+        let m_f32 = decode_prefix_f32_sidecars(Dtype::Int4Packed, &mod_qweight, 32, Some(refs));
+        let expected = Dtype::F32.diff_to_u8_sidecars(
+            &o_f32.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            0,
+            Dtype::F32,
+            &m_f32.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            0,
+            DiffMetric::Exact,
+            1.0,
+            32,
+            None, (0, 0), None, (0, 0),
+        );
+        let got = Dtype::Int4Packed.diff_to_u8_sidecars(
+            &qweight,
+            0,
+            Dtype::Int4Packed,
+            &mod_qweight,
+            0,
+            DiffMetric::Exact,
+            1.0,
+            32,
+            Some(refs),
+            (0, 0),
+            Some(refs),
+            (0, 0),
+        );
+        assert_eq!(got, expected);
+        // All deltas are +3 → every byte is the same non-sentinel value.
+        assert!(!got.iter().any(|&b| b == 255));
+        assert!(got.windows(2).all(|w| w[0] == w[1]));
+
+        // Without sidecars the packed sides decode to NaN sentinels.
+        let got = Dtype::Int4Packed.diff_to_u8_sidecars(
+            &qweight, 0, Dtype::Int4Packed, &mod_qweight, 0, DiffMetric::Exact, 1.0, 32,
+            None, (0, 0), None, (0, 0),
+        );
+        assert_eq!(got, vec![255u8; 32]);
+    }
+
+    #[test]
+    fn diff_to_u8_sidecars_row_aligned_fetch_matches_full_buffer() {
+        // Same fixture as above; simulate the diff source's row-aligned
+        // partial fetch: rows 1..4 of the qweight, starting mid-row at
+        // absolute element 9, anchored at (row 1, col 0). Must byte-match
+        // the same absolute range decoded from the whole-tensor buffers.
+        let qweight: Vec<u8> = (0..4u32)
+            .flat_map(|_| {
+                (0..8u32)
+                    .map(|c| (c + 1) << (4 * c))
+                    .fold(0u32, |a, v| a | v)
+                    .to_le_bytes()
+            })
+            .collect();
+        let mod_qweight: Vec<u8> = (0..4u32)
+            .flat_map(|_| {
+                (0..8u32)
+                    .map(|c| (c + 4) << (4 * c))
+                    .fold(0u32, |a, v| a | v)
+                    .to_le_bytes()
+            })
+            .collect();
+        let scales: Vec<u8> = std::iter::repeat(1.0f32.to_le_bytes())
+            .take(8)
+            .flatten()
+            .collect();
+        let refs = PackedSidecarRefs {
+            scales: &scales,
+            scales_dtype: Dtype::F32,
+            zeros: None,
+            zeros_dtype: Dtype::Unknown,
+            cols: 8,
+        };
+        let expected = Dtype::Int4Packed.diff_to_u8_sidecars(
+            &qweight, 9, Dtype::Int4Packed, &mod_qweight, 9, DiffMetric::AbsLog, 1.0, 6,
+            Some(refs), (0, 0), Some(refs), (0, 0),
+        );
+        // Row-aligned fetch: buffer starts at byte 4 (row 1), covering
+        // rows 1..4; requested start element 9 is elem_off 1 into it,
+        // anchor (1, 0).
+        let got = Dtype::Int4Packed.diff_to_u8_sidecars(
+            &qweight[4..],
+            1,
+            Dtype::Int4Packed,
+            &mod_qweight[4..],
+            1,
+            DiffMetric::AbsLog,
+            1.0,
+            6,
+            Some(refs),
+            (1, 0),
+            Some(refs),
+            (1, 0),
+        );
+        assert_eq!(got, expected);
     }
 
     #[test]

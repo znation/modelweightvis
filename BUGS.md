@@ -31,9 +31,15 @@ unwired — packed-int tensors paint as NaN sentinels here:
     tumwater(improve) 2026-10-09: `decode_prefix_f32_sidecars` in
     `src/format/dtype.rs` + the `build_moe_cka_sources` fetch loop now thread
     scales/qzeros into the CKA projection;
-- the diff source
-  builders (`TensorDiffSource`, `diff_to_u8`) — both have full `Data` and
-  `TensorMeta` in scope, so each is an independent, small wire-up.
+- ~~the diff source
+  builders (`TensorDiffSource`, `diff_to_u8`)~~ — fixed by
+  tumwater(improve) 2026-10-09: `Dtype::diff_to_u8_sidecars` in
+  `src/format/dtype.rs` takes optional per-side `PackedSidecarRefs` +
+  anchors; `TensorDiffSource` now carries each side's
+  `TensorMeta::packed_sidecars`, and its fetch path grabs the qweight
+  row-aligned (`packed_sidecar_fetch`) with the whole scales/qzeros
+  buffers so packed-int diffs dequantise instead of painting NaN
+  sentinels (255).
 
 Fix: mirror the decode_tensor_to_f32 pattern (fetch sidecar ranges, attach
 via `with_sidecars` plus `with_anchor` where the buffer doesn't start at

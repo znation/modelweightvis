@@ -203,6 +203,13 @@ pub struct TensorDiffSource {
     pub metric: format::DiffMetric,
     pub scale_orig: f32,
     pub byte_size: u64,
+    /// AWQ/GPTQ fused sidecar ranges for each side (`TensorMeta::
+    /// packed_sidecars`). `None` for non-packed dtypes or quant triples
+    /// without fused sidecars; when a side's dtype is packed and this is
+    /// `Some`, the per-fetch path also fetches scales/qzeros so the diff
+    /// dequantises real values instead of NaN sentinels.
+    pub orig_sidecars: Option<format::PackedSidecars>,
+    pub mod_sidecars: Option<format::PackedSidecars>,
 }
 
 impl CustomSource for TensorDiffSource {
@@ -223,7 +230,11 @@ impl CustomSource for TensorDiffSource {
         let mod_dtype = self.mod_dtype;
         let metric = self.metric;
         let scale_orig = self.scale_orig;
+        let orig_sidecars = self.orig_sidecars.clone();
+        let mod_sidecars = self.mod_sidecars.clone();
         Ok(Data::LazyDiff(Arc::new(move |start: u64, len: usize| {
+            let orig_sidecars = orig_sidecars.clone();
+            let mod_sidecars = mod_sidecars.clone();
             let orig = Arc::clone(&orig);
             let mod_ = Arc::clone(&mod_);
             Box::pin(async move {
@@ -240,12 +251,130 @@ impl CustomSource for TensorDiffSource {
                     .fetch_range(orig_start + o_byte_off, o_byte_len)
                     .await?;
                 let mb = mod_.fetch_range(mod_start + m_byte_off, m_byte_len).await?;
-                Ok(orig_dtype.diff_to_u8(
+                // Sidecar-aware diff for packed-int (AWQ/GPTQ) sides: the
+                // qweight fetch above snaps to pack-slot boundaries, which
+                // can land mid-row, so refetch row-aligned and pass the
+                // buffer's first row as the sidecar anchor. Non-packed
+                // sides keep the block-aligned fetch and no sidecars.
+                let o_packed = orig_sidecars
+                    .as_ref()
+                    .filter(|_| matches!(orig_dtype.stride(), format::ElementStride::Packed { .. }));
+                let (o_scales, o_zeros, o_anchor, o_elem_off, ob) =
+                    match packed_sidecar_fetch(
+                        &orig,
+                        orig_start,
+                        o_packed,
+                        orig_dtype,
+                        start,
+                        len as u64,
+                    )
+                    .await?
+                    {
+                        Some(t) => t,
+                        None => (Vec::new(), None, (0, 0), o_elem_off, ob),
+                    };
+                let o_sc = o_packed.map(|sc| format::PackedSidecarRefs {
+                    scales: &o_scales,
+                    scales_dtype: sc.scales_dtype,
+                    zeros: o_zeros.as_deref(),
+                    zeros_dtype: sc.zeros_dtype,
+                    cols: sc.cols,
+                });
+                let m_packed = mod_sidecars
+                    .as_ref()
+                    .filter(|_| matches!(mod_dtype.stride(), format::ElementStride::Packed { .. }));
+                let (m_scales, m_zeros, m_anchor, m_elem_off, mb) =
+                    match packed_sidecar_fetch(
+                        &mod_,
+                        mod_start,
+                        m_packed,
+                        mod_dtype,
+                        start,
+                        len as u64,
+                    )
+                    .await?
+                    {
+                        Some(t) => t,
+                        None => (Vec::new(), None, (0, 0), m_elem_off, mb),
+                    };
+                let m_sc = m_packed.map(|sc| format::PackedSidecarRefs {
+                    scales: &m_scales,
+                    scales_dtype: sc.scales_dtype,
+                    zeros: m_zeros.as_deref(),
+                    zeros_dtype: sc.zeros_dtype,
+                    cols: sc.cols,
+                });
+                Ok(orig_dtype.diff_to_u8_sidecars(
                     &ob, o_elem_off, mod_dtype, &mb, m_elem_off, metric, scale_orig, len,
+                    o_sc, o_anchor, m_sc, m_anchor,
                 ))
             })
         })))
     }
+}
+
+/// Row-aligned qweight fetch plus the owned scales/qzeros buffers for one
+/// packed-int side, or `None` when the side is not a packed dtype with
+/// fused sidecars (the caller then keeps its block-aligned fetch and builds
+/// no sidecar refs).
+///
+/// Row alignment (rather than `block_aligned_byte_range`'s slot alignment)
+/// makes the buffer start on a whole row, so the returned sidecar anchor is
+/// simply the buffer's first row with column 0 — the element offsets stay
+/// exact for [`format::Dtype::diff_to_u8_sidecars`]. The scales/qzeros
+/// buffers are fetched whole (they cover the entire tensor and are small
+/// relative to the qweight), matching the tile path's per-region sidecar
+/// fetches.
+#[allow(clippy::type_complexity)]
+async fn packed_sidecar_fetch(
+    data: &Data,
+    tensor_start: u64,
+    sidecars: Option<&format::PackedSidecars>,
+    dtype: format::Dtype,
+    start: u64,
+    len: u64,
+) -> anyhow::Result<Option<(Vec<u8>, Option<Vec<u8>>, (usize, usize), usize, Vec<u8>)>> {
+    use format::ElementStride;
+    let Some(sc) = sidecars else {
+        return Ok(None);
+    };
+    let ElementStride::Packed {
+        bits,
+        pack_dtype_bytes,
+        ..
+    } = dtype.stride()
+    else {
+        return Ok(None);
+    };
+    if bits == 0 || sc.cols == 0 {
+        return Ok(None);
+    }
+    let elems_per_slot = (pack_dtype_bytes as u64 * 8) / bits as u64;
+    if elems_per_slot == 0 {
+        return Ok(None);
+    }
+    let cols = sc.cols as u64;
+    let row_bytes = (cols / elems_per_slot) * pack_dtype_bytes as u64;
+    if row_bytes == 0 {
+        return Ok(None);
+    }
+    let first_row = start / cols;
+    let last_row_excl = (start + len).div_ceil(cols);
+    let byte_off = tensor_start + first_row * row_bytes;
+    let byte_len = ((last_row_excl - first_row) * row_bytes) as usize;
+    let elem_off = (start - first_row * cols) as usize;
+    let bytes = data.fetch_range(byte_off, byte_len).await?;
+    let scales = data
+        .fetch_range(
+            sc.scales_start,
+            (sc.scales_end - sc.scales_start) as usize,
+        )
+        .await?;
+    let zeros = match (sc.zeros_start, sc.zeros_end) {
+        (Some(zs), Some(ze)) => Some(data.fetch_range(zs, (ze - zs) as usize).await?),
+        _ => None,
+    };
+    Ok(Some((scales, zeros, (first_row as usize, 0), elem_off, bytes)))
 }
 
 /// Per-panel tag attached to each `--moe-summary` source. One source per
@@ -1310,6 +1439,8 @@ async fn build_multi_safetensors_diff_sources_inner(
                 metric,
                 scale_orig: *scale_orig,
                 byte_size: nelem,
+                orig_sidecars: orig_t.packed_sidecars.clone(),
+                mod_sidecars: mod_t.packed_sidecars.clone(),
             })),
             byte_size: nelem,
             name_override: Some(orig_t.label()),
