@@ -27,14 +27,36 @@ pub fn cfg_gqa_geometry(
     n_heads: usize,
     hidden_size: usize,
 ) -> anyhow::Result<(usize, usize)> {
-    let head_dim = config
-        .head_dim
-        .map(|d| d as usize)
-        .unwrap_or(hidden_size / n_heads);
+    anyhow::ensure!(
+        n_heads > 0,
+        "config num_attention_heads is 0; expected a positive head count"
+    );
+    let head_dim = match config.head_dim.map(|d| d as usize) {
+        Some(d) => {
+            anyhow::ensure!(
+                d > 0,
+                "config head_dim is 0; expected a positive head dimension"
+            );
+            d
+        }
+        None => {
+            anyhow::ensure!(
+                hidden_size % n_heads == 0,
+                "config omits head_dim and hidden_size ({hidden_size}) is not divisible by \
+                 num_attention_heads ({n_heads}); cannot derive head_dim"
+            );
+            hidden_size / n_heads
+        }
+    };
     let n_kv_heads = config
         .num_key_value_heads
         .map(|n| n as usize)
         .unwrap_or(n_heads);
+    anyhow::ensure!(
+        n_kv_heads > 0 && n_kv_heads <= n_heads,
+        "config num_key_value_heads ({n_kv_heads}) must be between 1 and \
+         num_attention_heads ({n_heads})"
+    );
     Ok((head_dim, n_kv_heads))
 }
 
@@ -505,5 +527,45 @@ mod tests {
         // cell (diagonal + off-diagonal) of the 2×2 block is 1.
         let base = e * e;
         assert!(c[base..base + e * e].iter().all(|&v| v == 1));
+    }
+
+    #[test]
+    fn gqa_geometry_derives_head_dim_and_kv_heads() {
+        // Plain MHA: no head_dim, no num_key_value_heads → hidden/heads, n_heads.
+        let (hd, kv) = cfg_gqa_geometry(&ModelConfig::default(), 8, 4096).unwrap();
+        assert_eq!((hd, kv), (512, 8));
+        // Explicit overrides are honored.
+        let cfg = ModelConfig {
+            head_dim: Some(128),
+            num_key_value_heads: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(cfg_gqa_geometry(&cfg, 8, 4096).unwrap(), (128, 4));
+    }
+
+    #[test]
+    fn gqa_geometry_rejects_impossible_configs() {
+        // n_heads = 0 (division by zero / meaningless geometry).
+        assert!(cfg_gqa_geometry(&ModelConfig::default(), 0, 4096).is_err());
+        // head_dim = 0.
+        let cfg = ModelConfig {
+            head_dim: Some(0),
+            ..Default::default()
+        };
+        assert!(cfg_gqa_geometry(&cfg, 8, 4096).is_err());
+        // hidden_size not divisible by n_heads and head_dim omitted.
+        assert!(cfg_gqa_geometry(&ModelConfig::default(), 5, 4096).is_err());
+        // More kv heads than attention heads.
+        let cfg = ModelConfig {
+            num_key_value_heads: Some(16),
+            ..Default::default()
+        };
+        assert!(cfg_gqa_geometry(&cfg, 8, 4096).is_err());
+        // num_key_value_heads = 0.
+        let cfg = ModelConfig {
+            num_key_value_heads: Some(0),
+            ..Default::default()
+        };
+        assert!(cfg_gqa_geometry(&cfg, 8, 4096).is_err());
     }
 }
