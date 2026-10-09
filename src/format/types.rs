@@ -73,6 +73,33 @@ pub fn validate_tensor_offsets(tensors: &[TensorMeta], file_size: u64) -> anyhow
                 file_size
             );
         }
+        // AWQ/GPTQ fused tensors carry their scales/qzeros byte ranges in
+        // `packed_sidecars`. The fusion step removes the sidecar entries from
+        // the tensor list before validation, so this is the only place their
+        // ranges are checked against the real file size.
+        if let Some(sc) = &t.packed_sidecars {
+            if sc.scales_end > file_size {
+                anyhow::bail!(
+                    "file is truncated — tensor '{}' declares scales bytes {}..{} but \
+                     the data is only {} bytes (interrupted download or copy?)",
+                    t.name,
+                    sc.scales_start,
+                    sc.scales_end,
+                    file_size
+                );
+            }
+            if let Some(ze) = sc.zeros_end {
+                if ze > file_size {
+                    anyhow::bail!(
+                        "file is truncated — tensor '{}' declares qzeros bytes ending at {} \
+                         but the data is only {} bytes (interrupted download or copy?)",
+                        t.name,
+                        ze,
+                        file_size
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -189,6 +216,74 @@ mod tests {
     fn label_scalar_has_empty_axis_list() {
         assert_eq!(meta(&[]).label(), "t [F32, ]");
     }
+
+    fn mk_t(name: &str, start: u64, end: u64) -> TensorMeta {
+        TensorMeta {
+            name: name.to_string(),
+            dtype: Dtype::Int4Packed,
+            shape: vec![4096, 4096],
+            file_start: start,
+            file_end: end,
+            packed_sidecars: None,
+        }
+    }
+
+    fn sidecars(scales_end: u64, zeros_end: Option<u64>) -> PackedSidecars {
+        PackedSidecars {
+            scales_start: 1_000_000,
+            scales_end,
+            scales_dtype: Dtype::F16,
+            zeros_start: zeros_end.map(|_| 2_000_000),
+            zeros_end,
+            zeros_dtype: Dtype::I32,
+            cols: 4096,
+        }
+    }
+
+    #[test]
+    fn validate_offsets_rejects_sidecar_past_eof() {
+        // The fused qweight entry is in-bounds, but the scales range was
+        // declared past EOF (hostile header or truncated download). The
+        // sidecar entries were consumed at fusion time, so this validator is
+        // the only boundary the scales range crosses before fetch_range.
+        let mut t = mk_t("w", 0, 1_000_000);
+        t.packed_sidecars = Some(sidecars(3_000_000, Some(2_500_000)));
+        let err = validate_tensor_offsets(&[t], 2_000_000).unwrap_err();
+        assert!(format!("{err:#}").contains("scales"));
+    }
+
+    #[test]
+    fn validate_offsets_rejects_qzeros_past_eof() {
+        let mut t = mk_t("w", 0, 1_000_000);
+        t.packed_sidecars = Some(sidecars(1_500_000, Some(9_999_999)));
+        let err = validate_tensor_offsets(&[t], 2_000_000).unwrap_err();
+        assert!(format!("{err:#}").contains("qzeros"));
+    }
+
+    #[test]
+    fn validate_offsets_accepts_in_bounds_sidecars() {
+        let mut t = mk_t("w", 0, 1_000_000);
+        t.packed_sidecars = Some(sidecars(1_500_000, Some(2_000_000)));
+        assert!(validate_tensor_offsets(std::slice::from_ref(&t), 2_000_000).is_ok());
+    }
+
+    #[test]
+    fn validate_ranges_strips_sidecar_past_eof_but_keeps_tensor() {
+        let mut t = mk_t("w", 0, 1_000_000);
+        t.packed_sidecars = Some(sidecars(3_000_000, Some(3_500_000)));
+        let mut v = vec![t];
+        let dropped = validate_tensor_ranges(&mut v, 2_000_000);
+        assert_eq!(dropped, 0, "the qweight entry itself is in-bounds");
+        assert!(v[0].packed_sidecars.is_none());
+    }
+
+    #[test]
+    fn validate_ranges_keeps_in_bounds_sidecar() {
+        let mut v = vec![mk_t("w", 0, 1_000_000)];
+        v[0].packed_sidecars = Some(sidecars(1_500_000, None));
+        validate_tensor_ranges(&mut v, 2_000_000);
+        assert!(v[0].packed_sidecars.is_some());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -237,5 +332,24 @@ pub fn validate_tensor_ranges(tensors: &mut Vec<TensorMeta>, file_size: u64) -> 
         }
         in_bounds
     });
+    // Sidecar ranges cannot be range-checked at fusion time (the sidecar
+    // entries were consumed there), and the fused qweight entry can be
+    // in-bounds while its scales/qzeros are not — strip the sidecar
+    // reference rather than the whole tensor; the renderer paints NaN
+    // sentinels without sidecars, the same as an incomplete quant triple.
+    for t in tensors.iter_mut() {
+        if let Some(sc) = &t.packed_sidecars {
+            let zeros_bad = sc.zeros_end.map_or(false, |ze| ze > file_size);
+            if sc.scales_end > file_size || zeros_bad {
+                log::warn!(
+                    "dropping packed-int sidecar ranges for tensor '{}' — declared \
+                     bytes fall outside file size {}",
+                    t.name,
+                    file_size
+                );
+                t.packed_sidecars = None;
+            }
+        }
+    }
     before - tensors.len()
 }
