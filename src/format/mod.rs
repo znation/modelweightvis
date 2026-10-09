@@ -31,6 +31,7 @@ pub use dtype::{
 pub use name_map::to_canonical;
 pub use types::{
     ModelInfo, PackedSidecars, TensorMeta, ABS_LOG_MAX, ABS_LOG_MIN, K_RMS_SAT, RMS_FLOOR,
+    validate_tensor_offsets,
 };
 
 /// Per-element delta encoding for a tensor `--diff`. Selected by the

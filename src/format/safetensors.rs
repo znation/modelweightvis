@@ -296,31 +296,10 @@ pub fn build_color_ranges(
     ranges
 }
 
-/// Validate that every tensor's absolute byte range fits within the file.
-///
-/// A truncated file (interrupted download or copy) can carry a fully valid
-/// header while its tensor data is cut off; without this check the header
-/// parse succeeds and later per-tensor reads run past the end of the file.
-/// `file_size` is the real length of the data the header was parsed from.
-pub fn validate_offsets(tensors: &[TensorMeta], file_size: u64) -> anyhow::Result<()> {
-    for t in tensors {
-        if t.file_end > file_size {
-            anyhow::bail!(
-                "safetensors: file is truncated — tensor '{}' needs bytes {}..{} \
-                 but the data is only {} bytes (interrupted download or copy?)",
-                t.name,
-                t.file_start,
-                t.file_end,
-                file_size
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::validate_tensor_offsets as validate_offsets;
 
     #[test]
     fn parse_header_rejects_reversed_data_offsets() {

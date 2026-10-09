@@ -412,7 +412,7 @@ pub fn load_model_info(
             header_buf[..8].copy_from_slice(&size_buf);
             f.read_exact(&mut header_buf[8..])?;
             let (tensors, header_end) = format::safetensors::parse_header(&header_buf)?;
-            format::safetensors::validate_offsets(&tensors, file_size)?;
+            format::validate_tensor_offsets(&tensors, file_size)?;
             let color_ranges =
                 format::safetensors::build_color_ranges(&tensors, header_end, file_size);
             Ok(ModelInfo {
@@ -427,6 +427,10 @@ pub fn load_model_info(
             // exactly as far as the tensor-info table (see
             // `parse_gguf_header_local`).
             let header = parse_gguf_header_local(path)?;
+            // The mmap-backed header parse succeeds on a truncated file
+            // (the header fits); catch tensors whose data is cut off before
+            // a later per-tensor read faults past the mmap's end.
+            format::validate_tensor_offsets(&header.tensors, file_size)?;
             let color_ranges = format::gguf::build_color_ranges(
                 &header.tensors,
                 header.tensor_data_offset,
@@ -469,11 +473,23 @@ pub async fn load_model_info_async(
     byte_size: u64,
     fmt: SourceFormat,
 ) -> anyhow::Result<ModelInfo> {
-    let (tensors, header_end) = fetch_model_header(data, fmt).await?;
-    let mut tensors = tensors;
-    if fmt == SourceFormat::Safetensors {
-        format::safetensors::validate_tensor_ranges(&mut tensors, byte_size);
+    let (mut tensors, header_end, dropped) = fetch_model_header(data, fmt).await?;
+    // Main's `validate_tensor_ranges` guard inside `fetch_model_header` drops
+    // hostile safetensors entries with a warning so per-tile slicing can't
+    // panic; but for the up-front model-info load a dropped entry means the
+    // declared data extends past the real file — an interrupted or corrupt
+    // download — so reject it outright rather than advertise a hollow tensor
+    // list. GGUF and pickle carry no such drop path; their truncation is
+    // caught by the offset check below against the true remote length.
+    if dropped > 0 {
+        anyhow::bail!(
+            "truncated safetensors: {dropped} tensor(s) declare byte ranges past the file size"
+        );
     }
+    // The same truncation fault as the local path applies to remote sources:
+    // `byte_size` is the remote file's true length, so offsets past it mean
+    // an interrupted download and later per-tile range fetches would fail.
+    format::validate_tensor_offsets(&tensors, byte_size)?;
     let color_ranges = match fmt {
         SourceFormat::Safetensors => {
             format::safetensors::build_color_ranges(&tensors, header_end, byte_size)
@@ -494,7 +510,7 @@ pub async fn load_model_info_async(
 async fn fetch_model_header(
     data: &Data,
     fmt: SourceFormat,
-) -> anyhow::Result<(Vec<format::TensorMeta>, u64)> {
+) -> anyhow::Result<(Vec<format::TensorMeta>, u64, usize)> {
     match fmt {
         SourceFormat::Safetensors => {
             let size_bytes = data.fetch_range(0, 8).await?;
@@ -516,13 +532,15 @@ async fn fetch_model_header(
             // when the render path slices the backing bytes at the declared
             // offsets.
             if data.is_local() && !matches!(data, Data::ZeroFill) {
-                format::safetensors::validate_tensor_ranges(&mut tensors, data.len() as u64);
+                let dropped =
+                    format::safetensors::validate_tensor_ranges(&mut tensors, data.len() as u64);
+                return Ok((tensors, header_end, dropped));
             }
-            Ok((tensors, header_end))
+            Ok((tensors, header_end, 0))
         }
         SourceFormat::Gguf => {
             let header = fetch_gguf_header(data).await?;
-            Ok((header.tensors, header.tensor_data_offset))
+            Ok((header.tensors, header.tensor_data_offset, 0))
         }
         SourceFormat::Pickle => {
             // The zip end-of-central-directory record lives at the END of a
@@ -535,7 +553,6 @@ async fn fetch_model_header(
         }
     }
 }
-
 // === extracted from arbvis::data (prepare_diff_sources_from_http,strip_prefix_components,find_strip_depths,TensorMatch,match_under_strip_depths,find_matched_tensor_pairs,fetch_rms_estimates,build_multi_safetensors_diff_sources_inner,build_multi_safetensors_diff_sources,build_multi_safetensors_diff_sources_from_http,build_safetensors_diff_sources,SourceMeta,try_load_source_meta,load_meta_for_sources,fetch_hf_sidecar) ===
 /// Build diff sources from two repos listed as HTTP specs (no download).
 ///
@@ -1089,7 +1106,7 @@ async fn build_multi_safetensors_diff_sources_inner(
                     async move {
                         let r = fetch_model_header(&d, fmt)
                             .await
-                            .map(|(t, _)| t)
+                            .map(|(t, _, _)| t)
                             .with_context(|| format!("reading {fmt:?} header for {side} file {i}"));
                         if let Some(pb) = pb.as_ref() {
                             pb.inc(1);
@@ -1829,7 +1846,7 @@ async fn open_moe_model_sources(input: &str, stream: bool) -> anyhow::Result<Loa
                 async move {
                     let r = fetch_model_header(&d, fmt)
                         .await
-                        .map(|(t, _)| t)
+                        .map(|(t, _, _)| t)
                         .with_context(|| format!("reading {fmt:?} header for moe file {i}"));
                     if let Some(pb) = pb.as_ref() {
                         pb.inc(1);
@@ -3176,6 +3193,58 @@ mod tests {
         std::fs::write(&p, &buf).unwrap();
         let err =
             load_model_info(&p, buf.len() as u64, SourceFormat::Safetensors).unwrap_err();
+        assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+    }
+
+    /// Minimal valid GGUF v2 header (magic/version/counts, zero KVs, one
+    /// F32 tensor of 1000 elements) followed by only 4 of the 4000 bytes of
+    /// tensor data the info table promises.
+    fn truncated_gguf_bytes() -> Vec<u8> {
+        let mut buf = 0x46554747u32.to_le_bytes().to_vec(); // magic "GGUF"
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version
+        buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+        // Tensor info: name "w", 1 dim of 1000, dtype F32 (0), offset 0.
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.push(b'w');
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1000u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        while buf.len() % 32 != 0 {
+            buf.push(0); // alignment padding so tensor_data_offset is reachable
+        }
+        buf.extend_from_slice(&[0u8; 4]); // tensor data, cut off after 4 bytes
+        buf
+    }
+
+    #[test]
+    fn load_model_info_rejects_truncated_gguf() {
+        // The mmap-backed header parse succeeds (the header itself fits);
+        // without the offset validation a later per-tensor read would fault
+        // past the end of the mmap.
+        let buf = truncated_gguf_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("model.gguf");
+        std::fs::write(&p, &buf).unwrap();
+        let err = load_model_info(&p, buf.len() as u64, SourceFormat::Gguf).unwrap_err();
+        assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn load_model_info_async_rejects_truncated_header_source() {
+        // Remote sources report the true file size (byte_size) but only the
+        // header is fetched up-front; a header-valid, data-truncated file
+        // must be rejected before any per-tile fetch is attempted.
+        let header =
+            br#"{"w":{"dtype":"F32","shape":[1000],"data_offsets":[0,4000]}}"#;
+        let mut buf = (header.len() as u64).to_le_bytes().to_vec();
+        buf.extend_from_slice(header);
+        buf.extend_from_slice(&[0u8; 4]);
+        let data = arbvis::data::Data::Owned(buf.clone());
+        let err = load_model_info_async(&data, buf.len() as u64, SourceFormat::Safetensors)
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("truncated"), "{err:#}");
     }
 

@@ -53,6 +53,30 @@ pub struct TensorMeta {
     pub packed_sidecars: Option<PackedSidecars>,
 }
 
+/// Validate that every tensor's absolute byte range fits within the file.
+///
+/// A truncated file (interrupted download or copy) can carry a fully valid
+/// header while its tensor data is cut off; without this check the header
+/// parse succeeds and later per-tensor reads run past the end of the file
+/// (faulting on an mmap, or erroring per tile). `file_size` is the real
+/// length of the data the header was parsed from. Format-agnostic: applies
+/// to any source whose [`TensorMeta`] carries absolute byte ranges.
+pub fn validate_tensor_offsets(tensors: &[TensorMeta], file_size: u64) -> anyhow::Result<()> {
+    for t in tensors {
+        if t.file_end > file_size {
+            anyhow::bail!(
+                "file is truncated — tensor '{}' needs bytes {}..{} but the data is only \
+                 {} bytes (interrupted download or copy?)",
+                t.name,
+                t.file_start,
+                t.file_end,
+                file_size
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Byte ranges and dtypes for the `scales` / `qzeros` sidecar tensors that
 /// accompany an AWQ/GPTQ-style packed-int `qweight` tensor in the same file.
 /// Populated by [`crate::format::safetensors::fuse_packed_quant_triples`].
