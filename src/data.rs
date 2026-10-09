@@ -2797,8 +2797,13 @@ fn percentile_bounds(scalars: &[f32], q_lo: f32, q_hi: f32) -> (f32, f32) {
 /// finite-safe — the random projection of a NaN row stays NaN, but
 /// the only way to hit one is a malformed checkpoint, in which case
 /// CKA polluted by NaN is still a useful diagnostic).
-fn decode_tensor_to_f32(dtype: format::Dtype, bytes: &[u8], n_elements: usize) -> Vec<f32> {
-    format::decode_prefix_f32(dtype, bytes, n_elements)
+fn decode_tensor_to_f32(
+    dtype: format::Dtype,
+    bytes: &[u8],
+    n_elements: usize,
+    sidecars: Option<format::PackedSidecarRefs<'_>>,
+) -> Vec<f32> {
+    format::decode_prefix_f32_sidecars(dtype, bytes, n_elements, sidecars)
 }
 
 /// Build the `--moe` **CKA** scene from the shared [`LoadedMoe`]: per-`(layer,
@@ -3054,7 +3059,38 @@ async fn compute_cka_panel(
     for (&expert_idx, (shard, meta)) in experts {
         let nbytes = meta.file_end.saturating_sub(meta.file_start) as usize;
         let bytes = datas[*shard].fetch_range(meta.file_start, nbytes).await?;
-        let w = decode_tensor_to_f32(dtype, &bytes, n_elements);
+        // AWQ/GPTQ packed-int tensors decode to NaN without their scales /
+        // qzeros sidecars; fetch them so CKA sees dequantized values. The
+        // qweight buffer covers the whole tensor, so the reader's default
+        // anchor `(0, 0)` is correct.
+        let sc = meta.packed_sidecars.as_ref();
+        let scales_buf = match sc {
+            Some(s) => Some(
+                datas[*shard]
+                    .fetch_range(s.scales_start, (s.scales_end - s.scales_start) as usize)
+                    .await?,
+            ),
+            None => None,
+        };
+        let zeros_buf = match sc {
+            Some(s) => match (s.zeros_start, s.zeros_end) {
+                (Some(zs), Some(ze)) => Some(
+                    datas[*shard]
+                        .fetch_range(zs, (ze - zs) as usize)
+                        .await?,
+                ),
+                _ => None,
+            },
+            None => None,
+        };
+        let sidecars = sc.map(|s| format::PackedSidecarRefs {
+            scales: scales_buf.as_deref().unwrap_or(&[]),
+            scales_dtype: s.scales_dtype,
+            zeros: zeros_buf.as_deref(),
+            zeros_dtype: s.zeros_dtype,
+            cols: s.cols,
+        });
+        let w = decode_tensor_to_f32(dtype, &bytes, n_elements, sidecars);
         let w_proj = crate::cka::project_rows(&w, d_out, d_in, &r, k);
         let self_sq = crate::cka::at_b_frobenius_sq(&w_proj, &w_proj, d_out, k);
         if (expert_idx as usize) < projections.len() {

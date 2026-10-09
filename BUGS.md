@@ -22,7 +22,11 @@ tensors paint as NaN sentinels there:
   (xet mode) — Packed arms return padding / `None` intensity;
 - `src/tiled/leaf_arch.rs` `render_arch_tile_diff` non-`Fixed(1)` fallback;
 - `src/tiled/arch_voxel.rs` `compute_face` (3D mode);
-- `src/data.rs` `decode_tensor_to_f32` (`--moe` CKA) and the diff source
+  - ~~`src/data.rs` `decode_tensor_to_f32` (`--moe` CKA)~~ — fixed by
+    tumwater(improve) 2026-10-09: `decode_prefix_f32_sidecars` in
+    `src/format/dtype.rs` + the `build_moe_cka_sources` fetch loop now thread
+    scales/qzeros into the CKA projection;
+- the diff source
   builders (`TensorDiffSource`, `diff_to_u8`) — both have full `Data` and
   `TensorMeta` in scope, so each is an independent, small wire-up.
 

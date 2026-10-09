@@ -769,6 +769,26 @@ pub fn decode_prefix_f32(dtype: Dtype, bytes: &[u8], n: usize) -> Vec<f32> {
     )
 }
 
+/// Decode the first `n` elements of `bytes` into a fresh f32 vec, with
+/// optional AWQ/GPTQ sidecar context for `ElementStride::Packed` dtypes.
+/// With `Some(refs)` and a packed dtype, elements dequantise through the
+/// scales/qzeros buffers (the buffer covers the whole tensor, so the
+/// reader's default anchor `(0, 0)` is correct). With `None` — or a
+/// non-packed dtype — this is exactly [`decode_prefix_f32`], and packed
+/// dtypes decode to NaN as before.
+pub fn decode_prefix_f32_sidecars(
+    dtype: Dtype,
+    bytes: &[u8],
+    n: usize,
+    refs: Option<PackedSidecarRefs<'_>>,
+) -> Vec<f32> {
+    if let (ElementStride::Packed { .. }, Some(refs)) = (dtype.stride(), refs) {
+        let mut reader = TensorElementReader::new(dtype, bytes).with_sidecars(refs);
+        return (0..n).map(|k| reader.element(k)).collect();
+    }
+    decode_prefix_f32(dtype, bytes, n)
+}
+
 fn read_u32_le(b: &[u8]) -> u32 {
     let mut v = 0u32;
     for (i, &x) in b.iter().take(4).enumerate() {
@@ -1476,6 +1496,41 @@ mod tests {
         assert_eq!(r.element(8), 0.0);
         assert_eq!(r.element(9), 1.0);
         assert_eq!(r.element(15), 4.0);
+    }
+
+    #[test]
+    fn decode_prefix_f32_sidecars_matches_reader() {
+        // Packed int4 tensor + sidecars → the helper dequantises through the
+        // sidecars (same values as TensorElementReader with them attached).
+        let qweight: Vec<u8> = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&0x8765_4321u32.to_le_bytes());
+            v
+        };
+        let scales: Vec<u8> = std::iter::repeat(1.0f32.to_le_bytes())
+            .take(8)
+            .flatten()
+            .collect();
+        let refs = PackedSidecarRefs {
+            scales: &scales,
+            scales_dtype: Dtype::F32,
+            zeros: None,
+            zeros_dtype: Dtype::Unknown,
+            cols: 8,
+        };
+        let v = decode_prefix_f32_sidecars(Dtype::Int4Packed, &qweight, 8, Some(refs));
+        assert_eq!(v.len(), 8);
+        for (i, expect) in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].iter().enumerate() {
+            assert_eq!(v[i], *expect, "element {i}");
+        }
+
+        // Without sidecars the packed dtype decodes to NaN (unchanged
+        // behaviour), and a non-packed dtype ignores the refs entirely.
+        let v = decode_prefix_f32_sidecars(Dtype::Int4Packed, &qweight, 8, None);
+        assert!(v.iter().all(|x| x.is_nan()));
+        let plain = [7.0f32.to_le_bytes().as_slice()].concat();
+        let v = decode_prefix_f32_sidecars(Dtype::F32, &plain, 1, Some(refs));
+        assert_eq!(v, vec![7.0]);
     }
 
     #[test]
