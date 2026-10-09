@@ -959,39 +959,9 @@ impl<'a> TensorElementReader<'a> {
     /// Estimate `rms = sqrt(mean(x²))` over the first `sample_elements`
     /// elements (or the whole buffer if shorter). Skips non-finite values.
     pub fn rms_estimate(&mut self, sample_elements: usize) -> f32 {
-        let n = match self.dtype.stride() {
-            ElementStride::Fixed(bpe) => self
-                .bytes
-                .len()
-                .checked_div(bpe)
-                .map(|m| sample_elements.min(m))
-                .unwrap_or(0),
-            ElementStride::Block {
-                block_bytes,
-                block_elements,
-            } => self
-                .bytes
-                .len()
-                .checked_div(block_bytes)
-                .map(|nb| sample_elements.min(nb * block_elements))
-                .unwrap_or(0),
-            ElementStride::Packed {
-                bits,
-                pack_dtype_bytes,
-                ..
-            } => {
-                if bits == 0 {
-                    0
-                } else {
-                    let elems_per_slot = (pack_dtype_bytes as usize * 8) / bits as usize;
-                    self.bytes
-                        .len()
-                        .checked_div(pack_dtype_bytes as usize)
-                        .map(|slots| sample_elements.min(slots * elems_per_slot))
-                        .unwrap_or(0)
-                }
-            }
-        };
+        // Same stride math as [`element_count_for_buf`], clamped to the
+        // requested sample budget.
+        let n = element_count_for_buf(self.dtype, self.bytes.len()).min(sample_elements);
         if n == 0 {
             return 0.0;
         }
