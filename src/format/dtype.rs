@@ -1503,8 +1503,7 @@ mod tests {
             v.extend_from_slice(&0x8765_4321u32.to_le_bytes());
             v
         };
-        let scales: Vec<u8> = std::iter::repeat(1.0f32.to_le_bytes())
-            .take(8)
+        let scales: Vec<u8> = std::iter::repeat_n(1.0f32.to_le_bytes(), 8)
             .flatten()
             .collect();
         let refs = PackedSidecarRefs {

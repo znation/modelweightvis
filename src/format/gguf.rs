@@ -237,7 +237,7 @@ mod tests {
         bytes.extend_from_slice(val);
         // Tensor info table is empty.
         // Pad to 32-byte alignment so tensor_data_offset is reachable.
-        while bytes.len() % 32 != 0 {
+        while !bytes.len().is_multiple_of(32) {
             bytes.push(0);
         }
         bytes
@@ -316,7 +316,7 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes()); // offset
         // Pad to the default 32-byte alignment so tensor_data_offset == 32;
         // the declared range [32..48) exceeds the 32-byte file.
-        while bytes.len() % 32 != 0 {
+        while !bytes.len().is_multiple_of(32) {
             bytes.push(0);
         }
         bytes

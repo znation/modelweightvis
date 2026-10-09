@@ -41,7 +41,7 @@ pub fn cfg_gqa_geometry(
         }
         None => {
             anyhow::ensure!(
-                hidden_size % n_heads == 0,
+                hidden_size.is_multiple_of(n_heads),
                 "config omits head_dim and hidden_size ({hidden_size}) is not divisible by \
                  num_attention_heads ({n_heads}); cannot derive head_dim"
             );

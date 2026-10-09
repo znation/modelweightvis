@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn validate_offsets_rejects_range_past_file_end() {
         let t = mk_t("t", Dtype::F32, vec![4], 100, 200);
-        assert!(validate_offsets(&[t.clone()], 200).is_ok());
+        assert!(validate_offsets(std::slice::from_ref(&t), 200).is_ok());
         let err = validate_offsets(&[t], 150).unwrap_err();
         assert!(format!("{err:#}").contains("truncated"), "{err:#}");
     }

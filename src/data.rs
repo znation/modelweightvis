@@ -3391,7 +3391,7 @@ mod tests {
         buf.extend_from_slice(&1000u64.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
-        while buf.len() % 32 != 0 {
+        while !buf.len().is_multiple_of(32) {
             buf.push(0); // alignment padding so tensor_data_offset is reachable
         }
         buf.extend_from_slice(&[0u8; 4]); // tensor data, cut off after 4 bytes
@@ -3444,7 +3444,7 @@ mod tests {
         buf.extend_from_slice(&4u64.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
-        while buf.len() % 32 != 0 {
+        while !buf.len().is_multiple_of(32) {
             buf.push(0); // alignment padding so tensor_data_offset is reachable
         }
         buf

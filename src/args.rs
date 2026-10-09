@@ -308,6 +308,7 @@ impl ModelArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn parse<const N: usize>(args: [&str; N]) -> Result<ModelArgs, clap::Error> {
         ModelArgs::try_parse_from(std::iter::once("modelweightvis").chain(args))
@@ -360,7 +361,7 @@ mod tests {
 
         let o = parse(["--moe", "m", "--probe-file", "p.txt"]).unwrap().probe_opts();
         assert!(o.enabled);
-        assert!(matches!(o.source, ProbeSource::File(f) if f == PathBuf::from("p.txt")));
+        assert!(matches!(o.source, ProbeSource::File(f) if f == Path::new("p.txt")));
 
         let o = parse(["--moe", "m", "--probe-url", "hf://x/y"]).unwrap().probe_opts();
         assert!(o.enabled);
