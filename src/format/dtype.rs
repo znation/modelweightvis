@@ -1161,11 +1161,20 @@ mod tests {
         // here without going through private struct fields. End-to-end
         // correctness is verified by the GGUF render path in the
         // verification plan.
-        let bytes = vec![0u8; 34];
+        //
+        // The block scale must be a nonzero f16: candle's dequant kernel
+        // computes quant * scale, and a zero scale can yield NaN in its
+        // SIMD paths, making the `is_finite` assertion depend on candle's
+        // zero-scale handling (the flake behind this test's original
+        // all-zero-bytes version). Scale 1.0 with zero quants dequantises
+        // to exactly 0.0, finite everywhere.
+        let mut bytes = vec![0u8; 34];
+        bytes[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
         let mut r = TensorElementReader::new(Dtype::Q8_0, &bytes);
         for k in 0..32 {
             let v = r.element(k);
             assert!(v.is_finite(), "elem {k}: got {v}, expected finite");
+            assert_eq!(v, 0.0, "elem {k}: zero quants with scale 1.0");
         }
         // Out-of-block read returns NaN sentinel.
         assert!(r.element(32).is_nan());

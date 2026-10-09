@@ -8,12 +8,6 @@ unclear-invariant).
 
 ## Open
 
-### Flaky test: `format::dtype::tests::reader_quantized_q8_0_does_not_crash_on_padded_block` (found by security 2026-10-09)
-
-- Symptom: intermittently panics with "elem 0: got NaN, expected finite" in a full `cargo test` run; passes when run alone (observed once during a full-suite run on 2026-10-09, then green on rerun and on 5 isolated runs).
-- Reproduce: run the full `cargo test` repeatedly.
-- Suspected cause: the test builds a Q8_0 block of all-zero bytes; candle's dequant kernel turns a zero f16 scale into an undefined/NaN product, so the `is_finite` assertion depends on candle's handling of zero scales, not on anything modelweightvis controls.
-
 ### AWQ/GPTQ packed-int tensors still render as NaN sentinels in diff, xet, voxel, and MoE paths — sidecars wired only into the 2D plain tile path (found by tumwater(bugfix) 2026-10-09)
 
 Sibling of the 2026-10-09 Fixed entry of the same title. That fix wired
@@ -46,6 +40,14 @@ wants a pure-refactor move: lift the `#[cfg(test)]` modules into `tests/` or spl
 `moe_sources` / `summary_jobs` modules; no behavior change, existing tests as the harness.
 
 ## Fixed
+
+### Flaky test: `format::dtype::tests::reader_quantized_q8_0_does_not_crash_on_padded_block` (found by security 2026-10-09; fixed by tumwater(bugfix) 2026-10-09)
+
+- Symptom: intermittently panics with "elem 0: got NaN, expected finite" in a full `cargo test` run; passes when run alone (observed once during a full-suite run on 2026-10-09, then green on rerun and on 5 isolated runs).
+- Reproduce: run the full `cargo test` repeatedly.
+- Suspected cause: the test builds a Q8_0 block of all-zero bytes; candle's dequant kernel turns a zero f16 scale into an undefined/NaN product, so the `is_finite` assertion depends on candle's handling of zero scales, not on anything modelweightvis controls.
+- Fix: build the test block with a nonzero f16 scale (`1.0`) so the dequant result is deterministic (zero quants × scale 1.0 = 0.0), and assert the values are exactly 0.0 as well as finite.
+**Validation gap:** no-repro — the flake fired once in a full-suite run and never reproduced deterministically, so the fix removes the zero-scale input rather than being confirmed against the observed failure.
 
 ### AWQ/GPTQ packed-int tensors render as NaN sentinels — sidecars never attached in production (found by tumwater(clean) 2026-10-09; fixed by tumwater(bugfix) 2026-10-09)
 
