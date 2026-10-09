@@ -412,6 +412,7 @@ pub fn load_model_info(
             header_buf[..8].copy_from_slice(&size_buf);
             f.read_exact(&mut header_buf[8..])?;
             let (tensors, header_end) = format::safetensors::parse_header(&header_buf)?;
+            format::safetensors::validate_offsets(&tensors, file_size)?;
             let color_ranges =
                 format::safetensors::build_color_ranges(&tensors, header_end, file_size);
             Ok(ModelInfo {
@@ -3148,6 +3149,24 @@ mod tests {
             shape,
             packed_sidecars: None,
         }
+    }
+
+    #[test]
+    fn load_model_info_rejects_truncated_safetensors() {
+        // Valid header claiming 4000 bytes of tensor data, but the file is
+        // cut off after the header plus 4 bytes (interrupted download).
+        let header =
+            br#"{"w":{"dtype":"F32","shape":[1000],"data_offsets":[0,4000]}}"#;
+        let mut buf = (header.len() as u64).to_le_bytes().to_vec();
+        buf.extend_from_slice(header);
+        buf.extend_from_slice(&[0u8; 4]);
+        assert!(buf.len() < 8 + 4000);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("model.safetensors");
+        std::fs::write(&p, &buf).unwrap();
+        let err =
+            load_model_info(&p, buf.len() as u64, SourceFormat::Safetensors).unwrap_err();
+        assert!(format!("{err:#}").contains("truncated"), "{err:#}");
     }
 
     #[test]
