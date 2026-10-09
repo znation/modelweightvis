@@ -30,11 +30,21 @@ pub async fn resolve(source: &ProbeSource) -> anyhow::Result<String> {
     }
 }
 
+/// Total request timeout for `--probe-url` HTTPS fetches. Probe corpora
+/// are small text files; anything slower than this is a hang.
+const PROBE_URL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Fetch `url` and return its body as a UTF-8 string. Accepts plain
 /// HTTPS URLs (e.g. a raw text file on a CDN) or `hf://...` URLs
 /// (resolved through the existing `arbvis::hf_url` machinery —
 /// downloads via `hf` CLI to the HF cache, then reads from disk).
 async fn fetch_url(url: &str) -> anyhow::Result<String> {
+    fetch_url_with_timeout(url, PROBE_URL_TIMEOUT).await
+}
+
+/// Same as [`fetch_url`], with the HTTPS request timeout made explicit so
+/// tests can inject a short one.
+async fn fetch_url_with_timeout(url: &str, timeout: std::time::Duration) -> anyhow::Result<String> {
     if url.starts_with("hf://") {
         let resolved = arbvis::hf_url::resolve(Path::new(url))
             .await
@@ -42,7 +52,13 @@ async fn fetch_url(url: &str) -> anyhow::Result<String> {
         std::fs::read_to_string(&resolved)
             .with_context(|| format!("--probe-url: reading {}", resolved.display()))
     } else {
-        let resp = reqwest::get(url)
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .with_context(|| format!("--probe-url: building HTTP client for {url}"))?;
+        let resp = client
+            .get(url)
+            .send()
             .await
             .with_context(|| format!("--probe-url: GET {url}"))?;
         let status = resp.status();
@@ -154,5 +170,35 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let err = tokenize("hi", dir.path()).expect_err("no tokenizer.json");
         assert!(err.to_string().contains("tokenizer.json"));
+    }
+
+    /// Fault injection: a server that accepts the TCP connection but
+    /// never sends a response. Before the timeout fix (`reqwest::get`,
+    /// default client, no timeout) this stalled the fetch forever; now
+    /// the total request timeout makes it fail within the injected
+    /// duration.
+    #[tokio::test]
+    async fn hanging_http_server_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            // Accept and hold the connection open without responding.
+            let (_sock, _) = listener.accept().expect("accept");
+            std::thread::park(); // never unparked: the server never replies
+        });
+
+        let url = format!("http://{addr}/probe.txt");
+        let start = std::time::Instant::now();
+        let result =
+            fetch_url_with_timeout(&url, std::time::Duration::from_millis(500)).await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("hanging server must produce an error, not hang");
+        assert!(elapsed < std::time::Duration::from_secs(10));
+        assert!(
+            err.to_string().contains("probe-url: GET"),
+            "error should name the failed fetch: {err}"
+        );
+        server.thread().unpark(); // let the test thread exit cleanly
     }
 }
