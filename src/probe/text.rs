@@ -71,3 +71,88 @@ pub fn tokenize(text: &str, model_dir: &Path) -> anyhow::Result<Vec<u32>> {
         .map_err(|e| anyhow::anyhow!("--probe: tokenizer.encode failed: {e}"))?;
     Ok(encoding.get_ids().to_vec())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write_tokenizer(dir: &std::path::Path) {
+        // A minimal but valid tokenizer.json: a tiny BPE vocab so encode
+        // is deterministic without depending on an HF download.
+        let json = r#"{
+            "version": "1.0",
+            "model": {
+                "type": "BPE",
+                "vocab": {"h": 0, "e": 1, "l": 2, "o": 3, " ": 4,
+                          "he": 5, "llo": 6, " hell": 7},
+                "merges": []
+            },
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null
+        }"#;
+        std::fs::write(dir.join("tokenizer.json"), json).expect("write tokenizer");
+    }
+
+    #[tokio::test]
+    async fn resolve_default_returns_bundled_snippet() {
+        let text = resolve(&ProbeSource::Default).await.expect("default resolves");
+        assert!(!text.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_text_is_passthrough() {
+        let text = resolve(&ProbeSource::Text("hello world".to_string()))
+            .await
+            .expect("text resolves");
+        assert_eq!(text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn resolve_file_reads_from_disk() {
+        let dir = tempdir().expect("tempdir");
+        let p = dir.path().join("probe.txt");
+        std::fs::write(&p, "from disk").expect("write");
+        let text = resolve(&ProbeSource::File(p)).await.expect("file resolves");
+        assert_eq!(text, "from disk");
+    }
+
+    #[tokio::test]
+    async fn resolve_file_missing_errors_with_context() {
+        let dir = tempdir().expect("tempdir");
+        let p = dir.path().join("absent.txt");
+        let err = resolve(&ProbeSource::File(p.clone()))
+            .await
+            .expect_err("missing file errors");
+        assert!(err.to_string().contains(&p.to_string_lossy().to_string()));
+    }
+
+    #[tokio::test]
+    async fn resolve_bad_url_errors() {
+        // Port 1 on loopback refuses connections; reqwest maps it to an
+        // error either way, which resolve must surface.
+        assert!(resolve(&ProbeSource::Url("http://127.0.0.1:1/nope".to_string()))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn tokenize_returns_ids_from_model_dir_tokenizer() {
+        let dir = tempdir().expect("tempdir");
+        write_tokenizer(dir.path());
+        let ids = tokenize("hello", dir.path()).expect("tokenize");
+        assert!(!ids.is_empty());
+        // Deterministic: same input → same ids.
+        assert_eq!(ids, tokenize("hello", dir.path()).expect("again"));
+    }
+
+    #[test]
+    fn tokenize_missing_tokenizer_file_errors() {
+        let dir = tempdir().expect("tempdir");
+        let err = tokenize("hi", dir.path()).expect_err("no tokenizer.json");
+        assert!(err.to_string().contains("tokenizer.json"));
+    }
+}

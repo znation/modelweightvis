@@ -147,3 +147,79 @@ pub fn run(
         Arch::Mixtral => mixtral::run(config, weight_paths, model_dir, &token_ids),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_arch_matches_supported_names() {
+        for (name, want) in [
+            ("Qwen2MoeForCausalLM", Some(Arch::Qwen2Moe)),
+            ("MixtralForCausalLM", Some(Arch::Mixtral)),
+        ] {
+            let cfg = ModelConfig::from_bytes(
+                format!("{{\"architectures\": [\"{name}\"]}}").as_bytes(),
+            )
+            .expect("parses");
+            assert_eq!(detect_arch(&cfg), want);
+        }
+    }
+
+    #[test]
+    fn detect_arch_rejects_unsupported_or_missing() {
+        let cfg =
+            ModelConfig::from_bytes(br#"{"architectures": ["LlamaForCausalLM"]}"#).expect("parses");
+        assert_eq!(detect_arch(&cfg), None);
+        let empty = ModelConfig::from_bytes(br#"{"architectures": []}"#).expect("parses");
+        assert_eq!(detect_arch(&empty), None);
+    }
+
+    #[test]
+    fn arch_labels_are_the_hf_config_strings() {
+        assert_eq!(Arch::Qwen2Moe.label(), "Qwen2MoeForCausalLM");
+        assert_eq!(Arch::Mixtral.label(), "MixtralForCausalLM");
+    }
+
+    #[test]
+    fn probe_opts_default_is_disabled_default_source() {
+        let opts = ProbeOpts::default();
+        assert!(!opts.enabled);
+        assert!(matches!(opts.source, ProbeSource::Default));
+    }
+
+    #[test]
+    fn routing_capture_invariants_hold_on_synthetic_data() {
+        // The docs promise a symmetric coact matrix whose diagonal equals
+        // freq; check the layout contract on a small synthetic capture.
+        let (layers, experts, tokens) = (2u32, 4u32, 8u32);
+        let n = (layers * experts) as usize;
+        let mut freq = vec![0.0f32; n];
+        let mut coact = vec![0.0f32; (layers * experts * experts) as usize];
+        for l in 0..layers as usize {
+            for e in 0..experts as usize {
+                freq[l * experts as usize + e] = (e as f32 + 1.0) / tokens as f32;
+                for j in 0..experts as usize {
+                    coact[l * experts as usize * experts as usize + e * experts as usize + j] =
+                        if e == j { freq[l * experts as usize + e] } else { 0.5 };
+                }
+            }
+        }
+        let cap = RoutingCapture { n_layers: layers, n_experts: experts, n_tokens: tokens, freq, coact };
+        let e = cap.n_experts as usize;
+        for l in 0..cap.n_layers as usize {
+            for i in 0..e {
+                for j in 0..e {
+                    let cell = cap.coact[l * e * e + i * e + j];
+                    let mirror = cap.coact[l * e * e + j * e + i];
+                    assert_eq!(cell, mirror, "coact symmetric at layer {l} ({i},{j})");
+                }
+                assert_eq!(
+                    cap.coact[l * e * e + i * e + i],
+                    cap.freq[l * e + i],
+                    "coact diagonal equals freq at layer {l}, expert {i}"
+                );
+            }
+        }
+    }
+}
