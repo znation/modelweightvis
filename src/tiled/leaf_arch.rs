@@ -35,6 +35,7 @@
 /// is essentially "any heavy shrink".
 const SPARSE_WASTE_THRESHOLD: u64 = 8;
 
+use futures::future;
 use image::Rgb;
 
 use arbvis::{encode_tile, Data, TileFormat, TILE};
@@ -298,8 +299,9 @@ fn packed_region_anchor(r: &TileRegion) -> (usize, usize) {
 /// Returns a `paint_w * paint_h`-byte buffer where pixel `(dy, dx)` lives at
 /// `compact[dy * paint_w + dx]` — matches `iter_region_pixels_compact`.
 ///
-/// Per region this issues `paint_h` `fetch_range` calls, each spanning
-/// exactly one source row (`cols` bytes). The full element bounding box
+/// Per region this issues one `fetch_range` per run of contiguous sampled
+/// source rows (each spanning `run_rows * cols` bytes), issued concurrently.
+/// The full element bounding box
 /// would be `(row_last - row_first) * cols` bytes — for a 24-px sub-tile of
 /// a 1408×2048 tensor that's ~2.8 MB; the compact path reads
 /// `24 * 2048 = 48 KB` instead (a ~60× reduction) and the returned buffer is
@@ -321,18 +323,46 @@ async fn fetch_compact_region_u8(
 
     let mut compact = vec![0u8; (paint_w * paint_h) as usize];
 
+    // Sampled source row per painted row — non-decreasing in `dy`.
+    let er_of = |dy: u64| (region.samp_y0 + dy) * rows / fh;
+    // Group painted rows into maximal runs of contiguous source rows. On
+    // enlarge (rows <= fh) consecutive painted rows share or step source
+    // rows, so a run coalesces many fetches into one spanning read; on
+    // heavy shrink runs degenerate to single rows and the grouping simply
+    // keeps the fetch set minimal.
+    let mut runs: Vec<(u64, u64, u64)> = Vec::new(); // (er_first, run_rows, first_dy)
     for dy in 0..paint_h {
-        let er = (region.samp_y0 + dy) * rows / fh; // absolute source row
-                                                    // Fixed(1) stride: each row is `cols` bytes.
-        let row_byte_abs = region.tensor_byte_start + er * cols;
+        let er = er_of(dy);
+        match runs.last_mut() {
+            Some((last_er, count, _)) if *last_er + *count == er => *count += 1,
+            _ => runs.push((er, 1, dy)),
+        }
+    }
+    // One fetch per run, issued concurrently: on Http / Xet sources these
+    // are independent range requests, and serializing them (the old
+    // row-at-a-time loop) paid one round-trip per painted row.
+    let fetched = future::try_join_all(runs.iter().map(|&(er_first, run_rows, _)| {
+        // Fixed(1) stride: each row is `cols` bytes.
+        let row_byte_abs = region.tensor_byte_start + er_first * cols;
         let row_byte_local = row_byte_abs.saturating_sub(src_off);
-        let row_bytes = data.fetch_range(row_byte_local, cols as usize).await?;
-        for dx in 0..paint_w {
-            let ec = (region.samp_x0 + dx) * cols / fw; // absolute source col
-                                                        // Defensive: clamp to row bounds. The render's mid-grey-on-miss
-                                                        // (`unwrap_or(127)`) matches diff_to_u8's "no change" byte.
-            let byte = row_bytes.get(ec as usize).copied().unwrap_or(127);
-            compact[(dy * paint_w + dx) as usize] = byte;
+        let len = (run_rows * cols) as usize;
+        async move { data.fetch_range(row_byte_local, len).await }
+    }))
+    .await?;
+    for (&(er_first, run_rows, first_dy), buf) in runs.iter().zip(fetched.into_iter()) {
+        for dy in first_dy..paint_h {
+            let er = er_of(dy);
+            if er >= er_first + run_rows {
+                break;
+            }
+            let row_off = ((er - er_first) * cols) as usize;
+            for dx in 0..paint_w {
+                let ec = (region.samp_x0 + dx) * cols / fw; // absolute source col
+                                                            // Defensive: clamp to row bounds. The render's mid-grey-on-miss
+                                                            // (`unwrap_or(127)`) matches diff_to_u8's "no change" byte.
+                let byte = buf.get(row_off + ec as usize).copied().unwrap_or(127);
+                compact[(dy * paint_w + dx) as usize] = byte;
+            }
         }
     }
     Ok(compact)
@@ -458,17 +488,26 @@ pub fn render_arch_tile_plain(
             // Packed-int (AWQ/GPTQ) regions carry fetched scales/qzeros
             // sidecars; hand them to the decoder so these tensors dequantise
             // per element instead of painting NaN sentinels.
-            let sidecar = tile.sidecars.get(i).and_then(|s| s.as_ref()).map(|sc| SidecarView {
-                scales: &sc.scales,
-                scales_dtype: sc.scales_dtype,
-                zeros: sc.zeros.as_deref(),
-                zeros_dtype: sc.zeros_dtype,
-                cols: sc.cols,
-                anchor: sc.anchor,
-            });
+            let sidecar = tile
+                .sidecars
+                .get(i)
+                .and_then(|s| s.as_ref())
+                .map(|sc| SidecarView {
+                    scales: &sc.scales,
+                    scales_dtype: sc.scales_dtype,
+                    zeros: sc.zeros.as_deref(),
+                    zeros_dtype: sc.zeros_dtype,
+                    cols: sc.cols,
+                    anchor: sc.anchor,
+                });
             iter_region_pixels(region, leading, |px, py, elem_off| {
-                let color =
-                    plain_element_color_sidecars(dtype, bytes, elem_off, sidecar.as_ref(), pixel_lut);
+                let color = plain_element_color_sidecars(
+                    dtype,
+                    bytes,
+                    elem_off,
+                    sidecar.as_ref(),
+                    pixel_lut,
+                );
                 img.put_pixel(px, py, color);
             });
         }
@@ -590,19 +629,111 @@ pub fn render_arch_tile_diff_paired(
             // element pairs line up.
             let mod_off = elem_off + leading_b - leading_a;
             let color = diff_element_color(
-                dtype,
-                bytes_a,
-                elem_off,
-                dtype_b,
-                bytes_b,
-                mod_off,
-                metric,
-                scale_orig,
-                pixel_lut,
+                dtype, bytes_a, elem_off, dtype_b, bytes_b, mod_off, metric, scale_orig, pixel_lut,
             );
             img.put_pixel(px, py, color);
         });
     })
+}
+
+#[cfg(test)]
+mod fetch_compact_region_u8_tests {
+    use super::*;
+
+    fn u8_region(
+        rows: u64,
+        cols: u64,
+        fw: u64,
+        fh: u64,
+        samp_x0: u64,
+        samp_y0: u64,
+        paint_w: u64,
+        paint_h: u64,
+    ) -> TileRegion {
+        TileRegion {
+            source_idx: 0,
+            tensor_id: 0,
+            dtype: Dtype::U8,
+            tensor_rows: rows,
+            tensor_cols: cols,
+            row_first: 0,
+            row_last_exclusive: rows,
+            col_first: 0,
+            col_last_exclusive: cols,
+            tensor_byte_start: 64,
+            footprint_w: fw,
+            footprint_h: fh,
+            samp_x0,
+            samp_y0,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: paint_w as u32,
+            tile_y1: paint_h as u32,
+        }
+    }
+
+    /// Ground truth per the mapping contract: pixel (dx, dy) shows element
+    /// `(samp_y0 + dy) * rows / fh, (samp_x0 + dx) * cols / fw`. Absolute
+    /// byte positions index the backing at `abs - src_off` (the fetch's
+    /// local addressing).
+    fn expected(data: &[u8], r: &TileRegion, src_off: u64, paint_w: u64, paint_h: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity((paint_w * paint_h) as usize);
+        for dy in 0..paint_h {
+            let er = (r.samp_y0 + dy) * r.tensor_rows / r.footprint_h;
+            for dx in 0..paint_w {
+                let ec = (r.samp_x0 + dx) * r.tensor_cols / r.footprint_w;
+                let abs = r.tensor_byte_start + er * r.tensor_cols + ec;
+                out.push(data[(abs - src_off) as usize]);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn heavy_shrink_matches_per_pixel_ground_truth() {
+        // 32x32 tensor shrunk to 8x8 footprint: each painted pixel jumps
+        // several source rows/cols, so the run grouper emits multiple runs
+        // (one per distinct sampled source row).
+        let backing: Vec<u8> = (0..128 * 64)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let data = Data::Owned(backing);
+        let r = u8_region(64, 128, 8, 8, 0, 0, 8, 8);
+        let got = fetch_compact_region_u8(&data, &r, 0).await.unwrap();
+        let want = expected(&data, &r, 0, 8, 8);
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn shrink_with_offsets_matches_ground_truth() {
+        // Non-zero samp offsets, non-square dims, src_off shifting the
+        // fetch origin: exercises the er/ec arithmetic and the
+        // tensor_byte_start + src_off byte addressing.
+        let backing: Vec<u8> = (0..64 * 96 + 64)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let data = Data::Owned(backing);
+        // footprint 16x16 sampling rows 4..12, cols 8..24 of a 96x64 tensor.
+        let r = u8_region(64, 96, 16, 16, 8, 4, 8, 8);
+        // src_off 32: the fetch reads backing[abs - 32], exercising the
+        // tensor_byte_start + src_off byte addressing.
+        let got = fetch_compact_region_u8(&data, &r, 32).await.unwrap();
+        let want = expected(&data, &r, 32, 8, 8);
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn enlarge_replicates_source_rows() {
+        // 4x4 tensor enlarged to 8x8 footprint: consecutive painted rows
+        // share one source row, so all rows land in a single coalesced run;
+        // pixels replicate elements exactly as iter_region_pixels would.
+        let backing: Vec<u8> = (0..64 + 4 * 4u64).map(|i| i as u8 * 3).collect();
+        let data = Data::Owned(backing);
+        let r = u8_region(4, 4, 8, 8, 0, 0, 8, 8);
+        let got = fetch_compact_region_u8(&data, &r, 0).await.unwrap();
+        let want = expected(&data, &r, 0, 8, 8);
+        assert_eq!(got, want);
+    }
 }
 
 #[cfg(test)]
