@@ -38,8 +38,8 @@ use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::layout::model_config::ModelConfig;
 use crate::probe::common::{
-    accumulate_coactivation, dispatch_experts, renormalize_topk, rms_norm, topk_per_row,
-    GqaAttention, RotaryEmbedding, SwiGluExpert,
+    accumulate_coactivation, cfg_gqa_geometry, cfg_usize, dispatch_experts, renormalize_topk,
+    rms_norm, topk_per_row, GqaAttention, RotaryEmbedding, SwiGluExpert,
 };
 use crate::probe::RoutingCapture;
 
@@ -67,44 +67,31 @@ struct Cfg {
 
 impl Cfg {
     fn from_config(config: &ModelConfig, norm_topk_prob: bool) -> anyhow::Result<Self> {
-        let hidden_size = config
-            .hidden_size
-            .context("Qwen2-MoE config missing hidden_size")? as usize;
-        let n_heads = config
-            .num_attention_heads
-            .context("Qwen2-MoE config missing num_attention_heads")?
-            as usize;
+        let hidden_size = cfg_usize(config.hidden_size, "Qwen2-MoE", "hidden_size")?;
+        let n_heads =
+            cfg_usize(config.num_attention_heads, "Qwen2-MoE", "num_attention_heads")?;
         // Qwen omits head_dim from config; derive from hidden_size / n_heads.
-        let head_dim = config
-            .head_dim
-            .map(|d| d as usize)
-            .unwrap_or(hidden_size / n_heads);
-        let n_kv_heads = config
-            .num_key_value_heads
-            .map(|n| n as usize)
-            .unwrap_or(n_heads);
-        let n_experts = config
-            .n_experts()
-            .context("Qwen2-MoE config missing num_experts")? as usize;
-        let top_k = config
-            .num_experts_per_tok
-            .context("Qwen2-MoE config missing num_experts_per_tok")? as usize;
-        let moe_intermediate_size = config
-            .moe_intermediate_size
-            .context("Qwen2-MoE config missing moe_intermediate_size")?
-            as usize;
-        let shared_intermediate_size = config
-            .shared_expert_intermediate_size
-            .or(config.intermediate_size)
-            .context("Qwen2-MoE config missing shared_expert_intermediate_size")?
-            as usize;
+        let (head_dim, n_kv_heads) = cfg_gqa_geometry(config, n_heads, hidden_size)?;
+        let n_experts = cfg_usize(config.n_experts(), "Qwen2-MoE", "num_experts")?;
+        let top_k =
+            cfg_usize(config.num_experts_per_tok, "Qwen2-MoE", "num_experts_per_tok")?;
+        let moe_intermediate_size =
+            cfg_usize(config.moe_intermediate_size, "Qwen2-MoE", "moe_intermediate_size")?;
+        let shared_intermediate_size = cfg_usize(
+            config
+                .shared_expert_intermediate_size
+                .or(config.intermediate_size),
+            "Qwen2-MoE",
+            "shared_expert_intermediate_size",
+        )?;
         Ok(Self {
             vocab_size: config.vocab_size.unwrap_or(0) as usize,
             hidden_size,
-            n_layers: config
-                .num_hidden_layers
-                .context("Qwen2-MoE config missing num_hidden_layers")?
-                as usize,
+            n_layers: cfg_usize(
+                config.num_hidden_layers,
+                "Qwen2-MoE",
+                "num_hidden_layers",
+            )?,
             n_heads,
             n_kv_heads,
             head_dim,

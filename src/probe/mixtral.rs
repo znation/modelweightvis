@@ -47,8 +47,8 @@ use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::layout::model_config::ModelConfig;
 use crate::probe::common::{
-    accumulate_coactivation, dispatch_experts, renormalize_topk, rms_norm, topk_per_row,
-    GqaAttention, RotaryEmbedding, SwiGluExpert,
+    accumulate_coactivation, cfg_gqa_geometry, cfg_usize, dispatch_experts, renormalize_topk,
+    rms_norm, topk_per_row, GqaAttention, RotaryEmbedding, SwiGluExpert,
 };
 use crate::probe::RoutingCapture;
 
@@ -74,38 +74,21 @@ struct Cfg {
 
 impl Cfg {
     fn from_config(config: &ModelConfig) -> anyhow::Result<Self> {
-        let hidden_size = config
-            .hidden_size
-            .context("Mixtral config missing hidden_size")? as usize;
-        let n_heads = config
-            .num_attention_heads
-            .context("Mixtral config missing num_attention_heads")? as usize;
+        let hidden_size = cfg_usize(config.hidden_size, "Mixtral", "hidden_size")?;
+        let n_heads =
+            cfg_usize(config.num_attention_heads, "Mixtral", "num_attention_heads")?;
         // Mixtral may omit head_dim from config; derive from hidden / n_heads.
-        let head_dim = config
-            .head_dim
-            .map(|d| d as usize)
-            .unwrap_or(hidden_size / n_heads);
-        let n_kv_heads = config
-            .num_key_value_heads
-            .map(|n| n as usize)
-            .unwrap_or(n_heads);
-        let n_experts = config
-            .n_experts()
-            .context("Mixtral config missing num_local_experts")? as usize;
-        let top_k = config
-            .num_experts_per_tok
-            .context("Mixtral config missing num_experts_per_tok")? as usize;
-        let intermediate_size = config
-            .intermediate_size
-            .context("Mixtral config missing intermediate_size")?
-            as usize;
+        let (head_dim, n_kv_heads) = cfg_gqa_geometry(config, n_heads, hidden_size)?;
+        let n_experts =
+            cfg_usize(config.n_experts(), "Mixtral", "num_local_experts")?;
+        let top_k =
+            cfg_usize(config.num_experts_per_tok, "Mixtral", "num_experts_per_tok")?;
+        let intermediate_size =
+            cfg_usize(config.intermediate_size, "Mixtral", "intermediate_size")?;
         Ok(Self {
             vocab_size: config.vocab_size.unwrap_or(0) as usize,
             hidden_size,
-            n_layers: config
-                .num_hidden_layers
-                .context("Mixtral config missing num_hidden_layers")?
-                as usize,
+            n_layers: cfg_usize(config.num_hidden_layers, "Mixtral", "num_hidden_layers")?,
             n_heads,
             n_kv_heads,
             head_dim,

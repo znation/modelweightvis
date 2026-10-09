@@ -5,8 +5,38 @@
 //! grouped-query attention helper that handles the head ≠ kv-head
 //! fan-out shared by Qwen2-MoE and Mixtral.
 
+use anyhow::Context;
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Linear, Module, VarBuilder};
+
+use crate::layout::model_config::ModelConfig;
+
+/// Read a required `config.json` field as `usize`, erroring with a
+/// `"<model> config missing <field>"` message when it is absent.
+pub fn cfg_usize(value: Option<u32>, model: &str, field: &str) -> anyhow::Result<usize> {
+    value
+        .map(|v| v as usize)
+        .with_context(|| format!("{model} config missing {field}"))
+}
+
+/// Derive GQA geometry shared by Mixtral and Qwen2-MoE: `head_dim` (defaults
+/// to `hidden_size / n_heads` when the config omits it) and `n_kv_heads`
+/// (defaults to `n_heads`, i.e. plain multi-head attention).
+pub fn cfg_gqa_geometry(
+    config: &ModelConfig,
+    n_heads: usize,
+    hidden_size: usize,
+) -> anyhow::Result<(usize, usize)> {
+    let head_dim = config
+        .head_dim
+        .map(|d| d as usize)
+        .unwrap_or(hidden_size / n_heads);
+    let n_kv_heads = config
+        .num_key_value_heads
+        .map(|n| n as usize)
+        .unwrap_or(n_heads);
+    Ok((head_dim, n_kv_heads))
+}
 
 /// Standard transformer RMSNorm:
 ///   `y = x / sqrt(mean(x², -1) + eps) * weight`
