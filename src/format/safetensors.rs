@@ -92,6 +92,13 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<(Vec<TensorMeta>, u64)> {
         let rel_end = offsets[1].as_u64().ok_or_else(|| {
             anyhow::anyhow!("safetensors: tensor '{}' data_offsets[1] not u64", name)
         })?;
+        if rel_end < rel_start {
+            anyhow::bail!(
+                "safetensors: tensor '{}' has data_offsets[0]={rel_start} > \
+                 data_offsets[1]={rel_end} (corrupt or hand-edited header)",
+                name
+            );
+        }
 
         tensors.push(TensorMeta {
             name: name.clone(),
@@ -314,6 +321,21 @@ pub fn validate_offsets(tensors: &[TensorMeta], file_size: u64) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_header_rejects_reversed_data_offsets() {
+        // A corrupt header whose data_offsets are reversed would otherwise
+        // produce file_end < file_start, which underflows `file_end -
+        // file_start` when the layout sums tensor byte sizes.
+        let json = br#"{"t":{"dtype":"F32","shape":[1],"data_offsets":[8,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(json);
+        let err = parse_header(&bytes).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("'t'"), "{msg}");
+        assert!(msg.contains("data_offsets"), "{msg}");
+    }
 
     #[test]
     fn validate_offsets_rejects_range_past_file_end() {
