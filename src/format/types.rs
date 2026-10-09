@@ -116,6 +116,58 @@ impl TensorMeta {
 ///
 /// `format` records which parser produced this — read by cross-format diff
 /// matching to canonicalise tensor names before pairing.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(shape: &[u64]) -> TensorMeta {
+        TensorMeta {
+            name: "t".into(),
+            dtype: Dtype::F32,
+            shape: shape.to_vec(),
+            file_start: 0,
+            file_end: 0,
+            packed_sidecars: None,
+        }
+    }
+
+    #[test]
+    fn element_shape_scalar_is_one_by_one() {
+        assert_eq!(meta(&[]).element_shape(), (1, 1));
+    }
+
+    #[test]
+    fn element_shape_1d_is_one_row_strip() {
+        assert_eq!(meta(&[7]).element_shape(), (1, 7));
+        assert_eq!(meta(&[0]).element_shape(), (1, 0));
+    }
+
+    #[test]
+    fn element_shape_2d_preserved() {
+        assert_eq!(meta(&[3, 5]).element_shape(), (3, 5));
+    }
+
+    #[test]
+    fn element_shape_nd_collapses_last_dims() {
+        assert_eq!(meta(&[2, 3, 4]).element_shape(), (2, 12));
+        assert_eq!(meta(&[2, 3, 4, 5]).element_shape(), (2, 60));
+        assert_eq!(meta(&[2, 0, 4]).element_shape(), (2, 0));
+    }
+
+    #[test]
+    fn label_names_dtype_and_shape() {
+        let mut m = meta(&[2, 3]);
+        m.dtype = Dtype::BF16;
+        m.name = "model.layers.1.q_proj.weight".into();
+        assert_eq!(m.label(), "model.layers.1.q_proj.weight [BF16, 2×3]");
+    }
+
+    #[test]
+    fn label_scalar_has_empty_axis_list() {
+        assert_eq!(meta(&[]).label(), "t [F32, ]");
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     #[allow(dead_code)]
