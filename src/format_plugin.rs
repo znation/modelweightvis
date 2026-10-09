@@ -129,3 +129,138 @@ impl FormatPlugin for PickleFormatPlugin {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Minimal valid safetensors file: 8-byte LE header size + JSON header
+    /// declaring one F32 tensor + its data (same fixture shape as hooks.rs).
+    fn tiny_safetensors() -> Vec<u8> {
+        let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        out.extend_from_slice(header);
+        out.extend_from_slice(&1.0f32.to_le_bytes());
+        out
+    }
+
+    /// Minimal valid GGUF v2 stream: magic, version 2, zero tensors, one
+    /// string KV (same fixture shape as format/gguf.rs).
+    fn synthetic_no_tensor_gguf() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x46554747u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        let val = b"llama";
+        bytes.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(val);
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    fn write_file(dir: &TempDir, name: &str, data: &[u8]) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, data).unwrap();
+        p
+    }
+
+    #[test]
+    fn ids_are_distinct_and_plugin_detection_partitions_formats() {
+        assert_eq!(SafetensorsFormatPlugin.id(), "safetensors");
+        assert_eq!(GgufFormatPlugin.id(), "gguf");
+        assert_eq!(PickleFormatPlugin.id(), "pickle");
+
+        let cases = [
+            ("model.safetensors", true, false, false),
+            ("MODEL.SAFETENSORS", true, false, false),
+            ("model.gguf", false, true, false),
+            ("pytorch_model.bin", false, false, true),
+            ("model.pth", false, false, true),
+            ("model.pt", false, false, true),
+            ("notes.txt", false, false, false),
+            ("model.safetensors.bin", false, false, true),
+        ];
+        for (name, st, gguf, pickle) in cases {
+            let p = Path::new(name);
+            assert_eq!(SafetensorsFormatPlugin.detects_path(p), st, "{name}");
+            assert_eq!(GgufFormatPlugin.detects_path(p), gguf, "{name}");
+            assert_eq!(PickleFormatPlugin.detects_path(p), pickle, "{name}");
+        }
+    }
+
+    #[test]
+    fn safetensors_populate_local_inserts_model_info() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "w.safetensors", &tiny_safetensors());
+        let mut exts = Extensions::default();
+        let size = std::fs::metadata(&path).unwrap().len();
+        SafetensorsFormatPlugin
+            .populate_local(&path, size, &mut exts)
+            .expect("populates");
+        let info = exts.get::<ModelInfo>().expect("ModelInfo inserted");
+        assert_eq!(info.format, SourceFormat::Safetensors);
+        assert_eq!(info.tensors.len(), 1);
+        assert_eq!(info.tensors[0].name, "w");
+    }
+
+    #[test]
+    fn gguf_populate_local_inserts_model_info() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "model.gguf", &synthetic_no_tensor_gguf());
+        let mut exts = Extensions::default();
+        let size = std::fs::metadata(&path).unwrap().len();
+        GgufFormatPlugin
+            .populate_local(&path, size, &mut exts)
+            .expect("populates");
+        let info = exts.get::<ModelInfo>().expect("ModelInfo inserted");
+        assert_eq!(info.format, SourceFormat::Gguf);
+        assert!(info.tensors.is_empty());
+    }
+
+    #[test]
+    fn safetensors_populate_local_fails_on_garbage() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "bad.safetensors", b"not a header");
+        let mut exts = Extensions::default();
+        // Non-fatal by design: the error must surface (no partial insert).
+        assert!(SafetensorsFormatPlugin
+            .populate_local(&path, 12, &mut exts)
+            .is_err());
+        assert!(exts.get::<ModelInfo>().is_none());
+    }
+
+    #[tokio::test]
+    async fn safetensors_populate_remote_uses_owned_data() {
+        let data = Data::Owned(tiny_safetensors());
+        let size = data.len() as u64;
+        let mut exts = Extensions::default();
+        SafetensorsFormatPlugin
+            .populate_remote(&data, size, &mut exts)
+            .await
+            .expect("populates");
+        let info = exts.get::<ModelInfo>().expect("ModelInfo inserted");
+        assert_eq!(info.format, SourceFormat::Safetensors);
+        assert_eq!(info.tensors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pickle_populate_remote_is_unsupported() {
+        let data = Data::Owned(b"nothing useful".to_vec());
+        let mut exts = Extensions::default();
+        let err = PickleFormatPlugin
+            .populate_remote(&data, 14, &mut exts)
+            .await
+            .expect_err("remote pickle must fail");
+        assert!(err.to_string().contains("not yet supported"), "{err}");
+        assert!(exts.get::<ModelInfo>().is_none());
+    }
+}
