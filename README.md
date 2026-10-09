@@ -78,6 +78,12 @@ One heatmap panel per FFN weight (`gate_proj`, `up_proj`, `down_proj`) plus the 
 - `mean-abs` — mean(|x|), stable and dominated by typical entries.
 - `sparsity` — fraction of near-zero entries, surfacing dead / near-dead experts.
 
+Each panel is normalized independently (a quiet panel isn't crushed by a noisy one); how the per-cell scalars map onto the heatmap range within a panel is chosen by `--moe-norm`:
+
+- `percentile` (default) — robust min-max: clip to the 2nd/98th percentiles, then stretch. Reveals the bulk spread while ignoring a lone outlier expert.
+- `max` — linear `0 → panel-max`. Keeps an absolute-zero anchor (a dead expert reads as the colormap's low end) but crushes contrast when values cluster near the max — the original behaviour.
+- `min-max` — linear `panel-min → panel-max`. Stretches the actual range to reveal per-expert spread; drops the zero anchor.
+
 Supports HF per-expert safetensors (Qwen-MoE, OLMoE, DeepSeek routed experts), the classic Mixtral `block_sparse_moe` layout, and the newer fused `transformers` export (batched `mlp.experts.gate_up_proj` / `down_proj`). GGUF fused-expert tensors are not yet supported.
 
 ### CKA scene
