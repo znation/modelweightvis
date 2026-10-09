@@ -57,6 +57,9 @@ impl ElementStride {
     /// boundary. For fixed: `n * bytes_per_element`. For block: rounded up
     /// to the nearest whole block. For packed: rounded up to the nearest
     /// whole pack-slot (e.g. 8 elements for int4-in-int32).
+    /// `#[allow(dead_code)]` is deliberate: no current caller walks byte
+    /// ranges in ElementStride terms, but the helper is the intended unit
+    /// for the sidecar byte-range math.
     #[allow(dead_code)]
     pub fn bytes_for_elements(self, n: usize) -> usize {
         match self {
@@ -334,6 +337,11 @@ impl Dtype {
         }
     }
 
+    /// True when the dtype is a GGUF quant or an AWQ/GPTQ-style packed
+    /// integer, i.e. raw bytes cannot be read as plain f32/f16/bf16
+    /// elements.
+    /// `#[allow(dead_code)]` is deliberate: kept as the canonical dtype
+    /// classifier for the AWQ/GPTQ sidecar wire-up tracked in BUGS.md.
     #[allow(dead_code)]
     pub fn is_quantized(self) -> bool {
         matches!(
@@ -359,6 +367,8 @@ impl Dtype {
     /// True for AWQ/GPTQ-style packed integers whose dequant requires
     /// out-of-band scales (and, for GPTQ, zero-points) — see
     /// [`ElementStride::Packed`].
+    /// `#[allow(dead_code)]` is deliberate: the AWQ/GPTQ diff/xet/voxel
+    /// paths (BUGS.md Open) are the intended consumers.
     #[allow(dead_code)]
     pub fn is_packed(self) -> bool {
         matches!(
