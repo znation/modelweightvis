@@ -1588,6 +1588,48 @@ fn is_block_or_packed_dtype(dtype: format::Dtype) -> bool {
     )
 }
 
+/// Route one tensor header into the summary grouping maps: HF per-expert →
+/// `expert_groups`, HF batched fused → `fused`, HF + GGUF routers →
+/// `routers`, GGUF fused experts → `gguf_fused`. Unrelated tensors are
+/// ignored. Factored out of [`build_moe_summary_sources`] so the dispatch
+/// order (HF parsers first, GGUF fallbacks second) is unit-testable.
+fn classify_moe_tensor(
+    shard_idx: usize,
+    t: &format::TensorMeta,
+    expert_groups: &mut std::collections::BTreeMap<
+        (u32, crate::format::moe::ExpertWeight),
+        std::collections::BTreeMap<u32, (usize, format::TensorMeta)>,
+    >,
+    routers: &mut std::collections::BTreeMap<u32, (usize, format::TensorMeta)>,
+    fused: &mut std::collections::BTreeMap<
+        (u32, crate::format::moe::FusedExpertTensor),
+        (usize, format::TensorMeta),
+    >,
+    gguf_fused: &mut std::collections::BTreeMap<
+        (u32, crate::format::moe::ExpertWeight),
+        (usize, format::TensorMeta),
+    >,
+) {
+    use crate::format::moe::{
+        parse_gguf_fused_expert, parse_gguf_router, parse_hf_expert, parse_hf_fused_expert,
+        parse_hf_router,
+    };
+    if let Some(r) = parse_hf_expert(&t.name) {
+        expert_groups
+            .entry((r.layer_idx, r.weight))
+            .or_default()
+            .insert(r.expert_idx, (shard_idx, t.clone()));
+    } else if let Some((layer_idx, kind)) = parse_hf_fused_expert(&t.name) {
+        fused.insert((layer_idx, kind), (shard_idx, t.clone()));
+    } else if let Some(layer_idx) = parse_hf_router(&t.name) {
+        routers.insert(layer_idx, (shard_idx, t.clone()));
+    } else if let Some((layer_idx, weight)) = parse_gguf_fused_expert(&t.name) {
+        gguf_fused.insert((layer_idx, weight), (shard_idx, t.clone()));
+    } else if let Some(layer_idx) = parse_gguf_router(&t.name) {
+        routers.insert(layer_idx, (shard_idx, t.clone()));
+    }
+}
+
 /// Slice batched fused-expert tensors into per-expert [`ScalarJob`]s.
 ///
 /// `mlp.experts.gate_up_proj` is `[E, 2·inter, H]` (gate rows then up rows
@@ -1694,6 +1736,109 @@ fn build_fused_expert_jobs(
     (jobs, n_experts, layers)
 }
 
+/// Slice GGUF fused-expert tensors (`ffn_{gate|up|down}_exps.weight`, shape
+/// `[n_experts, out, in]` row-major) into per-expert [`ScalarJob`]s.
+///
+/// Expert `e` occupies the contiguous byte sub-range
+/// `[file_start + e*stride, file_start + (e+1)*stride)` with
+/// `stride = (file_end - file_start) / shape[0]`: dim 0 is the outermost,
+/// row-major dimension, so each expert is one contiguous slab. Quantized
+/// dtypes need no special guard here — blocks run along the last (innermost)
+/// dim, so each expert slab is a whole number of rows and stays block-aligned
+/// for canonical GGUF checkpoints; a non-aligned or ragged tensor fails the
+/// exact-divisibility check below and is logged + skipped rather than
+/// mis-sliced.
+///
+/// Returns the jobs, the largest per-layer expert count seen (for canvas
+/// sizing), and the set of layers that carried fused tensors.
+fn build_gguf_fused_expert_jobs(
+    gguf_fused: &std::collections::BTreeMap<
+        (u32, crate::format::moe::ExpertWeight),
+        (usize, format::TensorMeta),
+    >,
+) -> (Vec<ScalarJob>, u32, std::collections::BTreeSet<u32>) {
+    let mut jobs: Vec<ScalarJob> = Vec::new();
+    let mut n_experts: u32 = 0;
+    let mut layers: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+
+    for (&(layer_idx, weight), (shard, meta)) in gguf_fused {
+        let e = meta.shape.first().copied().unwrap_or(0);
+        let total = meta.file_end.saturating_sub(meta.file_start);
+        if e == 0 || total == 0 {
+            log::warn!(
+                "moe-summary: GGUF fused {} tensor at layer {} has shape[0]={} / \
+                 byte range {} — skipping",
+                weight.label(),
+                layer_idx,
+                e,
+                total,
+            );
+            continue;
+        }
+        let stride = total / e;
+        if stride == 0 || stride * e != total {
+            log::warn!(
+                "moe-summary: GGUF fused {} tensor at layer {} ({} bytes) does not divide \
+                 evenly into {} expert slabs — not block-aligned; skipping",
+                weight.label(),
+                layer_idx,
+                total,
+                e,
+            );
+            continue;
+        }
+        n_experts = n_experts.max(e as u32);
+        layers.insert(layer_idx);
+        for expert_idx in 0..e {
+            let start = meta.file_start + expert_idx * stride;
+            jobs.push((
+                (layer_idx, weight, expert_idx as u32),
+                *shard,
+                start,
+                stride,
+                meta.dtype,
+            ));
+        }
+    }
+    (jobs, n_experts, layers)
+}
+
+/// Compute per-expert scalars from one fetched router tensor. `meta.shape`
+/// must be `[n_experts, cols]` and `bytes` the full tensor byte range. Row
+/// stride comes from `dtype.stride().bytes_per_row(cols)` — the block/packed
+/// aware row size, not `cols × element_size()`, which under-sizes quantized
+/// rows. Rows past the fetched bytes (truncated range) yield 0.0 rather than
+/// panicking.
+fn slice_router_rows(
+    stat: format::SummaryStat,
+    meta: &format::TensorMeta,
+    n_experts: u32,
+    bytes: &[u8],
+) -> Vec<(u32, f32)> {
+    let cols = meta.shape[1];
+    let row_bytes = meta.dtype.stride().bytes_per_row(cols) as usize;
+    let mut out: Vec<(u32, f32)> = Vec::new();
+    for e in 0..n_experts as usize {
+        let off = e * row_bytes;
+        let end = off + row_bytes;
+        if end > bytes.len() {
+            log::warn!(
+                "moe-summary: router row {} of `{}` out of bounds (off={} end={} len={}); \
+                 padding with 0",
+                e,
+                meta.name,
+                off,
+                end,
+                bytes.len(),
+            );
+            out.push((e as u32, 0.0));
+        } else {
+            out.push((e as u32, scalar_from_buf(stat, meta.dtype, &bytes[off..end])));
+        }
+    }
+    out
+}
+
 /// Model data shared by both `--moe` scene builders: the opened/materialized
 /// per-shard [`Data`] handles plus their parsed tensor headers. Built once by
 /// [`open_moe_model_sources`] so a combined `--moe` render loads the model a
@@ -1711,7 +1856,7 @@ struct LoadedMoe {
 /// file-open + header-fetch preamble, factored out so `--moe` loads once.
 async fn open_moe_model_sources(input: &str, stream: bool) -> anyhow::Result<LoadedMoe> {
     // === File opening ===================================================
-    let (datas, fmts, file_names) = if hf_url::is_repo_level(input)? {
+    let (datas, fmts, _file_names) = if hf_url::is_repo_level(input)? {
         let listed = hf_url::list_repo_as_http_specs(input)
             .await
             .with_context(|| format!("listing files in {input}"))?;
@@ -1866,24 +2011,6 @@ async fn open_moe_model_sources(input: &str, stream: bool) -> anyhow::Result<Loa
         pb.finish_and_clear();
     }
 
-    // GGUF fused-expert rejection — not yet supported by either scene.
-    for (shard_idx, tensors) in &headers {
-        if matches!(fmts[*shard_idx], SourceFormat::Gguf)
-            && tensors
-                .iter()
-                .any(|t| crate::format::moe::is_fused_gguf_expert(&t.name))
-        {
-            anyhow::bail!(
-                "--moe: GGUF fused expert tensors are not yet supported \
-                 (found `ffn_*_exps.weight` in {}).",
-                file_names
-                    .get(*shard_idx)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>"),
-            );
-        }
-    }
-
     Ok(LoadedMoe { datas, headers })
 }
 
@@ -1996,10 +2123,7 @@ async fn build_moe_summary_sources(
     let headers = loaded.headers.clone();
 
     // === Group per-expert + router tensors ================================
-    use crate::format::moe::{
-        parse_hf_expert, parse_hf_fused_expert, parse_hf_router, ExpertWeight as EW,
-        FusedExpertTensor,
-    };
+    use crate::format::moe::{ExpertWeight as EW, FusedExpertTensor};
     use std::collections::BTreeMap;
     type LayerKey = (u32, EW);
     let mut expert_groups: BTreeMap<LayerKey, BTreeMap<u32, (usize, format::TensorMeta)>> =
@@ -2009,18 +2133,19 @@ async fn build_moe_summary_sources(
     // `(layer, GateUp|Down)`, sliced into per-expert byte ranges below.
     let mut fused: BTreeMap<(u32, FusedExpertTensor), (usize, format::TensorMeta)> =
         BTreeMap::new();
+    // GGUF fused-expert tensors (`ffn_{gate|up|down}_exps.weight`): one entry
+    // per `(layer, weight)`, sliced into per-expert byte ranges below.
+    let mut gguf_fused: BTreeMap<LayerKey, (usize, format::TensorMeta)> = BTreeMap::new();
     for (shard_idx, tensors) in &headers {
         for t in tensors {
-            if let Some(r) = parse_hf_expert(&t.name) {
-                expert_groups
-                    .entry((r.layer_idx, r.weight))
-                    .or_default()
-                    .insert(r.expert_idx, (*shard_idx, t.clone()));
-            } else if let Some((layer_idx, kind)) = parse_hf_fused_expert(&t.name) {
-                fused.insert((layer_idx, kind), (*shard_idx, t.clone()));
-            } else if let Some(layer_idx) = parse_hf_router(&t.name) {
-                routers.insert(layer_idx, (*shard_idx, t.clone()));
-            }
+            classify_moe_tensor(
+                *shard_idx,
+                t,
+                &mut expert_groups,
+                &mut routers,
+                &mut fused,
+                &mut gguf_fused,
+            );
         }
     }
 
@@ -2031,8 +2156,9 @@ async fn build_moe_summary_sources(
     // right offset and length. Returns the jobs plus the per-layer expert
     // count discovered from the tensor shapes.
     let (fused_jobs, fused_n_experts, fused_layers) = build_fused_expert_jobs(&fused);
+    let (gguf_jobs, gguf_n_experts, gguf_layers) = build_gguf_fused_expert_jobs(&gguf_fused);
 
-    if expert_groups.is_empty() && fused_jobs.is_empty() {
+    if expert_groups.is_empty() && fused_jobs.is_empty() && gguf_jobs.is_empty() {
         anyhow::bail!(
             "--moe-summary: no per-expert tensors found in {input} \
              (expected `model.layers.{{L}}.mlp.experts.{{E}}.{{gate|up|down}}_proj.weight` \
@@ -2051,8 +2177,8 @@ async fn build_moe_summary_sources(
             set.insert(*l);
         }
         // Fused checkpoints carry no per-expert tensors, so their layers come
-        // entirely from the batched-tensor scan.
-        for l in &fused_layers {
+        // entirely from the batched-tensor scan (HF batched and GGUF alike).
+        for l in fused_layers.iter().chain(gguf_layers.iter()) {
             set.insert(*l);
         }
         set.into_iter().collect()
@@ -2063,7 +2189,8 @@ async fn build_moe_summary_sources(
         .max()
         .map(|m| m + 1)
         .unwrap_or(0)
-        .max(fused_n_experts);
+        .max(fused_n_experts)
+        .max(gguf_n_experts);
     let n_layers = layer_ids.len() as u32;
     if n_layers == 0 || n_experts == 0 {
         anyhow::bail!("--moe-summary: derived n_layers=0 or n_experts=0 from {input}");
@@ -2093,6 +2220,7 @@ async fn build_moe_summary_sources(
     // Per-expert jobs sliced out of the batched fused tensors join the same
     // pool — downstream only cares about `(layer, weight, expert) → scalar`.
     jobs.extend(fused_jobs);
+    jobs.extend(gguf_jobs);
     let pb = setup_progress("moe-summary expert scalars", jobs.len() as u64);
     let datas_ref = &datas;
     let pb_for_workers = pb.clone();
@@ -2129,10 +2257,14 @@ async fn build_moe_summary_sources(
     }
 
     // === Per-row router slicing ===========================================
-    // For each layer's `mlp.gate.weight` (shape `[n_experts, hidden_dim]`),
-    // fetch the whole tensor once then slice each row as one expert's gate
-    // vector. Skip layers whose router shape doesn't match the inferred
-    // n_experts (defensive: a mis-shaped router would mis-index the heatmap).
+    // For each layer's router gate (HF `mlp.gate.weight`, GGUF
+    // `ffn_gate_inp.weight`; shape `[n_experts, hidden_dim]`), fetch the whole
+    // tensor once then slice each row as one expert's gate vector. Row
+    // addressing uses `dtype.stride().bytes_per_row(cols)`, which is correct
+    // for block-quantized dtypes too (blocks run along the row/last dim, so a
+    // whole row is a whole number of blocks). Skip layers whose router shape
+    // doesn't match the inferred n_experts (defensive: a mis-shaped router
+    // would mis-index the heatmap).
     let mut router_scalars: BTreeMap<(u32, u32), f32> = BTreeMap::new();
     if !routers.is_empty() {
         let pb = setup_progress("moe-summary router scalars", routers.len() as u64);
@@ -2164,39 +2296,28 @@ async fn build_moe_summary_sources(
                         );
                     } else {
                         let cols = meta.shape[1];
-                        let elem = meta.dtype.element_size() as u64;
-                        let row_bytes = cols.saturating_mul(elem);
+                        let row_bytes = meta.dtype.stride().bytes_per_row(cols);
                         let total = meta.file_end.saturating_sub(meta.file_start);
-                        match d.fetch_range(meta.file_start, total as usize).await {
-                            Ok(bytes) => {
-                                for e in 0..n_experts as u64 {
-                                    let off = (e * row_bytes) as usize;
-                                    let end = off + row_bytes as usize;
-                                    if end > bytes.len() {
-                                        log::warn!(
-                                            "moe-summary: router row {} of layer {} out of \
-                                             bounds (off={} end={} len={}); padding with 0",
-                                            e,
-                                            layer_idx,
-                                            off,
-                                            end,
-                                            bytes.len(),
-                                        );
-                                        out.push((e as u32, 0.0));
-                                    } else {
-                                        out.push((
-                                            e as u32,
-                                            scalar_from_buf(stat, meta.dtype, &bytes[off..end]),
-                                        ));
-                                    }
+                        if row_bytes == 0 {
+                            log::warn!(
+                                "moe-summary: router at layer {} has cols={} with dtype {:?} \
+                                 (row bytes = 0); skipping",
+                                layer_idx,
+                                cols,
+                                meta.dtype,
+                            );
+                        } else {
+                            match d.fetch_range(meta.file_start, total as usize).await {
+                                Ok(bytes) => {
+                                    out = slice_router_rows(stat, &meta, n_experts, &bytes);
                                 }
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "moe-summary: router fetch failed for layer {} ({e}); \
-                                     padding with 0",
-                                    layer_idx,
-                                );
+                                Err(e) => {
+                                    log::warn!(
+                                        "moe-summary: router fetch failed for layer {} ({e}); \
+                                         padding with 0",
+                                        layer_idx,
+                                    );
+                                }
                             }
                         }
                     }
@@ -3422,6 +3543,210 @@ mod tests {
         );
         let (jobs, _, _) = build_fused_expert_jobs(&rank);
         assert!(jobs.is_empty());
+    }
+
+    // Like `meta`, but with an explicit byte range — needed for quantized
+    // dtypes where the byte length is not `elems × element_size()`.
+    fn meta_bytes(
+        shape: Vec<u64>,
+        dtype: format::Dtype,
+        file_start: u64,
+        byte_len: u64,
+    ) -> format::TensorMeta {
+        format::TensorMeta {
+            name: "t".into(),
+            dtype,
+            file_start,
+            file_end: file_start + byte_len,
+            shape,
+            packed_sidecars: None,
+        }
+    }
+
+    #[test]
+    fn gguf_fused_jobs_slice_by_outer_dim_with_exact_union() {
+        // blk.0.ffn_gate_exps.weight, shape [E=4, 32, 8] F32 at offset 1000 →
+        // 4*32*8*4 = 4096 bytes, one contiguous 1024-byte slab per expert.
+        let mut g: BTreeMap<(u32, EW), (usize, format::TensorMeta)> = BTreeMap::new();
+        g.insert(
+            (0, EW::GateProj),
+            (0, meta(vec![4, 32, 8], format::Dtype::F32, 1000)),
+        );
+        let (jobs, n_experts, layers) = build_gguf_fused_expert_jobs(&g);
+        assert_eq!(n_experts, 4);
+        assert_eq!(layers.into_iter().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(jobs.len(), 4);
+        // Exact coverage: slabs tile [1000, 5000) with no gaps or overlap.
+        for (e, &(key, shard, start, len, dt)) in jobs.iter().enumerate() {
+            assert_eq!(key, (0, EW::GateProj, e as u32));
+            assert_eq!((shard, start, len, dt), (0, 1000 + e as u64 * 1024, 1024, format::Dtype::F32));
+        }
+        // Second shard, second weight — down_exps maps to DownProj.
+        g.insert(
+            (3, EW::DownProj),
+            (1, meta(vec![4, 8, 32], format::Dtype::F32, 9000)),
+        );
+        let (jobs2, _, layers2) = build_gguf_fused_expert_jobs(&g);
+        assert_eq!(jobs2.len(), 8);
+        assert_eq!(layers2.into_iter().collect::<Vec<_>>(), vec![0, 3]);
+        let down = jobs2
+            .iter()
+            .find(|&&(k, _, _, _, _)| k == (3, EW::DownProj, 2))
+            .unwrap();
+        assert_eq!(down.2, 9000 + 2 * 1024);
+    }
+
+    #[test]
+    fn gguf_fused_jobs_quantized_slabs_stay_block_aligned() {
+        // Q8_0 blocks (34 bytes / 32 elems) run along the last dim. With cols
+        // = 64 (2 blocks per row), shape [2, 64] → per-row bytes = 68, total =
+        // 136; each expert slab is whole rows and therefore whole blocks, so
+        // the slicer accepts it.
+        let mut g: BTreeMap<(u32, EW), (usize, format::TensorMeta)> = BTreeMap::new();
+        g.insert(
+            (1, EW::UpProj),
+            (0, meta_bytes(vec![2, 64], format::Dtype::Q8_0, 0, 136)),
+        );
+        let (jobs, n_experts, _) = build_gguf_fused_expert_jobs(&g);
+        assert_eq!(n_experts, 2);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].3, 68); // stride
+        assert_eq!(jobs[1].2, 68); // expert 1 starts one slab in
+    }
+
+    #[test]
+    fn gguf_fused_jobs_skip_ragged_and_degenerate() {
+        // Byte range not divisible by shape[0] (non-block-aligned last dim):
+        // Q8_0 [3, 63] → elem_count 189 rounds down to 5 blocks = 170 bytes;
+        // 170 % 3 ≠ 0 → skipped rather than mis-sliced.
+        let mut ragged: BTreeMap<(u32, EW), (usize, format::TensorMeta)> = BTreeMap::new();
+        ragged.insert(
+            (0, EW::GateProj),
+            (0, meta_bytes(vec![3, 63], format::Dtype::Q8_0, 0, 170)),
+        );
+        let (jobs, n_experts, _) = build_gguf_fused_expert_jobs(&ragged);
+        assert!(jobs.is_empty());
+        assert_eq!(n_experts, 0);
+
+        // Zero experts / zero bytes are degenerate.
+        let mut zero: BTreeMap<(u32, EW), (usize, format::TensorMeta)> = BTreeMap::new();
+        zero.insert((0, EW::GateProj), (0, meta(vec![0, 8], format::Dtype::F32, 0)));
+        let (jobs, _, _) = build_gguf_fused_expert_jobs(&zero);
+        assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn slice_router_rows_f32_uses_fixed_row_stride() {
+        // Router shape [2, 4] F32: row stride 16 bytes, values 1.0 / 0.0.
+        let m = meta(vec![2, 4], format::Dtype::F32, 0);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+        let rows = slice_router_rows(
+            format::SummaryStat::MeanAbs,
+            &m,
+            2,
+            &bytes,
+        );
+        assert_eq!(rows, vec![(0, 1.0), (1, 0.0)]);
+    }
+
+    #[test]
+    fn slice_router_rows_q8_0_uses_block_aware_row_stride() {
+        // The motivating quantized case: router shape [2, 256] Q8_0. The row
+        // stride must come from the block-aware `bytes_per_row` (256/32 blocks
+        // × 34 bytes = 272) — not 256 × element_size() = 256, which would
+        // slice mid-block. Assert the stride formula first, then that the
+        // block-aware path runs the full decode without panicking.
+        let m = meta_bytes(vec![2, 256], format::Dtype::Q8_0, 0, 544);
+        assert_eq!(m.dtype.stride().bytes_per_row(256), 272);
+        // 16 all-zero Q8_0 blocks (34 bytes each) go through the block-aware
+        // decode. (candle's dequant kernel returns unstable values for
+        // hand-built raw blocks — the same reason the dtype.rs reader test
+        // only asserts finiteness — so only finiteness is checked here; the
+        // stride formula above is the exact-behaviour assertion.)
+        let bytes = vec![0u8; 544];
+        let rows = slice_router_rows(format::SummaryStat::MeanAbs, &m, 2, &bytes);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[1].0, 1);
+        for (e, v) in &rows {
+            assert!(v.is_finite(), "row {e} = {v}, expected finite");
+        }
+
+        // With the buggy fixed-element_size stride (256), the row-0 slice
+        // would be bytes[0..256] — 7 whole blocks plus a ragged 18-byte tail —
+        // and rows would land mid-block. The block-aware stride keeps every
+        // row slice block-aligned: row 1 starts at byte 272 = 8 whole blocks in,
+        // and the whole 544-byte range is exactly 16 whole blocks (512 elements).
+        assert!(format::rms_from_buf(format::Dtype::Q8_0, &bytes).is_finite());
+    }
+
+    #[test]
+    fn slice_router_rows_truncated_tail_pads_with_zero() {
+        // Fewer bytes than n_experts rows → out-of-range rows yield 0.0
+        // instead of panicking.
+        let m = meta(vec![2, 4], format::Dtype::F32, 0);
+        let bytes = 1.0_f32.to_le_bytes(); // one element, far short of 32 bytes
+        let rows = slice_router_rows(format::SummaryStat::MeanAbs, &m, 2, &bytes);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].1, 0.0);
+    }
+
+    #[test]
+    fn classify_routes_gguf_and_hf_into_the_right_maps() {
+        let mut expert_groups: BTreeMap<(u32, EW), BTreeMap<u32, (usize, format::TensorMeta)>> =
+            BTreeMap::new();
+        let mut routers: BTreeMap<u32, (usize, format::TensorMeta)> = BTreeMap::new();
+        let mut fused: BTreeMap<(u32, FusedExpertTensor), (usize, format::TensorMeta)> =
+            BTreeMap::new();
+        let mut gguf_fused: BTreeMap<(u32, EW), (usize, format::TensorMeta)> = BTreeMap::new();
+        let mk = |name: &str| format::TensorMeta {
+            name: name.into(),
+            dtype: format::Dtype::F32,
+            file_start: 0,
+            file_end: 4,
+            shape: vec![1],
+            packed_sidecars: None,
+        };
+        let route = |name: &str,
+                     shard: usize,
+                     e: &mut BTreeMap<(u32, EW), BTreeMap<u32, (usize, format::TensorMeta)>>,
+                     r: &mut BTreeMap<u32, (usize, format::TensorMeta)>,
+                     f: &mut BTreeMap<(u32, FusedExpertTensor), (usize, format::TensorMeta)>,
+                     g: &mut BTreeMap<(u32, EW), (usize, format::TensorMeta)>| {
+            classify_moe_tensor(shard, &mk(name), e, r, f, g);
+        };
+        // GGUF names → gguf_fused / routers.
+        route("blk.0.ffn_gate_exps.weight", 0, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        route("blk.0.ffn_up_exps.weight", 0, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        route("blk.0.ffn_down_exps.weight", 1, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        route("blk.0.ffn_gate_inp.weight", 2, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        assert_eq!(gguf_fused.keys().collect::<Vec<_>>(), vec![&(0, EW::GateProj), &(0, EW::UpProj), &(0, EW::DownProj)]);
+        assert_eq!(gguf_fused[&(0, EW::DownProj)].0, 1);
+        assert_eq!(routers.get(&0).map(|(_, m)| m.name.clone()), Some("blk.0.ffn_gate_inp.weight".into()));
+        assert!(routers.contains_key(&0));
+        // HF names land in their existing maps, untouched by the GGUF branch.
+        route("model.layers.0.mlp.experts.2.up_proj.weight", 3, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        route("model.layers.0.mlp.gate.weight", 4, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        route("model.layers.1.mlp.experts.gate_up_proj.weight", 5, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        assert!(expert_groups.contains_key(&(0, EW::UpProj)));
+        assert_eq!(expert_groups[&(0, EW::UpProj)][&2].0, 3);
+        assert_eq!(routers.get(&0).map(|(_, m)| m.name.clone()), Some("model.layers.0.mlp.gate.weight".into()));
+        assert!(fused.contains_key(&(1, FusedExpertTensor::GateUp)));
+        // Unrelated tensors go nowhere.
+        route("token_embd.weight", 6, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        route("blk.0.attn_q.weight", 6, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        route("blk.0.ffn_gate.weight", 6, &mut expert_groups, &mut routers, &mut fused, &mut gguf_fused);
+        assert_eq!(routers.len(), 1); // only the HF router overwrote layer 0
+        assert_eq!(gguf_fused.len(), 3);
+        assert_eq!(fused.len(), 1);
     }
 
 }

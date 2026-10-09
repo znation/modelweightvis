@@ -8,9 +8,11 @@
 //! shared experts run on every token and aren't part of the routed N×N matrix.
 //!
 //! GGUF fuses all experts of one layer into a single tensor named
-//! `blk.{L}.ffn_{gate|up|down}_exps.weight`. Per-expert visualisation of GGUF
-//! checkpoints is out of scope for v1 — `is_fused_gguf_expert` lets callers
-//! detect and reject this case cleanly.
+//! `blk.{L}.ffn_{gate|up|down}_exps.weight`. [`parse_gguf_fused_expert`] maps
+//! those onto the same `(layer, ExpertWeight)` slots as the HF parsers, so the
+//! `--moe` summary scene can slice them into per-expert byte ranges;
+//! [`parse_gguf_router`] does the same for the per-layer router
+//! `blk.{L}.ffn_gate_inp.weight`.
 //!
 //! See [`crate::format::name_map`] for the cross-format diff canonicaliser
 //! (which deliberately collapses HF per-expert names to the GGUF fused form
@@ -153,18 +155,49 @@ pub fn parse_hf_fused_expert(name: &str) -> Option<(u32, FusedExpertTensor)> {
     Some((layer_idx, kind))
 }
 
-/// Whether `name` is a GGUF fused-expert tensor (`ffn_{gate|up|down}_exps.weight`,
-/// optionally under `blk.{L}.`). Used by callers to bail with a clear error
-/// before attempting per-expert layout on a GGUF checkpoint.
-pub fn is_fused_gguf_expert(name: &str) -> bool {
-    let leaf = match name.strip_prefix("blk.") {
-        Some(rest) => rest.split_once('.').map(|(_, x)| x).unwrap_or(rest),
-        None => name,
+/// Parse a GGUF fused-expert tensor name. Returns the layer index and which
+/// expert weight the tensor holds, for `blk.{L}.ffn_{gate|up|down}_exps.weight`.
+/// The bare-leaf form (no `blk.{L}.` prefix, as produced by the diff
+/// canonicaliser's prefix-stripping) maps to layer 0. Returns `None` for
+/// anything else — including the per-tensor (non-fused) `ffn_{gate|up|down}.weight`,
+/// which lacks the `_exps` suffix, and non-expert GGUF tensors.
+///
+/// This is the GGUF counterpart to [`parse_hf_expert`] and [`parse_hf_fused_expert`];
+/// the three never collide because the GGUF names use `blk.{N}.ffn_*` addressing
+/// and the `_exps` suffix, while the HF names require `model.layers.{N}.mlp.experts.…`.
+pub fn parse_gguf_fused_expert(name: &str) -> Option<(u32, ExpertWeight)> {
+    let (layer_idx, leaf) = gguf_layer_leaf(name)?;
+    let weight = match leaf {
+        "ffn_gate_exps.weight" => ExpertWeight::GateProj,
+        "ffn_up_exps.weight" => ExpertWeight::UpProj,
+        "ffn_down_exps.weight" => ExpertWeight::DownProj,
+        _ => return None,
     };
-    matches!(
-        leaf,
-        "ffn_gate_exps.weight" | "ffn_up_exps.weight" | "ffn_down_exps.weight"
-    )
+    Some((layer_idx, weight))
+}
+
+/// Parse a GGUF router-gate tensor name. Returns the layer index for
+/// `blk.{L}.ffn_gate_inp.weight` (the per-layer MoE router whose rows are
+/// per-expert gate vectors). The bare-leaf form maps to layer 0, as in
+/// [`parse_gguf_fused_expert`]. Returns `None` for anything else — including
+/// the per-expert `ffn_gate.weight`/`ffn_gate_exps.weight` (different leaves,
+/// handled by other parsers or ignored) and attention tensors.
+pub fn parse_gguf_router(name: &str) -> Option<u32> {
+    let (layer_idx, leaf) = gguf_layer_leaf(name)?;
+    (leaf == "ffn_gate_inp.weight").then_some(layer_idx)
+}
+
+/// Split a GGUF tensor name into `(layer_idx, leaf)`. `blk.{L}.{leaf}` yields
+/// the parsed layer index; a bare leaf (no `blk.` prefix) yields layer 0.
+/// Returns `None` for a `blk.` prefix whose layer segment isn't numeric.
+fn gguf_layer_leaf(name: &str) -> Option<(u32, &str)> {
+    match name.strip_prefix("blk.") {
+        Some(rest) => {
+            let (l, leaf) = rest.split_once('.')?;
+            Some((l.parse().ok()?, leaf))
+        }
+        None => Some((0, name)),
+    }
 }
 
 #[cfg(test)]
@@ -376,21 +409,57 @@ mod tests {
     }
 
     #[test]
-    fn detects_gguf_fused_experts() {
-        assert!(is_fused_gguf_expert("blk.0.ffn_gate_exps.weight"));
-        assert!(is_fused_gguf_expert("blk.31.ffn_up_exps.weight"));
-        assert!(is_fused_gguf_expert("blk.15.ffn_down_exps.weight"));
+    fn parses_gguf_fused_experts() {
+        let (l, w) = parse_gguf_fused_expert("blk.0.ffn_gate_exps.weight").unwrap();
+        assert_eq!((l, w), (0, ExpertWeight::GateProj));
+        let (l, w) = parse_gguf_fused_expert("blk.31.ffn_up_exps.weight").unwrap();
+        assert_eq!((l, w), (31, ExpertWeight::UpProj));
+        let (l, w) = parse_gguf_fused_expert("blk.15.ffn_down_exps.weight").unwrap();
+        assert_eq!((l, w), (15, ExpertWeight::DownProj));
         // Bare-leaf form (canonicaliser strips the `blk.{N}.` prefix
-        // before lookup).
-        assert!(is_fused_gguf_expert("ffn_gate_exps.weight"));
+        // before lookup) maps to layer 0.
+        assert_eq!(
+            parse_gguf_fused_expert("ffn_gate_exps.weight"),
+            Some((0, ExpertWeight::GateProj))
+        );
     }
 
     #[test]
-    fn fused_detector_rejects_unrelated() {
-        assert!(!is_fused_gguf_expert("blk.0.ffn_gate.weight"));
-        assert!(!is_fused_gguf_expert("blk.0.attn_q.weight"));
-        assert!(!is_fused_gguf_expert(
-            "model.layers.0.mlp.experts.0.gate_proj.weight"
-        ));
+    fn parses_gguf_router() {
+        assert_eq!(parse_gguf_router("blk.7.ffn_gate_inp.weight"), Some(7));
+        assert_eq!(parse_gguf_router("ffn_gate_inp.weight"), Some(0));
+        // Per-tensor (non-fused) and attention tensors never match.
+        assert_eq!(parse_gguf_router("blk.7.ffn_gate.weight"), None);
+        assert_eq!(parse_gguf_router("blk.7.attn_q.weight"), None);
+        // Non-numeric layer segment is rejected.
+        assert_eq!(parse_gguf_router("blk.x.ffn_gate_inp.weight"), None);
+    }
+
+    #[test]
+    fn gguf_parsers_reject_unrelated_and_dont_collide_with_hf() {
+        for name in [
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.ffn_gate_exps",       // missing .weight suffix
+            "blk.0.attn_q.weight",
+            "blk.0.ffn_gate_inp_ff.weight",
+            "model.layers.0.mlp.experts.0.gate_proj.weight",
+            "token_embd.weight",
+        ] {
+            assert_eq!(parse_gguf_fused_expert(name), None, "{name}");
+            assert_eq!(parse_gguf_router(name), None, "{name}");
+        }
+        // HF-style names parse under the HF parsers, not the GGUF ones, and
+        // vice versa: the two families never cross-match.
+        let hf = "model.layers.3.mlp.experts.1.gate_proj.weight";
+        assert!(parse_hf_expert(hf).is_some());
+        assert_eq!(parse_gguf_fused_expert(hf), None);
+        let gguf = "blk.3.ffn_gate_exps.weight";
+        assert!(parse_gguf_fused_expert(gguf).is_some());
+        assert_eq!(parse_hf_expert(gguf), None);
+        assert_eq!(parse_hf_router(gguf), None);
+        assert_eq!(parse_hf_router("blk.3.ffn_gate_inp.weight"), None);
+        assert_eq!(parse_hf_fused_expert(gguf), None);
     }
 }

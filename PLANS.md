@@ -5,7 +5,12 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 
 ## Planned
 
-### Support GGUF fused-expert tensors in `--moe` Summary scene
+_None yet._
+
+
+## Done
+
+### Support GGUF fused-expert tensors in `--moe` Summary scene (done 2026-10-09)
 
 **Goal.** `--moe` currently hard-errors on GGUF MoE checkpoints (`ffn_{gate|up|down}_exps.weight`, e.g. Mixtral/Qwen GGUF quants) — see the bail in `open_moe_model_sources` (`src/data.rs`, the `is_fused_gguf_expert` rejection block, currently commented "GGUF fused-expert rejection — not yet supported by either scene"). The Summary scene should render these checkpoints like every other fused-layout export (HF batched `gate_up_proj` already works).
 
@@ -24,7 +29,24 @@ Each plan: goal, approach, files touched, acceptance criteria. Move finished pla
 
 _Found by plan loop 2026-10-09._
 
-
-## Done
-
-_None yet._
+**Implemented 2026-10-09 by feature (second attempt — first attempt rejected in review).**
+- `src/format/moe.rs`: `parse_gguf_fused_expert` + `parse_gguf_router` added as planned;
+  `is_fused_gguf_expert` (the reject-only detector) removed — its only caller was the deleted
+  bail. Bare (no-`blk.`) leaf form maps to layer 0, matching the diff canonicaliser's
+  prefix-stripped lookups.
+- `src/data.rs`: `build_gguf_fused_expert_jobs` slices `[E, …, …]` GGUF fused tensors by
+  outer-dim byte stride with an exact-divisibility guard (a ragged/non-block-aligned tensor
+  is logged and skipped, never mis-sliced). Router dispatch (HF + GGUF) now goes through
+  `classify_moe_tensor`, extracted from the inline scan so the dispatch order is unit-tested.
+- **Review fix 1 — quantized routers:** the per-row router path previously computed
+  `row_bytes = cols × element_size()`, which under-sizes block-quantized rows
+  (Q8_0 row of 256 elems is 272 bytes, not 256) and silently mis-sliced router rows. It now
+  uses `dtype.stride().bytes_per_row(cols)`; the row math lives in `slice_router_rows`,
+  unit-tested for F32 (exact values) and Q8_0 (272-byte block-aware stride, finite decode,
+  truncated-tail 0.0 padding).
+- **Review fix 2 — wiring tests:** `classify_routes_gguf_and_hf_into_the_right_maps` covers
+  the GGUF→map wiring end to end, plus parser non-collision tests in `moe.rs` and
+  exact-union coverage tests for the GGUF fused slicer (aligned, quantized-aligned,
+  ragged-skip).
+- The CKA scene's existing no-per-expert-tensors warning-and-skip now covers GGUF fused
+  checkpoints since the bail is gone; no CKA code change was needed.
