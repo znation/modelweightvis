@@ -43,7 +43,7 @@ use arbvis::{encode_tile, Data, TileFormat, TILE};
 use crate::format::{DiffMetric, Dtype, ElementStride};
 use crate::layout::arch::ArchLayout;
 use crate::layout::render::{
-    diff_element_color, plain_element_color, plain_element_color_sidecars, xet_element_color,
+    diff_element_color, plain_element_color_sidecars, xet_element_color,
     SidecarView, PADDING_RGB,
 };
 use crate::layout::TileRegion;
@@ -524,7 +524,7 @@ pub fn render_arch_tile_diff(
     pixel_lut: &[Rgb<u8>; 256],
     fmt: TileFormat,
 ) -> TileResult {
-    render_arch_tile(tile, fmt, |img, _i, region, bytes, leading, is_compact| {
+    render_arch_tile(tile, fmt, |img, i, region, bytes, leading, is_compact| {
         let dtype = region.dtype;
         if is_compact {
             // Compact buffer is one byte per painted pixel — exactly the
@@ -534,17 +534,34 @@ pub fn render_arch_tile_diff(
                 img.put_pixel(px, py, pixel_lut[byte as usize]);
             });
         } else {
+            // Packed-int (AWQ/GPTQ) regions carry fetched scales/qzeros
+            // sidecars; hand them to the decoder so non-diff packed regions
+            // inside a diff run dequantise instead of painting NaN sentinels.
+            let sidecar = tile.sidecars.get(i).and_then(|s| s.as_ref()).map(|sc| SidecarView {
+                scales: &sc.scales,
+                scales_dtype: sc.scales_dtype,
+                zeros: sc.zeros.as_deref(),
+                zeros_dtype: sc.zeros_dtype,
+                cols: sc.cols,
+                anchor: sc.anchor,
+            });
             iter_region_pixels(region, leading, |px, py, elem_off| {
                 // `TensorDiff` produces one byte per *element pair* (not per
                 // element of the source dtype). For diff buffers `dtype` is U8
                 // and `stride` is `Fixed(1)`, so the per-pixel byte index is
                 // exactly `elem_off`. Non-diff regions inside a diff run fall
-                // through to the plain-element path.
+                // through to the plain-element path (sidecar-aware).
                 let stride = dtype.stride();
                 let byte = match stride {
                     ElementStride::Fixed(1) => bytes.get(elem_off).copied().unwrap_or(127),
                     _ => {
-                        let plain = plain_element_color(dtype, bytes, elem_off, pixel_lut);
+                        let plain = plain_element_color_sidecars(
+                            dtype,
+                            bytes,
+                            elem_off,
+                            sidecar.as_ref(),
+                            pixel_lut,
+                        );
                         img.put_pixel(px, py, plain);
                         return;
                     }
@@ -905,6 +922,72 @@ mod region_byte_span_tests {
         for py in 0..4u32 {
             for px in 0..8u32 {
                 assert_eq!(img[(px, py)], PADDING_RGB, "pixel ({px},{py})");
+            }
+        }
+    }
+
+    #[test]
+    fn diff_tile_renders_packed_region_with_sidecars() {
+        // Same setup as `plain_tile_renders_packed_region_with_sidecars`, but
+        // through the diff renderer: a packed-int (non-diff) region inside a
+        // diff run falls through to the plain-element path, which must be
+        // sidecar-aware — otherwise AWQ/GPTQ weights paint NaN sentinels in
+        // diff mode too.
+        let qweight: Vec<u8> = [0u32, 1, 2, 3]
+            .iter()
+            .map(|r| r * 0x1111_1111)
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let scales: Vec<u8> = (0..8)
+            .flat_map(|c| ((c as f32) + 1.0).to_le_bytes())
+            .collect();
+        let expect = |r: u64, c: u64| -> f32 { r as f32 * (c as f32 + 1.0) };
+
+        let region = TileRegion {
+            source_idx: 0,
+            tensor_id: 0,
+            dtype: Dtype::Int4Packed,
+            tensor_rows: 4,
+            tensor_cols: 8,
+            row_first: 2,
+            row_last_exclusive: 4,
+            col_first: 0,
+            col_last_exclusive: 8,
+            tensor_byte_start: 0,
+            footprint_w: 8,
+            footprint_h: 8,
+            samp_x0: 0,
+            samp_y0: 4,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: 8,
+            tile_y1: 4,
+        };
+        let lut: Vec<Rgb<u8>> = (0..256).map(|i| Rgb([i as u8, 0, 0])).collect();
+        let mut lut_arr = [Rgb([0u8, 0, 0]); 256];
+        lut_arr.copy_from_slice(&lut);
+
+        let tile = LoadedArchTile {
+            regions: vec![(region, qweight[8..16].to_vec(), 0, false)],
+            magnitude_lut: false,
+            sidecars: vec![Some(OwnedRegionSidecars {
+                scales,
+                scales_dtype: Dtype::F32,
+                zeros: None,
+                zeros_dtype: Dtype::Unknown,
+                cols: 8,
+                anchor: (2, 0),
+            })],
+        };
+
+        // With sidecars: painted rows decode to r * (c + 1); its f32 MSB
+        // drives the LUT index — identical to the plain renderer.
+        let (img, _) = render_arch_tile_diff(&tile, &lut_arr, TileFormat::Png).unwrap();
+        for (py, r) in [2u64, 2, 3, 3].iter().enumerate() {
+            for px in 0..8u32 {
+                let v = expect(*r, px as u64);
+                let want = lut[(v.to_bits() >> 24) as usize];
+                assert_eq!(img[(px, py as u32)], want, "pixel ({px},{py})");
             }
         }
     }

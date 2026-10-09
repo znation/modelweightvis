@@ -25,7 +25,12 @@ unwired — packed-int tensors paint as NaN sentinels here:
   the whole-tensor diff paths would need per-tensor sidecar buffers
   threaded through the lazy-streaming diff source — a larger change,
   tracked as its own slice;
-- `src/tiled/leaf_arch.rs` `render_arch_tile_diff` non-`Fixed(1)` fallback;
+- ~~`src/tiled/leaf_arch.rs` `render_arch_tile_diff` non-`Fixed(1)`
+  fallback~~ — fixed by tumwater(bugfix) 2026-10-09: the fallback now calls
+  `plain_element_color_sidecars` with the region's sidecar view (already
+  loaded by `load_arch_tile_regions`), so non-diff packed-int regions inside
+  a diff run dequantise; regression test
+  `diff_tile_renders_packed_region_with_sidecars`.
 - `src/tiled/arch_voxel.rs` `compute_face` (3D mode);
   - ~~`src/data.rs` `decode_tensor_to_f32` (`--moe` CKA)~~ — fixed by
     tumwater(improve) 2026-10-09: `decode_prefix_f32_sidecars` in
