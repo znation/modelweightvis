@@ -64,9 +64,7 @@ pub struct ExpertRef {
 pub fn parse_hf_expert(name: &str) -> Option<ExpertRef> {
     // model.layers.{L}.mlp.experts.{E}.{gate|up|down}_proj.weight   (Qwen/OLMoE/…)
     // model.layers.{L}.block_sparse_moe.experts.{E}.{w1|w3|w2}.weight (classic Mixtral)
-    let rest = name.strip_prefix("model.layers.")?;
-    let (layer_str, rest) = rest.split_once('.')?;
-    let layer_idx: u32 = layer_str.parse().ok()?;
+    let (layer_idx, rest) = hf_layer_leaf(name)?;
 
     // The MoE block prefix is `mlp.experts.` for most HF layouts (Qwen3,
     // OLMoE, DeepSeek routed experts) and `block_sparse_moe.experts.` for the
@@ -107,9 +105,7 @@ pub fn parse_hf_expert(name: &str) -> Option<ExpertRef> {
 /// layer-level `*.gate.weight` exactly, while [`parse_hf_expert`] requires an
 /// `experts.{E}.…` segment (the `experts.` prefix is the discriminator).
 pub fn parse_hf_router(name: &str) -> Option<u32> {
-    let rest = name.strip_prefix("model.layers.")?;
-    let (layer_str, rest) = rest.split_once('.')?;
-    let layer_idx: u32 = layer_str.parse().ok()?;
+    let (layer_idx, rest) = hf_layer_leaf(name)?;
     if rest == "mlp.gate.weight" || rest == "block_sparse_moe.gate.weight" {
         Some(layer_idx)
     } else {
@@ -143,9 +139,7 @@ pub enum FusedExpertTensor {
 /// this layout *is* sliceable into per-expert byte ranges, so callers use it
 /// to build per-expert scalar jobs.
 pub fn parse_hf_fused_expert(name: &str) -> Option<(u32, FusedExpertTensor)> {
-    let rest = name.strip_prefix("model.layers.")?;
-    let (layer_str, rest) = rest.split_once('.')?;
-    let layer_idx: u32 = layer_str.parse().ok()?;
+    let (layer_idx, rest) = hf_layer_leaf(name)?;
     let leaf = rest.strip_prefix("mlp.experts.")?;
     let kind = match leaf {
         "gate_up_proj" | "gate_up_proj.weight" => FusedExpertTensor::GateUp,
@@ -198,6 +192,18 @@ fn gguf_layer_leaf(name: &str) -> Option<(u32, &str)> {
         }
         None => Some((0, name)),
     }
+}
+
+/// Split an HF tensor name into `(layer_idx, rest)` at the layer segment:
+/// `model.layers.{L}.{rest}` with a numeric `{L}`. Used by the three HF MoE
+/// parsers ([`parse_hf_expert`], [`parse_hf_router`],
+/// [`parse_hf_fused_expert`]) — the HF counterpart to [`gguf_layer_leaf`].
+/// Returns `None` for anything without the `model.layers.` prefix or a
+/// non-numeric layer segment.
+fn hf_layer_leaf(name: &str) -> Option<(u32, &str)> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let (l, leaf) = rest.split_once('.')?;
+    Some((l.parse().ok()?, leaf))
 }
 
 #[cfg(test)]
