@@ -38,8 +38,8 @@ use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::layout::model_config::ModelConfig;
 use crate::probe::common::{
-    accumulate_coactivation, cfg_gqa_geometry, cfg_usize, dispatch_experts, renormalize_topk,
-    rms_norm, topk_per_row, GqaAttention, RotaryEmbedding, SwiGluExpert,
+    capture_from_counts, cfg_gqa_geometry, cfg_usize, dispatch_experts, rms_norm,
+    route_topk_and_tally, GqaAttention, RotaryEmbedding, SwiGluExpert,
 };
 use crate::probe::RoutingCapture;
 
@@ -167,40 +167,18 @@ pub fn run(
         let residual = hidden.clone();
         let x = rms_norm(&hidden, &layer.post_attention_layernorm, cfg.rms_norm_eps)?;
 
-        // Router: [B, S, H] @ [H, E] → [B, S, E]
-        let router_logits = layer.gate.forward(&x)?;
-        let router_probs_f32 =
-            candle_nn::ops::softmax_last_dim(&router_logits.to_dtype(DType::F32)?)?;
-
-        // Top-k: candle has `topk_last_dim` via sort or manual reduce. We
-        // do it in plain Rust on a CPU copy — it's tiny (B * S * n_experts
-        // ≈ 1 * 300 * 60 = 18k floats) and lets us also tally counts
-        // here without an extra device→host trip.
-        let probs_host: Vec<f32> = router_probs_f32.flatten_all()?.to_vec1::<f32>()?;
-        let (topk_weights_host, topk_indices_host) =
-            topk_per_row(&probs_host, n_tokens, cfg.n_experts, cfg.top_k);
-
-        // Tally counts for this layer.
-        let layer_off = layer_idx * cfg.n_experts;
-        for &e in &topk_indices_host {
-            counts[layer_off + e as usize] += 1;
-        }
-        accumulate_coactivation(
-            &mut coact_counts,
-            &topk_indices_host,
+        // Router → top-k → tally (shared helper). Renormalisation is per
+        // `norm_topk_prob` — Qwen1.5-MoE has it off.
+        let (topk_weights_renorm, topk_indices_host) = route_topk_and_tally(
+            &layer.gate.forward(&x)?,
             n_tokens,
-            cfg.top_k,
             cfg.n_experts,
+            cfg.top_k,
             layer_idx,
-        );
-
-        // Optionally renormalize top-k weights to sum to 1 along the k
-        // axis. Qwen1.5-MoE has this off.
-        let topk_weights_renorm = if cfg.norm_topk_prob {
-            renormalize_topk(&topk_weights_host, cfg.top_k)
-        } else {
-            topk_weights_host.clone()
-        };
+            &mut counts,
+            &mut coact_counts,
+            cfg.norm_topk_prob,
+        )?;
 
         // Expert dispatch — group tokens by chosen expert, run that
         // expert's SwiGLU FFN on the (small) gather, scatter weighted
@@ -231,19 +209,13 @@ pub fn run(
     pb.finish_and_clear();
 
     // Frequencies — counts / n_tokens.
-    let freq: Vec<f32> = counts.iter().map(|&c| c as f32 / n_tokens as f32).collect();
-    let coact: Vec<f32> = coact_counts
-        .iter()
-        .map(|&c| c as f32 / n_tokens as f32)
-        .collect();
-
-    Ok(RoutingCapture {
-        n_layers: cfg.n_layers as u32,
-        n_experts: cfg.n_experts as u32,
-        n_tokens: n_tokens as u32,
-        freq,
-        coact,
-    })
+    Ok(capture_from_counts(
+        cfg.n_layers,
+        cfg.n_experts,
+        n_tokens,
+        &counts,
+        &coact_counts,
+    ))
 }
 
 // ============================================================================

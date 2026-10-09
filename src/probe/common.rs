@@ -7,9 +7,10 @@
 
 use anyhow::Context;
 use candle_core::{DType, Device, Result, Tensor, D};
-use candle_nn::{Linear, Module, VarBuilder};
+use candle_nn::{ops, Linear, Module, VarBuilder};
 
 use crate::layout::model_config::ModelConfig;
+use crate::probe::RoutingCapture;
 
 /// Read a required `config.json` field as `usize`, erroring with a
 /// `"<model> config missing <field>"` message when it is absent.
@@ -427,6 +428,76 @@ pub fn renormalize_topk(weights: &[f32], k: usize) -> Vec<f32> {
 /// appears in any of the token's top-k slots, gather those tokens into a
 /// `[n_e, H]` batch, run the expert once, then index-add the weighted result
 /// back. `topk_indices` / `topk_weights` are `[n_tokens * top_k]` row-major.
+/// Router → top-k → tally, the per-layer MoE step shared by every probe
+/// forward loop (`probe/mixtral.rs`, `probe/qwen2_moe.rs`). Softmaxes
+/// `router_logits` in f32, copies to host (tiny: `n_tokens × n_experts`),
+/// takes per-token top-k, tallies routing-frequency counts and top-k
+/// co-occurrence counts, and optionally renormalises the top-k weights to
+/// sum to 1 along the k axis (Mixtral always; Qwen per its `norm_topk_prob`).
+/// Returns the `(weights, indices)` pair to hand to [`dispatch_experts`].
+/// `counts` has `n_layers × n_experts` slots, `coact_counts` has
+/// `n_layers × n_experts × n_experts`.
+#[allow(clippy::too_many_arguments)]
+pub fn route_topk_and_tally(
+    router_logits: &Tensor,
+    n_tokens: usize,
+    n_experts: usize,
+    top_k: usize,
+    layer_idx: usize,
+    counts: &mut [u32],
+    coact_counts: &mut [u32],
+    renorm: bool,
+) -> Result<(Vec<f32>, Vec<u32>)> {
+    let probs_f32 = ops::softmax_last_dim(&router_logits.to_dtype(DType::F32)?)?;
+    let probs_host: Vec<f32> = probs_f32.flatten_all()?.to_vec1::<f32>()?;
+    let (topk_weights, topk_indices) = topk_per_row(&probs_host, n_tokens, n_experts, top_k);
+
+    let layer_off = layer_idx * n_experts;
+    for &e in &topk_indices {
+        counts[layer_off + e as usize] += 1;
+    }
+    accumulate_coactivation(
+        coact_counts,
+        &topk_indices,
+        n_tokens,
+        top_k,
+        n_experts,
+        layer_idx,
+    );
+
+    let weights = if renorm {
+        renormalize_topk(&topk_weights, top_k)
+    } else {
+        topk_weights
+    };
+    Ok((weights, topk_indices))
+}
+
+/// Aggregate per-`(layer, expert)` routing counts into a [`RoutingCapture`]:
+/// both the frequency and co-activation buffers become `count / n_tokens`.
+/// Shared tail of the MoE probe forwards (`probe/mixtral.rs`,
+/// `probe/qwen2_moe.rs`).
+pub fn capture_from_counts(
+    n_layers: usize,
+    n_experts: usize,
+    n_tokens: usize,
+    counts: &[u32],
+    coact_counts: &[u32],
+) -> RoutingCapture {
+    let freq = counts.iter().map(|&c| c as f32 / n_tokens as f32).collect();
+    let coact = coact_counts
+        .iter()
+        .map(|&c| c as f32 / n_tokens as f32)
+        .collect();
+    RoutingCapture {
+        n_layers: n_layers as u32,
+        n_experts: n_experts as u32,
+        n_tokens: n_tokens as u32,
+        freq,
+        coact,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_experts(
     x: &Tensor,
@@ -527,6 +598,43 @@ mod tests {
         // cell (diagonal + off-diagonal) of the 2×2 block is 1.
         let base = e * e;
         assert!(c[base..base + e * e].iter().all(|&v| v == 1));
+    }
+
+    #[test]
+    fn route_topk_and_tally_tallies_counts_and_renorms() {
+        // 2 tokens, 3 experts, top-1. Row 0 favors expert 1, row 1 expert 2.
+        let logits = Tensor::from_vec(vec![0.0f32, 3.0, 1.0, 1.0, 0.5, 4.0], (1, 2, 3), &Device::Cpu).unwrap();
+        let mut counts = vec![0u32; 3];
+        let mut coact = vec![0u32; 3 * 3];
+        let (weights, indices) = route_topk_and_tally(
+            &logits, 2, 3, 1, 0, &mut counts, &mut coact, /* renorm */ true,
+        )
+        .unwrap();
+        // Top-1 picks expert 1 for token 0 and expert 2 for token 1.
+        assert_eq!(indices, vec![1, 2]);
+        // Renormalised weights sum to 1 over the k axis (top-1 → both are 1).
+        assert_eq!(weights.len(), 2);
+        for w in &weights {
+            assert!((w - 1.0).abs() < 1e-6);
+        }
+        // Frequency counts: one hit each for experts 1 and 2, none for 0.
+        assert_eq!(counts, vec![0, 1, 1]);
+        // Co-activation with top-1: diagonal only, one hit each for experts 1 and 2.
+        assert_eq!(coact, vec![0, 0, 0, 0, 1, 0, 0, 0, 1]);
+        // Without renorm the raw softmax weights are kept (and sum < 2).
+        let (raw, _) = route_topk_and_tally(
+            &logits, 2, 3, 1, 0, &mut [0u32; 3], &mut [0u32; 9], false,
+        )
+        .unwrap();
+        assert!(raw[0] < 1.0 - 1e-6);
+    }
+
+    #[test]
+    fn capture_from_counts_scales_by_n_tokens() {
+        let cap = capture_from_counts(2, 2, 4, &[4, 0, 2, 2], &[8, 0, 0, 8, 0, 0, 4, 4, 0]);
+        assert_eq!((cap.n_layers, cap.n_experts, cap.n_tokens), (2, 2, 4));
+        assert_eq!(cap.freq, vec![1.0, 0.0, 0.5, 0.5]);
+        assert_eq!(cap.coact, vec![2.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
     }
 
     #[test]
