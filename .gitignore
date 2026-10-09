@@ -7,3 +7,5 @@ Cargo.lock.user
 # arbvis git dep to a local sibling checkout — see README's
 # "Local arbvis co-development" section).
 /.cargo/
+.tumwater/
+tumwater.json
