@@ -102,7 +102,6 @@ fn disp_dims(rows: u64, cols: u64, s: f32) -> (u32, u32) {
 }
 
 /// One placed tensor in the architectural canvas.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PlacedTensor {
     pub source_idx: usize,
@@ -139,7 +138,6 @@ pub struct PlacedTensor {
 
 /// One transformer block's bounding rectangle on the canvas. Drawn as a
 /// single layer-granularity overlay polygon.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LayerBounds {
     pub layer_idx: u32,
@@ -149,6 +147,12 @@ pub struct LayerBounds {
     pub height: u32,
 }
 
+/// The architectural canvas layout produced by [`ArchLayout::try_build`].
+///
+/// `#[allow(dead_code)]` is deliberate: `width`, `height`, and
+/// `architecture` are not read by any current render path, but the struct
+/// is the crate's pub plugin-surface payload and the fields document the
+/// padded canvas the layout was computed against.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct ArchLayout {

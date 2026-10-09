@@ -136,10 +136,13 @@ impl LayoutShape for ArchLayout {
 /// One contiguous (row-major) element range of one tensor that overlaps a
 /// tile. The tile renderer fetches `byte_start..byte_end` from the source
 /// and decodes elements at the natural dtype stride.
-#[allow(dead_code)]
+///
+/// `tensor_id` lets the tile renderer pair regions that decode from the
+/// same tensor across diff sources (see `tiled::leaf_arch`).
 #[derive(Debug, Clone)]
 pub struct TileRegion {
     pub source_idx: usize,
+    /// Stable id of the source tensor this region decodes from.
     pub tensor_id: usize,
     pub dtype: Dtype,
     pub tensor_rows: u64,

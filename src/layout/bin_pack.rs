@@ -11,6 +11,11 @@ pub struct Slot {
     pub height: u32,
 }
 
+/// One slot's packed position on the canvas.
+///
+/// `#[allow(dead_code)]` is deliberate: `width` and `height` are not read by
+/// any current caller (only `x`/`y`), but they document the slot size the
+/// packer placed and are part of the module's pub surface.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct Placement {

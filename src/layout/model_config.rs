@@ -26,7 +26,6 @@ use crate::format::gguf::{metadata_array_len, metadata_string, metadata_u64};
 /// Fields we care about from a HuggingFace `config.json`. Everything is
 /// optional because configs vary across architectures — `vocab_size` and
 /// `intermediate_size` aren't present on every model card.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelConfig {
     /// `["LlamaForCausalLM", …]` etc. Used for display only and for
@@ -46,6 +45,9 @@ pub struct ModelConfig {
     pub head_dim: Option<u32>,
     pub rms_norm_eps: Option<f64>,
     pub rope_theta: Option<f64>,
+    /// Context-window sliding window size, when the model uses one. Unread
+    /// today; kept because config.json ships it for sliding-window models.
+    #[allow(dead_code)]
     pub sliding_window: Option<u32>,
     pub max_position_embeddings: Option<u32>,
     pub num_experts_per_tok: Option<u32>,

@@ -23,6 +23,10 @@ pub enum LayerSlot {
 }
 
 /// Result of classifying every tensor in a checkpoint.
+///
+/// `#[allow(dead_code)]` is deliberate: `block_regex`, `prefix`, and
+/// `num_layers` are not read by any current render path, but the struct is
+/// the pub plugin-surface result of [`classify`].
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ArchProfile {
