@@ -814,6 +814,7 @@ pub fn decode_prefix_f32_sidecars(
     decode_prefix_f32(dtype, bytes, n)
 }
 
+
 fn read_u32_le(b: &[u8]) -> u32 {
     let mut v = 0u32;
     for (i, &x) in b.iter().take(4).enumerate() {

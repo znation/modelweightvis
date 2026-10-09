@@ -8,18 +8,23 @@ unclear-invariant).
 
 ## Open
 
-### AWQ/GPTQ packed-int tensors still render as NaN sentinels in diff, xet, voxel, and MoE paths — sidecars wired only into the 2D plain tile path (found by tumwater(bugfix) 2026-10-09)
+### AWQ/GPTQ packed-int tensors still render as NaN sentinels in diff/xet, voxel, and MoE-diff paths — sidecars wired into the MoE CKA decode only (found by tumwater(bugfix) 2026-10-09; partially fixed by tumwater(bugfix) 2026-10-09)
 
-Sibling of the 2026-10-09 Fixed entry of the same title. That fix wired
-`TensorMeta::packed_sidecars` → fetched scales/qzeros →
+Sibling of the 2026-10-09 Fixed entry of the same title. The original fix
+wired `TensorMeta::packed_sidecars` → fetched scales/qzeros →
 `TensorElementReader::with_sidecars` through the 2D architectural plain tile
-path (`src/tiled/leaf_arch.rs`, `src/layout/render.rs`,
-`src/format/dtype.rs` anchor-aware decode). The remaining production paths
-still build `TensorElementReader::new(...)` with no sidecars, so packed-int
-tensors paint as NaN sentinels there:
+path. The 2026-10-09 partial fix added the `--moe` CKA wire-up:
+`src/data.rs` `decode_tensor_to_f32` now fetches the sidecar ranges from the
+source `Data` and decodes packed-int expert weights via the new
+`format::decode_prefix_f32_sidecars` (sidecar-aware decode). Still
+unwired — packed-int tensors paint as NaN sentinels here:
 
-- `src/layout/render.rs` `diff_element_color` / `element_intensity_and_position`
-  (xet mode) — Packed arms return padding / `None` intensity;
+- `src/format/dtype.rs` `Dtype::diff_to_u8` (and its callers
+  `TensorDiffSource` in `src/data.rs` + `diff_element_color` /
+  `element_intensity_and_position` in `src/layout/render.rs`):
+  the whole-tensor diff paths would need per-tensor sidecar buffers
+  threaded through the lazy-streaming diff source — a larger change,
+  tracked as its own slice;
 - `src/tiled/leaf_arch.rs` `render_arch_tile_diff` non-`Fixed(1)` fallback;
 - `src/tiled/arch_voxel.rs` `compute_face` (3D mode);
   - ~~`src/data.rs` `decode_tensor_to_f32` (`--moe` CKA)~~ — fixed by
@@ -30,9 +35,9 @@ tensors paint as NaN sentinels there:
   builders (`TensorDiffSource`, `diff_to_u8`) — both have full `Data` and
   `TensorMeta` in scope, so each is an independent, small wire-up.
 
-Fix: mirror the fixed tile-path pattern into each of these — fetch the
-sidecar ranges, attach via `with_sidecars` (plus `with_anchor` where the
-buffer doesn't start at element (0, 0)).
+Fix: mirror the decode_tensor_to_f32 pattern (fetch sidecar ranges, attach
+via `with_sidecars` plus `with_anchor` where the buffer doesn't start at
+element (0, 0)) into each of these.
 
 ### Structural risk: `src/data.rs` (3347 lines) and `src/layout/arch.rs` (2080 lines) exceed the one-sitting readability principle (found by tumwater(steward) 2026-10-09)
 
@@ -44,6 +49,28 @@ wants a pure-refactor move: lift the `#[cfg(test)]` modules into `tests/` or spl
 `moe_sources` / `summary_jobs` modules; no behavior change, existing tests as the harness.
 
 ## Fixed
+
+### `--moe` CKA path renders AWQ/GPTQ packed-int expert weights as NaN sentinels — `decode_tensor_to_f32` never attached sidecars (found by tumwater(bugfix) 2026-10-09; fixed by tumwater(bugfix) 2026-10-09)
+
+Slice of the Open entry "AWQ/GPTQ packed-int tensors still render as NaN
+sentinels…": the `--moe` CKA builder (`src/data.rs`
+`compute_cka_panel`) called `decode_tensor_to_f32`, which decoded through
+`format::decode_prefix_f32` with no sidecar context — an AWQ/GPTQ
+`Int4Packed` expert weight with fused `TensorMeta::packed_sidecars`
+decoded to NaN per element, polluting every CKA panel that expert touched.
+
+- Fix: `decode_tensor_to_f32` now takes the tensor's `TensorMeta` and source
+  `Data`, fetches the fused scales/qzeros sidecar byte ranges, and decodes
+  via the new `format::decode_prefix_f32_sidecars` (a
+  `TensorElementReader::with_sidecars`-backed decode). Without fused
+  sidecars (incomplete quant triple) the NaN-sentinel behaviour is kept.
+- Reproduce: `cargo test --lib decode_tensor_to_f32` —
+  `decode_tensor_to_f32_packed_with_sidecars_dequantises` fails (NaN) on
+  the pre-fix decode and asserts the known dequant values [1..8] after.
+**Validation gap:** no-fake — the bug needed a packed-int checkpoint with
+fused sidecars flowing through the CKA builder; the closest offline
+substitute is a hand-built `Data::Owned` fake file with sidecar bytes at
+distinct offsets, which no test had.
 
 ### Flaky test: `format::dtype::tests::reader_quantized_q8_0_does_not_crash_on_padded_block` (found by security 2026-10-09; fixed by tumwater(bugfix) 2026-10-09)
 

@@ -2809,8 +2809,13 @@ fn percentile_bounds(scalars: &[f32], q_lo: f32, q_hi: f32) -> (f32, f32) {
     (at(q_lo), at(q_hi))
 }
 
-/// Decode `bytes` (one expert's whole weight tensor, dtype `dtype`) to
-/// a fresh `Vec<f32>` of length `n_elements`. Non-finite values are
+/// Decode `bytes` (one expert's whole weight tensor, described by `meta`)
+/// to a fresh `Vec<f32>` of length `n_elements`. AWQ/GPTQ packed-int tensors
+/// decode through their fused `TensorMeta::packed_sidecars` — the scales/
+/// qzeros sidecar byte ranges are fetched from the same source `Data` and
+/// attached via `TensorElementReader::with_sidecars`, so the tensor
+/// dequantises to real values instead of the NaN sentinels a sidecar-less
+/// reader produces. Non-finite values are
 /// preserved (caller's projection / inner-product loops happen to be
 /// finite-safe — the random projection of a NaN row stays NaN, but
 /// the only way to hit one is a malformed checkpoint, in which case
@@ -3837,6 +3842,77 @@ mod tests {
         assert_eq!(routers.len(), 1); // only the HF router overwrote layer 0
         assert_eq!(gguf_fused.len(), 3);
         assert_eq!(fused.len(), 1);
+    }
+
+    /// `decode_tensor_to_f32` dequantises an AWQ/GPTQ packed-int tensor
+    /// through its fused sidecars instead of returning NaN sentinels:
+    /// one Int4Packed row of the known quants [1..8] (scale 1.0, symmetric),
+    /// with the scales sidecar placed at a distinct file offset so the
+    /// fetch_range path is exercised, not just the buffer wiring.
+    #[tokio::test]
+    async fn decode_tensor_to_f32_packed_with_sidecars_dequantises() {
+        // Int4Packed: one int32 slot packs 8 quants; one row of 8 cols.
+        // Quant row [1, 2, 3, 4, 5, 6, 7, 8] = slot 0x8765_4321.
+        let qweight = 0x8765_4321u32.to_le_bytes().to_vec();
+        // scales sidecar: group 0 × 8 cols, all 1.0 (f32) — offset 4 in the
+        // fake file, after the qweight bytes.
+        let mut file = qweight.clone();
+        for _ in 0..8 {
+            file.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        let data = Data::Owned(file);
+        let _meta = crate::format::TensorMeta {
+            name: "model.layers.0.mlp.experts.0.down_proj.weight".into(),
+            dtype: crate::format::Dtype::Int4Packed,
+            shape: vec![1, 8],
+            file_start: 0,
+            file_end: 4,
+            packed_sidecars: Some(crate::format::PackedSidecars {
+                scales_start: 4,
+                scales_end: 36,
+                scales_dtype: crate::format::Dtype::F32,
+                zeros_start: None,
+                zeros_end: None,
+                zeros_dtype: crate::format::Dtype::Unknown,
+                cols: 8,
+            }),
+        };
+        let bytes = data.fetch_range(0, 4).await.unwrap();
+        let whole = data.fetch_range(0, 36).await.unwrap();
+        let sidecars = crate::format::PackedSidecarRefs {
+            scales: &whole[4..36],
+            scales_dtype: crate::format::Dtype::F32,
+            zeros: None,
+            zeros_dtype: crate::format::Dtype::Unknown,
+            cols: 8,
+        };
+        let w = decode_tensor_to_f32(
+            crate::format::Dtype::Int4Packed,
+            &bytes,
+            8,
+            Some(sidecars),
+        );
+        let expected: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        assert_eq!(w, expected);
+    }
+
+    /// Same packed dtype without fused sidecars (incomplete quant triple):
+    /// the NaN-sentinel behaviour is preserved — no panic, all NaN.
+    #[tokio::test]
+    async fn decode_tensor_to_f32_packed_without_sidecars_still_nan() {
+        let data = Data::Owned(0xFFu32.to_le_bytes().to_vec());
+        let _meta = crate::format::TensorMeta {
+            name: "q".into(),
+            dtype: crate::format::Dtype::Int4Packed,
+            shape: vec![1, 8],
+            file_start: 0,
+            file_end: 4,
+            packed_sidecars: None,
+        };
+        let bytes = data.fetch_range(0, 4).await.unwrap();
+        let w =
+            decode_tensor_to_f32(crate::format::Dtype::Int4Packed, &bytes, 8, None);
+        assert!(w.iter().all(|v| v.is_nan()));
     }
 
 }
