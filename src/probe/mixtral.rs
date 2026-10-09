@@ -389,23 +389,9 @@ mod tests {
     #[test]
     #[ignore = "requires a local MixtralForCausalLM checkpoint; set MIXTRAL_TINY_DIR"]
     fn forward_on_local_checkpoint() {
-        let dir = match std::env::var("MIXTRAL_TINY_DIR") {
-            Ok(d) => std::path::PathBuf::from(d),
-            Err(_) => return,
+        let Some((dir, config, shards)) = tiny_fixture() else {
+            return;
         };
-        let config = crate::layout::model_config::ModelConfig::try_from_dir(&dir)
-            .expect("config.json present and parseable");
-        let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .expect("read model dir")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
-            .collect();
-        shards.sort();
-        assert!(
-            !shards.is_empty(),
-            "no safetensors shards in {}",
-            dir.display()
-        );
 
         let cap = crate::probe::run(
             crate::probe::Arch::Mixtral,
@@ -464,15 +450,11 @@ mod tests {
     #[test]
     #[ignore = "requires MIXTRAL_TINY_DIR (fused tiny checkpoint)"]
     fn fused_and_classic_loaders_agree() {
-        let dir = match std::env::var("MIXTRAL_TINY_DIR") {
-            Ok(d) => std::path::PathBuf::from(d),
-            Err(_) => return,
+        let Some((dir, config, fused_shards)) = tiny_fixture() else {
+            return;
         };
-        let config = crate::layout::model_config::ModelConfig::try_from_dir(&dir)
-            .expect("config.json present and parseable");
         let text = "The quick brown fox jumps over the lazy dog.";
 
-        let fused_shards = sorted_safetensors(&dir);
         let cap_fused = crate::probe::run(
             crate::probe::Arch::Mixtral,
             &dir,
@@ -501,6 +483,27 @@ mod tests {
             cap_fused.freq, cap_classic.freq,
             "fused vs classic loaders disagree on routing",
         );
+    }
+
+    /// Load the local tiny fixture set by `MIXTRAL_TINY_DIR`: the model dir,
+    /// its parsed config, and its sorted safetensors shards. Returns `None`
+    /// (so the caller test silently passes) when the env var is unset, and
+    /// asserts the dir actually contains shards. Used by both `#[ignore]`
+    /// fixture tests in this module.
+    fn tiny_fixture() -> Option<(std::path::PathBuf, ModelConfig, Vec<std::path::PathBuf>)> {
+        let dir = match std::env::var("MIXTRAL_TINY_DIR") {
+            Ok(d) => std::path::PathBuf::from(d),
+            Err(_) => return None,
+        };
+        let config = crate::layout::model_config::ModelConfig::try_from_dir(&dir)
+            .expect("config.json present and parseable");
+        let shards = sorted_safetensors(&dir);
+        assert!(
+            !shards.is_empty(),
+            "no safetensors shards in {}",
+            dir.display()
+        );
+        Some((dir, config, shards))
     }
 
     fn sorted_safetensors(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
