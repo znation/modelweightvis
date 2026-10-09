@@ -50,8 +50,11 @@ pub fn element_to_byte_proxy(dtype: Dtype, raw: &[u8]) -> u8 {
         | Dtype::Q6K
         | Dtype::Q8K
         // Packed-int dtypes (AWQ/GPTQ) also reach this only by accident —
-        // sidecar-aware dequant flows through `TensorElementReader::with_sidecars`.
-        // First-byte fallback gives a plausible legacy hilbert hue.
+        // sidecar-aware dequant is *meant* to flow through
+        // `TensorElementReader::with_sidecars`, but no production call site
+        // attaches sidecars today (only a test does), so packed dtypes decode
+        // to NaN and paint as sentinels. First-byte fallback gives a
+        // plausible legacy hilbert hue.
         | Dtype::Int4Packed
         | Dtype::Int3Packed
         | Dtype::Int8Packed => raw.first().copied().unwrap_or(0),

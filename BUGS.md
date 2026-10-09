@@ -8,6 +8,21 @@ unclear-invariant).
 
 ## Open
 
+### AWQ/GPTQ packed-int tensors render as NaN sentinels — sidecars never attached in production (found by tumwater(clean) 2026-10-09)
+
+`TensorElementReader::with_sidecars` (`src/format/dtype.rs`) is the only way to
+attach the `scales`/`qzeros` buffers AWQ/GPTQ packed-int (`Int4Packed` etc.)
+decoding needs, but no production call site attaches them — the only caller is
+a test (`src/format/dtype.rs`, `packed_without_sidecars_returns_nan` area);
+all production readers are built with `TensorElementReader::new(...)`
+(`src/layout/render.rs`, `src/tiled/arch_voxel.rs`, `src/data.rs`). Without
+sidecars, packed dtypes decode to NaN by design, so those tensors paint as
+sentinels instead of real magnitudes. The metadata is already parsed:
+`TensorMeta::packed_sidecars` is populated by
+`crate::format::safetensors::fuse_packed_quant_triples` but never read.
+Fix: read `packed_sidecars` in the tile/diff render paths and thread the
+corresponding scales/qzeros byte ranges through `with_sidecars`.
+
 _None yet._
 
 ## Fixed

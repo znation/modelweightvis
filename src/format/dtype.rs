@@ -729,9 +729,13 @@ impl<'a> TensorElementReader<'a> {
         }
     }
 
-    /// Builder: attach AWQ/GPTQ sidecar tensors. Only used by callers
-    /// rendering packed-int tensors; for plain / Block dtypes this is a
-    /// no-op (the sidecars are simply unused).
+    /// Builder: attach AWQ/GPTQ sidecar tensors. For plain / Block dtypes
+    /// this is a no-op (the sidecars are simply unused).
+    ///
+    /// Currently called only from this crate's own tests — no production
+    /// path attaches sidecars yet, so packed-int tensors render as NaN
+    /// sentinels (see BUGS.md). Kept exported for the wire-up that reads
+    /// `TensorMeta::packed_sidecars` and threads the buffers here.
     #[allow(dead_code)]
     pub fn with_sidecars(mut self, refs: PackedSidecarRefs<'a>) -> Self {
         self.sidecars = Some(refs);
