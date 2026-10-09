@@ -453,7 +453,13 @@ pub fn load_model_info(
             // Pickle's zip end-of-central-directory lives at the END of the
             // file, so unlike safetensors/GGUF we can't parse from a prefix.
             // candle's pickle reader opens the file by path; pass it through.
+            // The pickle stream declares each tensor's storage offset and
+            // element count, so a hostile header can point a tensor's range
+            // past EOF — validate against the real file size before any
+            // downstream per-tile read faults past the mmap's end (same guard
+            // as the safetensors/GGUF local arms).
             let header = format::pickle::parse_header(path)?;
+            format::validate_tensor_offsets(&header.tensors, file_size)?;
             let color_ranges = format::pickle::build_color_ranges(
                 &header.tensors,
                 header.tensor_data_offset,
@@ -3408,6 +3414,20 @@ mod tests {
         let p = dir.path().join("model.gguf");
         std::fs::write(&p, &buf).unwrap();
         let err = load_model_info(&p, buf.len() as u64, SourceFormat::Gguf).unwrap_err();
+        assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+    }
+
+    #[test]
+    fn load_model_info_rejects_pickle_tensor_declared_past_eof() {
+        // Hostile pickle header: the tensor's declared storage offset points
+        // 200 bytes into an 8-f32 (32-byte) storage entry, pushing its range
+        // past EOF. Before the local pickle path validated offsets, a later
+        // per-tile read would fault past the mmap's end.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hostile.bin");
+        crate::format::pickle::tests::write_pth_with_storage_offset(&p, 200);
+        let file_size = std::fs::metadata(&p).unwrap().len();
+        let err = load_model_info(&p, file_size, SourceFormat::Pickle).unwrap_err();
         assert!(format!("{err:#}").contains("truncated"), "{err:#}");
     }
 

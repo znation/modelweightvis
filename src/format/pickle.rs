@@ -85,11 +85,24 @@ pub fn parse_header(path: &Path) -> anyhow::Result<PickleHeader> {
         let storage_start = entry.data_start();
         // `layout.start_offset()` is already in bytes (`offset * dtype.size_in_bytes()`
         // in candle's `rebuild_args`), so don't multiply it again.
-        let file_start = storage_start + info.layout.start_offset() as u64;
-        let file_end = file_start + elem_count * elem_bytes;
+        // Both the storage offset and the element count come straight from the
+        // untrusted pickle stream, so a hostile header can declare values that
+        // overflow u64 here; check instead of panicking (debug) or wrapping
+        // (release). Callers validate the resulting ranges against the real
+        // file size (`validate_tensor_offsets`) before any byte is read.
+        let name = info.name.clone();
+        let span = elem_count.checked_mul(elem_bytes).ok_or_else(|| {
+            anyhow::anyhow!("pickle: tensor '{name}' declares an element count whose byte size overflows")
+        })?;
+        let file_start = storage_start
+            .checked_add(info.layout.start_offset() as u64)
+            .ok_or_else(|| anyhow::anyhow!("pickle: tensor '{name}' declares a storage offset that overflows"))?;
+        let file_end = file_start
+            .checked_add(span)
+            .ok_or_else(|| anyhow::anyhow!("pickle: tensor '{name}' declares a byte range that overflows"))?;
 
         tensors.push(TensorMeta {
-            name: info.name,
+            name,
             dtype,
             shape,
             file_start,
@@ -159,7 +172,7 @@ pub fn build_color_ranges(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Hand-build a minimal PyTorch zip archive on disk:
@@ -189,7 +202,7 @@ mod tests {
         // Hand-assembled protocol-2 ops: this is the same opcode subset
         // `torch.save` emits for a simple state_dict.
         zip.start_file("model/data.pkl", opts).unwrap();
-        let pkl = build_pickle();
+        let pkl = build_pickle(0);
         zip.write_all(&pkl).unwrap();
         zip.finish().unwrap();
     }
@@ -198,17 +211,18 @@ mod tests {
     ///   PROTO 2 / EMPTY_DICT / MARK / BINUNICODE "weight" /
     ///   GLOBAL torch._utils._rebuild_tensor_v2 / MARK /
     ///       BINPERSID ("storage", FloatStorage, "0", "cpu", 8) /
-    ///       BININT1 0 (start_offset) /
+    ///       BININT1 `storage_offset` /
     ///       MARK BININT1 2 BININT1 4 TUPLE (size = (2,4)) /
     ///       MARK BININT1 4 BININT1 1 TUPLE (stride = (4,1)) /
     ///       NEWFALSE (requires_grad) / NONE (backward_hooks) /
+    ///   TUPLE / REDUCE / SETITEMS / STOP
     ///   TUPLE / REDUCE / SETITEMS / STOP
     ///
     /// candle's pickle reader recognises this as the standard rebuild form
     /// (`rebuild_args` in candle-core's pickle.rs). We use `BINUNICODE`
     /// (opcode `X`, u32-length-prefixed) rather than `SHORT_BINUNICODE`
     /// (opcode `0x8c`) because candle's reader doesn't decode the latter.
-    fn build_pickle() -> Vec<u8> {
+    fn build_pickle(storage_offset: u8) -> Vec<u8> {
         let mut p = vec![
             0x80, // PROTO
             0x02, b'}', // EMPTY_DICT
@@ -238,9 +252,9 @@ mod tests {
         p.push(b't'); // TUPLE
         p.push(b'Q'); // BINPERSID
 
-        // arg 1: storage_offset = 0
+        // arg 1: storage_offset
         p.push(b'K');
-        p.push(0);
+        p.push(storage_offset);
 
         // arg 2: size = (2, 4)
         p.push(b'('); // MARK
@@ -277,6 +291,50 @@ mod tests {
         let bytes = s.as_bytes();
         p.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         p.extend_from_slice(bytes);
+    }
+
+    /// Write a minimal pth whose pickle declares `storage_offset` bytes into
+    /// the storage entry — used to prove hostile headers are caught at the
+    /// boundary rather than faulting on later reads. `pub(crate)` so the
+    /// data.rs tests can drive the full local load path.
+    pub(crate) fn write_pth_with_storage_offset(path: &Path, storage_offset: u8) {
+        use std::io::Write;
+        use zip::write::{SimpleFileOptions, ZipWriter};
+        let f = File::create(path).unwrap();
+        let mut zip = ZipWriter::new(f);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        zip.start_file("model/data/0", opts).unwrap();
+        let values: [f32; 8] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        for v in values {
+            zip.write_all(&v.to_le_bytes()).unwrap();
+        }
+
+        zip.start_file("model/data.pkl", opts).unwrap();
+        zip.write_all(&build_pickle(storage_offset)).unwrap();
+        zip.finish().unwrap();
+    }
+
+    /// candle accepts a storage offset far past the storage entry's real
+    /// bytes, so a hostile pickle can point a tensor's declared range past
+    /// EOF. `parse_header` itself must succeed (it only reports what the
+    /// header claims) and report a range past the real file size — the
+    /// caller's `validate_tensor_offsets` check is what rejects the file.
+    #[test]
+    fn parse_header_accepts_but_reports_past_eof_range_for_hostile_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hostile.bin");
+        write_pth_with_storage_offset(&path, 200);
+
+        let header = parse_header(&path).expect("parse should succeed");
+        assert_eq!(header.tensors.len(), 1);
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            header.tensors[0].file_end > file_size,
+            "hostile offset must push the declared range past EOF \
+             (file_end={}, file_size={file_size})",
+            header.tensors[0].file_end
+        );
     }
 
     #[test]
