@@ -268,3 +268,230 @@ impl PrepareSourcesExtension for SourceMetaSidecarHook {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arbvis::{DestKind, DiffPair, Registry};
+    use tempfile::TempDir;
+
+    fn ctx<'a>(
+        inputs: &'a [PathBuf],
+        diff: Option<(&'a str, &'a str)>,
+        three_d: bool,
+        stream: bool,
+        registry: &'a Registry,
+    ) -> SourceCtx<'a> {
+        SourceCtx {
+            inputs,
+            diff: diff.map(|(original, modified)| DiffPair { original, modified }),
+            dest_kind: DestKind::Bundle,
+            three_d,
+            stream,
+            show_xet_xorbs: false,
+            registry,
+        }
+    }
+
+    fn with_ctx<T>(
+        inputs: &[PathBuf],
+        diff: Option<(&str, &str)>,
+        three_d: bool,
+        stream: bool,
+        f: impl FnOnce(&SourceCtx<'_>) -> T,
+    ) -> T {
+        let registry = Registry::default();
+        f(&ctx(inputs, diff, three_d, stream, &registry))
+    }
+
+    fn moe_provider() -> MoeSceneProvider {
+        MoeSceneProvider {
+            target: PathBuf::from("hf://org/model"),
+            stat: SummaryStat::default(),
+            norm: MoeNorm::default(),
+            cka_sample: 1024,
+            probe: ProbeOpts::default(),
+        }
+    }
+
+    // --- MoeSceneProvider: gating + metadata -------------------------------
+
+    #[test]
+    fn moe_provider_id_priority_and_applicable_gate() {
+        let p = moe_provider();
+        assert_eq!(p.id(), "moe-scenes");
+        assert_eq!(p.priority(), 400);
+        // Applies to a bare `--moe <model>`: no positional inputs, no --diff.
+        let empty: [PathBuf; 0] = [];
+        let files = [PathBuf::from("model.safetensors")];
+        with_ctx(&empty, None, false, false, |c| assert!(p.applicable(c)));
+        // A positional input or --diff means a different provider must win.
+        with_ctx(&files, None, false, false, |c| assert!(!p.applicable(c)));
+        with_ctx(&empty, Some(("hf://a/b", "hf://c/d")), false, false, |c| assert!(
+            !p.applicable(c)
+        ));
+    }
+
+    #[tokio::test]
+    async fn moe_provider_rejects_three_d() {
+        let p = moe_provider();
+        let empty: [PathBuf; 0] = [];
+        let res = {
+            let registry = Registry::default();
+            p.prepare(&ctx(&empty, None, true, false, &registry)).await
+        };
+        let err = match res {
+            Ok(_) => panic!("--moe + --3d must bail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--3d"), "error should mention --3d: {msg}");
+        assert!(msg.contains("drop --3d"), "error should say how to fix: {msg}");
+    }
+
+    // --- RepoDiffProvider: gating + metadata -------------------------------
+
+    #[test]
+    fn repo_diff_provider_gates_on_repo_level_urls() {
+        let p = RepoDiffProvider {
+            diff_metric: DiffMetric::default(),
+            finetune: FinetuneForce::Off,
+        };
+        assert_eq!(p.id(), "repo-diff");
+        assert_eq!(p.priority(), 300);
+        let empty: [PathBuf; 0] = [];
+        // Both sides repo-level HF URLs → applies.
+        with_ctx(&empty, Some(("hf://a/b", "hf://c/d")), false, false, |c| assert!(
+            p.applicable(c)
+        ));
+        // One side a file path → not repo-level.
+        with_ctx(
+            &empty,
+            Some(("hf://a/b/file.safetensors", "hf://c/d")),
+            false,
+            false,
+            |c| assert!(!p.applicable(c)),
+        );
+        // No HF URLs at all (local paths) → does not apply.
+        with_ctx(&empty, Some(("/tmp/a", "/tmp/b")), false, false, |c| assert!(
+            !p.applicable(c)
+        ));
+        // No --diff at all → does not apply.
+        with_ctx(&empty, None, false, false, |c| assert!(!p.applicable(c)));
+    }
+
+    // --- TensorDiffProvider: gating + prepare ------------------------------
+
+    #[test]
+    fn tensor_diff_provider_gates_on_two_existing_dirs() {
+        let p = TensorDiffProvider {
+            diff_metric: DiffMetric::default(),
+            finetune: FinetuneForce::Off,
+        };
+        assert_eq!(p.id(), "tensor-diff");
+        assert_eq!(p.priority(), 250);
+        let empty: [PathBuf; 0] = [];
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (oa, ob) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        with_ctx(&empty, Some((&oa, &ob)), false, false, |c| assert!(
+            p.applicable(c)
+        ));
+        // One side missing / a file → does not apply.
+        with_ctx(&empty, Some((&oa, "/nonexistent-dir-zz")), false, false, |c| assert!(
+            !p.applicable(c)
+        ));
+        // Repo-level URLs → repo-diff's job, not tensor-diff's.
+        with_ctx(&empty, Some(("hf://a/b", "hf://c/d")), false, false, |c| assert!(
+            !p.applicable(c)
+        ));
+        // No --diff → does not apply.
+        with_ctx(&empty, None, false, false, |c| assert!(!p.applicable(c)));
+    }
+
+    #[tokio::test]
+    async fn tensor_diff_prepare_bails_on_empty_dirs() {
+        let p = TensorDiffProvider {
+            diff_metric: DiffMetric::default(),
+            finetune: FinetuneForce::On, // no network: skip auto-detection
+        };
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (oa, ob) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let empty: [PathBuf; 0] = [];
+        let res = {
+            let registry = Registry::default();
+            p.prepare(&ctx(&empty, Some((&oa, &ob)), false, false, &registry)).await
+        };
+        let err = match res {
+            Ok(_) => panic!("empty dirs must bail"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("no matching file pairs"));
+    }
+
+    fn write_bytes(p: &Path, data: &[u8]) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, data).unwrap();
+    }
+
+    /// Minimal valid safetensors file: 8-byte LE header size + JSON header
+    /// declaring one F32 tensor + its data.
+    fn tiny_safetensors() -> Vec<u8> {
+        let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        out.extend_from_slice(header);
+        out.extend_from_slice(&1.0f32.to_le_bytes());
+        out
+    }
+
+    #[tokio::test]
+    async fn tensor_diff_prepare_offsets_byte_sources_past_tensor_sources() {
+        let p = TensorDiffProvider {
+            diff_metric: DiffMetric::default(),
+            finetune: FinetuneForce::On,
+        };
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        let st = tiny_safetensors();
+        write_bytes(&a.join("w.safetensors"), &st);
+        write_bytes(&b.join("w.safetensors"), &st);
+        write_bytes(&a.join("notes.txt"), b"hello");
+        write_bytes(&b.join("notes.txt"), b"hello");
+        let (oa, ob) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let empty: [PathBuf; 0] = [];
+        let registry = Registry::default();
+        let (sources, _total, hints) = p
+            .prepare(&ctx(&empty, Some((&oa, &ob)), false, false, &registry))
+            .await
+            .expect("mixed tensor+byte diff should succeed");
+        // Both the tensor pair and the byte pair must be represented.
+        let tensor = sources
+            .iter()
+            .filter(|s| matches!(s.kind, arbvis::SourceKind::Custom(_)))
+            .count();
+        assert!(tensor > 0, "safetensors pair should build a tensor source");
+        assert!(sources.iter().any(|s| matches!(s.kind, arbvis::SourceKind::Diff { .. })),
+            "byte pair should build a byte diff source");
+        // Tensor sources come first (0-based file_idx); the byte remainder's
+        // file_idx is re-based past the tensor block.
+        assert_eq!(sources[0].file_idx, 0);
+        for s in sources.iter().skip(tensor) {
+            assert_eq!(s.file_idx, tensor, "byte source file_idx must be offset past the tensor block");
+        }
+        // Hints: diff mode, "diff" suffix, no xet, both dirs as inputs.
+        assert!(hints.diff_mode);
+        assert_eq!(hints.title_suffix, "diff");
+        assert!(!hints.show_xet_xorbs);
+        assert_eq!(hints.inputs, vec![oa.clone(), ob.clone()]);
+    }
+}
+
