@@ -25,13 +25,12 @@ pub mod safetensors;
 pub mod types;
 
 pub use dtype::{
-    decode_prefix_f32_sidecars, frobenius_from_buf, mean_abs_from_buf, rms_from_buf, sparsity_from_buf,
-    Dtype, ElementStride, PackedSidecarRefs, TensorElementReader,
+    decode_prefix_f32_sidecars, diff_metric_norms, diff_signed, frobenius_from_buf, mean_abs_from_buf,
+    rms_from_buf, sparsity_from_buf, Dtype, ElementStride, PackedSidecarRefs, TensorElementReader,
 };
 pub use name_map::to_canonical;
 pub use types::{
-    ModelInfo, PackedSidecars, TensorMeta, ABS_LOG_MAX, ABS_LOG_MIN, K_RMS_SAT, RMS_FLOOR,
-    validate_tensor_offsets,
+    ModelInfo, PackedSidecars, TensorMeta, validate_tensor_offsets,
 };
 
 /// Per-element delta encoding for a tensor `--diff`. Selected by the

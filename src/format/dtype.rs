@@ -481,9 +481,7 @@ impl Dtype {
         scale_orig: f32,
         elem_count: usize,
     ) -> Vec<u8> {
-        let rms_denom = (K_RMS_SAT * scale_orig.max(RMS_FLOOR)).max(f32::MIN_POSITIVE);
-        let log_min = ABS_LOG_MIN.log10();
-        let log_max = ABS_LOG_MAX.log10();
+        let (rms_denom, log_min, log_max) = diff_metric_norms(scale_orig);
         // Fixed-stride fast path: chunked little-endian reads instead of the
         // per-element reader dispatch — the stride match and bounds check are
         // hoisted out of the loop. Only taken when both buffers fully cover
@@ -534,20 +532,31 @@ impl Dtype {
     }
 }
 
-/// Signed-delta metric + sign-magnitude byte encode for one diff pixel.
-/// Shared by the fixed-stride fast path and the reader fallback in
-/// [`Dtype::diff_to_u8`] so the two loops stay byte-identical.
-fn push_diff_pixel(
-    out: &mut Vec<u8>,
-    o: f32,
-    m: f32,
+/// Per-tensor constants the diff metrics derive from `scale_orig` (the RMS
+/// of the `orig` tensor): `(rms_denom, log_min, log_max)` for
+/// [`DiffMetric::Rms`] / [`DiffMetric::AbsLog`]. Shared by `diff_to_u8` and
+/// the element-wise LUT encoder in `layout::render` so the two stay
+/// byte-identical.
+pub fn diff_metric_norms(scale_orig: f32) -> (f32, f32, f32) {
+    (
+        (K_RMS_SAT * scale_orig.max(RMS_FLOOR)).max(f32::MIN_POSITIVE),
+        ABS_LOG_MIN.log10(),
+        ABS_LOG_MAX.log10(),
+    )
+}
+
+/// Normalize one delta into a signed value in `[-1, 1]` under `metric`,
+/// given the per-tensor norms from [`diff_metric_norms`]. Shared by both
+/// diff encoders (byte encoding in [`Dtype::diff_to_u8`] and the LUT colour
+/// in `layout::render`) so the metric arithmetic lives in one place.
+pub fn diff_signed(
+    delta: f32,
     metric: DiffMetric,
     rms_denom: f32,
     log_min: f32,
     log_max: f32,
-) {
-    let delta = m - o;
-    let signed = match metric {
+) -> f32 {
+    match metric {
         DiffMetric::Rms => (delta / rms_denom).clamp(-1.0, 1.0),
         DiffMetric::AbsLog => {
             let abs_d = delta.abs();
@@ -571,7 +580,23 @@ fn push_diff_pixel(
                 -1.0
             }
         }
-    };
+    }
+}
+
+/// Signed-delta metric + sign-magnitude byte encode for one diff pixel.
+/// Shared by the fixed-stride fast path and the reader fallback in
+/// [`Dtype::diff_to_u8`] so the two loops stay byte-identical.
+fn push_diff_pixel(
+    out: &mut Vec<u8>,
+    o: f32,
+    m: f32,
+    metric: DiffMetric,
+    rms_denom: f32,
+    log_min: f32,
+    log_max: f32,
+) {
+    let delta = m - o;
+    let signed = diff_signed(delta, metric, rms_denom, log_min, log_max);
     let brightness = (signed.abs() * 127.0).round() as u8;
     let byte = if signed >= 0.0 {
         127u8.saturating_add(brightness)

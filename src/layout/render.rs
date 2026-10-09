@@ -6,7 +6,10 @@
 
 use image::Rgb;
 
-use crate::format::{DiffMetric, Dtype, ElementStride, PackedSidecarRefs, TensorElementReader};
+use crate::format::{
+    diff_metric_norms, diff_signed, DiffMetric, Dtype, ElementStride, PackedSidecarRefs,
+    TensorElementReader,
+};
 
 /// Neutral background colour for canvas pixels that fall outside every
 /// tensor's rectangle in [`crate::layout::arch::ArchLayout`]. Not pure black
@@ -182,38 +185,8 @@ pub fn diff_element_color(
         return pixel_lut[255];
     }
     let delta = m - o;
-    let signed = match metric {
-        DiffMetric::Rms => {
-            use crate::format::{K_RMS_SAT, RMS_FLOOR};
-            let rms_denom = (K_RMS_SAT * scale_orig.max(RMS_FLOOR)).max(f32::MIN_POSITIVE);
-            (delta / rms_denom).clamp(-1.0, 1.0)
-        }
-        DiffMetric::AbsLog => {
-            use crate::format::{ABS_LOG_MAX, ABS_LOG_MIN};
-            let abs_d = delta.abs();
-            if abs_d <= ABS_LOG_MIN {
-                0.0
-            } else {
-                let log_min = ABS_LOG_MIN.log10();
-                let log_max = ABS_LOG_MAX.log10();
-                let norm = ((abs_d.log10() - log_min) / (log_max - log_min)).clamp(0.0, 1.0);
-                if delta >= 0.0 {
-                    norm
-                } else {
-                    -norm
-                }
-            }
-        }
-        DiffMetric::Exact => {
-            if delta == 0.0 {
-                0.0
-            } else if delta > 0.0 {
-                1.0
-            } else {
-                -1.0
-            }
-        }
-    };
+    let (rms_denom, log_min, log_max) = diff_metric_norms(scale_orig);
+    let signed = diff_signed(delta, metric, rms_denom, log_min, log_max);
     let brightness = (signed.abs() * 127.0).round() as u8;
     let byte = if signed >= 0.0 {
         127u8.saturating_add(brightness)
