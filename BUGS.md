@@ -23,7 +23,14 @@ sentinels instead of real magnitudes. The metadata is already parsed:
 Fix: read `packed_sidecars` in the tile/diff render paths and thread the
 corresponding scales/qzeros byte ranges through `with_sidecars`.
 
-_None yet._
+### Structural risk: `src/data.rs` (3347 lines) and `src/layout/arch.rs` (2080 lines) exceed the one-sitting readability principle (found by tumwater(steward) 2026-10-09)
+
+PRINCIPLES.md holds "keep each file focused on one responsibility, and small enough to read
+in one sitting". `src/data.rs` mixes MoE source loading, Summary/CKA job building, and their
+screens worth of unit tests; `src/layout/arch.rs` similarly concentrates detection plus ~860 lines of tests. Not a runtime bug — a maintainability risk: the open GGUF fused-expert plan
+(`PLANS.md`) would add more to `data.rs` before any split. Fix candidate, when a bugfix tick
+wants a pure-refactor move: lift the `#[cfg(test)]` modules into `tests/` or split data.rs into
+`moe_sources` / `summary_jobs` modules; no behavior change, existing tests as the harness.
 
 ## Fixed
 
