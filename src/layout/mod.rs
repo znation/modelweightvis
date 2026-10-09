@@ -209,10 +209,30 @@ pub(crate) fn arch_eligible(ctx: &LayoutBuildCtx<'_>) -> bool {
         }
         saw_tensor = true;
         if s.extensions.get::<ModelInfo>().is_none() {
+            explain_arch_ineligible(s);
             return false; // matched a format plugin but failed to parse
         }
     }
     saw_tensor
+}
+
+/// The forced+strict default makes an unparsed tensor file fatal, but arbvis's
+/// fatal message ("layout `arch` requested but no registered layout matched")
+/// doesn't say *why* — the actual parse failure only appears as a WARN line
+/// further up. Log the bridge between the two: which source blocked the arch
+/// layout, that the plugin failure above it is the cause, and the `--layout
+/// hilbert` escape hatch for the byte view. Logged on each ineligible query;
+/// both the 2D and 3D arch plugins consult [`arch_eligible`].
+fn explain_arch_ineligible(s: &Source) {
+    let path: &Path = match &s.kind {
+        SourceKind::File(p) => p.as_path(),
+        SourceKind::Http(spec) => Path::new(spec.filename.as_str()),
+        _ => Path::new("<source>"),
+    };
+    log::error!(
+        "arch layout cannot build: {} matched a tensor-format plugin but its header failed to parse (see the plugin warning above) — rerun with `--layout hilbert` for a byte-level view",
+        path.display(),
+    );
 }
 
 /// Architectural plugin — applies when sources carry safetensors metadata
@@ -343,6 +363,7 @@ mod eligible_tests {
     use super::*;
     use arbvis::Extensions;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     /// A local-file source named `name`, optionally carrying a (parsed)
     /// `ModelInfo`. `with_info == false` models a tensor file whose format
@@ -414,6 +435,55 @@ mod eligible_tests {
     fn no_tensor_sources_is_ineligible() {
         let s = [file_source("config.json", false)];
         assert!(!arch_eligible(&ctx(&s, false)));
+    }
+
+    /// Captures `log::error!` output so the bridge message arbvis's cryptic
+    /// strict-layout failure can be asserted on. Installed once per process;
+    /// tests that never log are unaffected either way.
+    static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct CaptureLogger;
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            LOGGED
+                .lock()
+                .unwrap()
+                .push(format!("{}: {}", record.level(), record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    fn install_capture_logger() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+        });
+        log::set_max_level(log::LevelFilter::Error);
+    }
+
+    fn logged_mentioning(needle: &str) -> Vec<String> {
+        LOGGED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(needle))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn ineligible_tensor_source_logs_reason_and_remedy() {
+        install_capture_logger();
+        let s = [file_source("corrupt.safetensors", false)];
+        assert!(!arch_eligible(&ctx(&s, false)));
+        let lines = logged_mentioning("corrupt.safetensors");
+        assert_eq!(lines.len(), 1, "expected exactly one log line, got {lines:?}");
+        assert!(lines[0].starts_with("ERROR: arch layout cannot build"));
+        assert!(lines[0].contains("--layout hilbert"), "remedy missing: {}", lines[0]);
     }
 
     #[test]
