@@ -103,6 +103,7 @@ pub struct ArchVoxelRenderer {
 }
 
 impl ArchVoxelRenderer {
+    /// Creates the default renderer with an empty per-face cell cache.
     pub fn new() -> Self {
         Self::default()
     }

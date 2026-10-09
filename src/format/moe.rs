@@ -40,6 +40,7 @@ pub enum ExpertWeight {
 }
 
 impl ExpertWeight {
+    /// The canonical HF module-name suffix for this expert weight.
     pub fn label(self) -> &'static str {
         match self {
             ExpertWeight::GateProj => "gate_proj",

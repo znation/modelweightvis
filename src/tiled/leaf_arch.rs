@@ -435,6 +435,8 @@ fn render_arch_tile(
     encode_tile(img, fmt)
 }
 
+/// Render one plain-mode arch tile: paint each region's decoded bytes via
+/// `pixel_lut` and encode the result in `fmt`.
 pub fn render_arch_tile_plain(
     tile: &LoadedArchTile,
     pixel_lut: &[Rgb<u8>; 256],

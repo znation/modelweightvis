@@ -121,6 +121,7 @@ impl TensorMeta {
         }
     }
 
+    /// Human-readable one-line description: `name dtype [rows, cols]`.
     pub fn label(&self) -> String {
         let shape_str: Vec<String> = self.shape.iter().map(|d| d.to_string()).collect();
         format!(

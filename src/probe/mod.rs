@@ -68,6 +68,7 @@ pub enum Arch {
 }
 
 impl Arch {
+    /// The HF `architectures` name this variant was detected from.
     pub fn label(self) -> &'static str {
         match self {
             Arch::Qwen2Moe => "Qwen2MoeForCausalLM",

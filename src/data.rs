@@ -448,6 +448,7 @@ pub enum ProbeStat {
 }
 
 impl ProbeStat {
+    /// The snake_case key this stat is filed under in MoE probe output.
     pub fn label(self) -> &'static str {
         match self {
             ProbeStat::RoutingFreq => "routing_freq",

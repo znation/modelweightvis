@@ -902,6 +902,7 @@ pub struct PackedSidecarRefs<'a> {
 }
 
 impl<'a> TensorElementReader<'a> {
+    /// Reader over one tensor's raw bytes; dequantises on demand via [`decode_element`].
     pub fn new(dtype: Dtype, bytes: &'a [u8]) -> Self {
         Self {
             dtype,

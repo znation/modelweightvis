@@ -169,6 +169,7 @@ pub struct SafetensorsIndex {
 }
 
 impl SafetensorsIndex {
+    /// Parse a `model.safetensors.index.json` payload; `None` when it is not valid JSON.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         match serde_json::from_slice::<Self>(bytes) {
             Ok(i) => Some(i),
