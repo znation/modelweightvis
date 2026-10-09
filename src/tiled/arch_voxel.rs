@@ -55,6 +55,26 @@ fn voxel_rect(fx: u64, fy: u64, bw: u64, bh: u64, rows: u64, cols: u64) -> (u64,
     (r0, r1, c0, c1)
 }
 
+/// The linear element indices one face voxel samples, spaced evenly across its
+/// sub-rectangle in row-major order — the shared sampling skeleton of
+/// [`magnitude_face`] and [`diff_face`] (both its only call sites).
+fn voxel_samples(
+    ex: &ArchVoxelExtra,
+    r0: u64,
+    r1: u64,
+    c0: u64,
+    c1: u64,
+) -> impl Iterator<Item = usize> {
+    let total = (r1 - r0) * (c1 - c0);
+    let stride = (total / PER_VOXEL_SAMPLES).max(1);
+    let cols = ex.cols;
+    (0..total).step_by(stride as usize).map(move |t| {
+        let r = r0 + t / (c1 - c0);
+        let c = c0 + t % (c1 - c0);
+        (r * cols + c) as usize
+    })
+}
+
 /// Identifies a tensor entity within one build for the streamed-slab face
 /// cache: `(source_idx, byte_start, byte_len, diff_mode)`. The byte span is
 /// unique per entity and `diff_mode` picks the color path; a fresh renderer
@@ -228,19 +248,13 @@ fn magnitude_face(
     for fy in 0..bh {
         for fx in 0..bw {
             let (r0, r1, c0, c1) = voxel_rect(fx, fy, bw, bh, ex.rows, ex.cols);
-            let total = (r1 - r0) * (c1 - c0);
-            let stride = (total / PER_VOXEL_SAMPLES).max(1);
             let (mut sum, mut n) = (0f64, 0u64);
-            let mut t = 0u64;
-            while t < total {
-                let r = r0 + t / (c1 - c0);
-                let c = c0 + t % (c1 - c0);
-                let v = reader.element((r * ex.cols + c) as usize);
+            for idx in voxel_samples(ex, r0, r1, c0, c1) {
+                let v = reader.element(idx);
                 if v.is_finite() {
                     sum += v.abs() as f64;
                     n += 1;
                 }
-                t += stride;
             }
             let m = if n > 0 { (sum / n as f64) as f32 } else { 0.0 };
             means[(fy * bw + fx) as usize] = m;
@@ -288,14 +302,9 @@ fn diff_face(
     for fy in 0..bh {
         for fx in 0..bw {
             let (r0, r1, c0, c1) = voxel_rect(fx, fy, bw, bh, ex.rows, ex.cols);
-            let total = (r1 - r0) * (c1 - c0);
-            let stride = (total / PER_VOXEL_SAMPLES).max(1);
             let (mut sum_signed, mut n, mut nonfinite) = (0f64, 0u64, 0u64);
-            let mut t = 0u64;
-            while t < total {
-                let r = r0 + t / (c1 - c0);
-                let c = c0 + t % (c1 - c0);
-                let code = reader.element((r * ex.cols + c) as usize);
+            for idx in voxel_samples(ex, r0, r1, c0, c1) {
+                let code = reader.element(idx);
                 if code.is_finite() {
                     let code = code as i32;
                     if code >= 255 {
@@ -305,7 +314,6 @@ fn diff_face(
                         n += 1;
                     }
                 }
-                t += stride;
             }
             let cell = if n == 0 {
                 // Only non-finite (or nothing) sampled.
