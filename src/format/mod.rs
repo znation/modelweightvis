@@ -26,10 +26,12 @@ pub mod types;
 
 pub use dtype::{
     frobenius_from_buf, mean_abs_from_buf, rms_from_buf, sparsity_from_buf, Dtype, ElementStride,
-    TensorElementReader,
+    PackedSidecarRefs, TensorElementReader,
 };
 pub use name_map::to_canonical;
-pub use types::{ModelInfo, TensorMeta, ABS_LOG_MAX, ABS_LOG_MIN, K_RMS_SAT, RMS_FLOOR};
+pub use types::{
+    ModelInfo, PackedSidecars, TensorMeta, ABS_LOG_MAX, ABS_LOG_MIN, K_RMS_SAT, RMS_FLOOR,
+};
 
 /// Per-element delta encoding for a tensor `--diff`. Selected by the
 /// `--diff-metric` CLI flag (see [`crate::DiffMetricArg`]) and carried as a

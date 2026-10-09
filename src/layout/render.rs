@@ -6,7 +6,7 @@
 
 use image::Rgb;
 
-use crate::format::{DiffMetric, Dtype, TensorElementReader};
+use crate::format::{DiffMetric, Dtype, ElementStride, PackedSidecarRefs, TensorElementReader};
 
 /// Neutral background colour for canvas pixels that fall outside every
 /// tensor's rectangle in [`crate::layout::arch::ArchLayout`]. Not pure black
@@ -50,10 +50,10 @@ pub fn element_to_byte_proxy(dtype: Dtype, raw: &[u8]) -> u8 {
         | Dtype::Q6K
         | Dtype::Q8K
         // Packed-int dtypes (AWQ/GPTQ) also reach this only by accident —
-        // sidecar-aware dequant is *meant* to flow through
-        // `TensorElementReader::with_sidecars`, but no production call site
-        // attaches sidecars today (only a test does), so packed dtypes decode
-        // to NaN and paint as sentinels. First-byte fallback gives a
+        // sidecar-aware dequant flows through the tile loader, which passes
+        // sidecar context via [`plain_element_color_sidecars`]; a packed
+        // dtype reaching this fallback means no sidecars were available, so
+        // the element stays a NaN sentinel. First-byte fallback gives a
         // plausible legacy hilbert hue.
         | Dtype::Int4Packed
         | Dtype::Int3Packed
@@ -99,12 +99,64 @@ pub fn plain_element_color(
             let byte = (v.to_bits() >> 24) as u8;
             pixel_lut[byte as usize]
         }
-        // Packed-int dtypes need scales/zeros sidecar buffers which this
-        // renderer entry point doesn't have. Paint as padding so the
-        // viewer sees "we recognise the tensor but can't dequant per-element
-        // here yet" rather than a misleading false-color signal.
         ElementStride::Packed { .. } => PADDING_RGB,
     }
+}
+
+/// Borrowed packed-int sidecar context for one tile region: the scales/
+/// zeros buffers plus the absolute `(row, col)` the region's fetched byte
+/// buffer starts at. Built by the tile loader from
+/// `TensorMeta::packed_sidecars`; consumed by
+/// [`plain_element_color_sidecars`].
+#[derive(Clone, Copy)]
+pub struct SidecarView<'a> {
+    pub scales: &'a [u8],
+    pub scales_dtype: Dtype,
+    /// `None` for symmetric quants (e.g. AWQ without zero-points).
+    pub zeros: Option<&'a [u8]>,
+    pub zeros_dtype: Dtype,
+    /// Unpacked-tensor column count (drives scale-row indexing).
+    pub cols: u32,
+    /// Absolute `(row, col)` of the fetched qweight buffer's first element.
+    pub anchor: (usize, usize),
+}
+
+/// Like [`plain_element_color`], with optional packed-int sidecar context.
+///
+/// For `ElementStride::Packed` dtypes with `Some(sidecars)`: dequantises
+/// element `elem_idx` (buffer-relative) through the sidecars, anchoring the
+/// scales/qzeros lookups at the region's absolute position — the same MSB-
+/// through-LUT mapping the Block branch uses. With `None` (or a non-packed
+/// dtype) this is exactly [`plain_element_color`].
+pub fn plain_element_color_sidecars(
+    dtype: Dtype,
+    bytes: &[u8],
+    elem_idx: usize,
+    sidecars: Option<&SidecarView<'_>>,
+    pixel_lut: &[Rgb<u8>; 256],
+) -> Rgb<u8> {
+    if let ElementStride::Packed { .. } = dtype.stride() {
+        let Some(sc) = sidecars else {
+            return PADDING_RGB;
+        };
+        let refs = PackedSidecarRefs {
+            scales: sc.scales,
+            scales_dtype: sc.scales_dtype,
+            zeros: sc.zeros,
+            zeros_dtype: sc.zeros_dtype,
+            cols: sc.cols,
+        };
+        let mut reader = TensorElementReader::new(dtype, bytes)
+            .with_anchor(sc.anchor.0, sc.anchor.1)
+            .with_sidecars(refs);
+        let v = reader.element(elem_idx);
+        if !v.is_finite() {
+            return PADDING_RGB;
+        }
+        let byte = (v.to_bits() >> 24) as u8;
+        return pixel_lut[byte as usize];
+    }
+    plain_element_color(dtype, bytes, elem_idx, pixel_lut)
 }
 
 /// Element-aware diff colour. Decodes one element from each side via the

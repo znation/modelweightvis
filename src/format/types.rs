@@ -50,7 +50,6 @@ pub struct TensorMeta {
     /// dtypes. The qweight byte range lives in `file_start`/`file_end`; the
     /// sidecar struct carries the parallel byte ranges and dtypes for the
     /// `scales` and `qzeros` tensors needed to dequantise.
-    #[allow(dead_code)]
     pub packed_sidecars: Option<PackedSidecars>,
 }
 
@@ -58,7 +57,6 @@ pub struct TensorMeta {
 /// accompany an AWQ/GPTQ-style packed-int `qweight` tensor in the same file.
 /// Populated by [`crate::format::safetensors::fuse_packed_quant_triples`].
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PackedSidecars {
     pub scales_start: u64,
     pub scales_end: u64,

@@ -39,14 +39,34 @@ use image::Rgb;
 
 use arbvis::{encode_tile, Data, TileFormat, TILE};
 
-use crate::format::{DiffMetric, ElementStride};
+use crate::format::{DiffMetric, Dtype, ElementStride};
 use crate::layout::arch::ArchLayout;
 use crate::layout::render::{
-    diff_element_color, plain_element_color, xet_element_color, PADDING_RGB,
+    diff_element_color, plain_element_color, plain_element_color_sidecars, xet_element_color,
+    SidecarView, PADDING_RGB,
 };
 use crate::layout::TileRegion;
 
 type TileResult = Result<(image::ImageBuffer<Rgb<u8>, Vec<u8>>, Vec<u8>), String>;
+
+/// Owned sidecar buffers for one packed-int (AWQ/GPTQ) region, fetched
+/// alongside the qweight bytes by [`load_arch_tile_regions`] from the
+/// tensor's `TensorMeta::packed_sidecars` ranges. Index-parallel to
+/// [`LoadedArchTile::regions`] via [`LoadedArchTile::sidecars`].
+#[derive(Debug, Clone)]
+pub struct OwnedRegionSidecars {
+    pub scales: Vec<u8>,
+    pub scales_dtype: Dtype,
+    /// `None` for symmetric quants (e.g. AWQ without zero-points).
+    pub zeros: Option<Vec<u8>>,
+    pub zeros_dtype: Dtype,
+    /// Unpacked-tensor column count (drives scale-row indexing).
+    pub cols: u32,
+    /// Absolute `(row, col)` of the region's qweight buffer start within
+    /// its tensor — the sidecar lookups need it, the qweight slot read
+    /// stays buffer-relative.
+    pub anchor: (usize, usize),
+}
 
 /// Bytes loaded for one tile in architectural mode: one buffer per region.
 #[derive(Default)]
@@ -62,6 +82,12 @@ pub struct LoadedArchTile {
     ///   `iter_region_pixels_compact` in that case. `false` is the default
     ///   element-bounding-box layout consumed by `iter_region_pixels`.
     pub regions: Vec<(TileRegion, Vec<u8>, usize, bool)>,
+    /// Per-region packed-int sidecar buffers, index-parallel to `regions`
+    /// (one `Some` per packed-int region whose sidecars were fetched;
+    /// `None` for plain / block dtypes). Renderers hand these to
+    /// [`plain_element_color_sidecars`] so AWQ/GPTQ tensors dequantise
+    /// instead of painting NaN sentinels.
+    pub sidecars: Vec<Option<OwnedRegionSidecars>>,
     /// Mirror of [`ArchLayout::magnitude_lut`](crate::layout::arch::ArchLayout)
     /// for this tile, stamped at load time (the renderer's `RenderCtx` can't
     /// see the layout). When `true`, [`render_arch_tile_plain`] colours through
@@ -156,6 +182,7 @@ pub async fn load_arch_tile_regions(
 ) -> anyhow::Result<LoadedArchTile> {
     let mut out = LoadedArchTile {
         magnitude_lut: layout.magnitude_lut,
+        sidecars: Vec::new(),
         ..Default::default()
     };
     let regions = layout.regions_in_tile(zoom, tx, ty);
@@ -184,16 +211,87 @@ pub async fn load_arch_tile_regions(
             let compact =
                 fetch_compact_region_u8(&source_data[region.source_idx], &region, src_off).await?;
             out.regions.push((region, compact, 0, true));
+            // Compact regions are Fixed(1)-stride only — never packed-int.
+            out.sidecars.push(None);
         } else {
             let local_off = abs_start - src_off;
             let bytes = source_data[region.source_idx]
                 .fetch_range(local_off, len)
                 .await?;
+            let sidecars =
+                load_region_sidecars(layout, &region, &source_data[region.source_idx]).await?;
             out.regions.push((region, bytes, leading, false));
+            out.sidecars.push(sidecars);
         }
     }
     let _ = (tx, ty); // keep params for symmetry with the byte-mode signature
     Ok(out)
+}
+
+/// Fetch the AWQ/GPTQ sidecar buffers for one packed-int region, or `None`
+/// for plain / block dtypes.
+///
+/// `TensorMeta::packed_sidecars` (mirrored onto `PlacedTensor`) holds the
+/// sidecar tensors' file-local byte ranges, so the fetches go straight to
+/// the source `Data` — no cumulative-offset adjustment (unlike the qweight
+/// span, whose `tensor_byte_start` is stream-absolute).
+async fn load_region_sidecars(
+    layout: &ArchLayout,
+    region: &TileRegion,
+    data: &Data,
+) -> anyhow::Result<Option<OwnedRegionSidecars>> {
+    if !matches!(region.dtype.stride(), ElementStride::Packed { .. }) {
+        return Ok(None);
+    }
+    let Some(sc) = layout
+        .tensors
+        .iter()
+        .find(|t| t.tensor_id == region.tensor_id)
+        .and_then(|t| t.packed_sidecars.as_ref())
+    else {
+        // Packed dtype without fused sidecars (incomplete quant triple):
+        // leave None — the renderer paints NaN sentinels, as before.
+        return Ok(None);
+    };
+    let scales_len = sc.scales_end.saturating_sub(sc.scales_start) as usize;
+    let scales = data.fetch_range(sc.scales_start, scales_len).await?;
+    let zeros = match (sc.zeros_start, sc.zeros_end) {
+        (Some(zs), Some(ze)) => {
+            let zeros_len = ze.saturating_sub(zs) as usize;
+            Some(data.fetch_range(zs, zeros_len).await?)
+        }
+        _ => None,
+    };
+    Ok(Some(OwnedRegionSidecars {
+        scales,
+        scales_dtype: sc.scales_dtype,
+        zeros,
+        zeros_dtype: sc.zeros_dtype,
+        cols: sc.cols,
+        anchor: packed_region_anchor(region),
+    }))
+}
+
+/// Absolute `(row, col)` a packed-int region's fetched qweight buffer starts
+/// at within its tensor: `row_first` vertically, and the column snapped down
+/// to the packed-slot boundary (matching `region_byte_span`'s Packed arm,
+/// which aligns the fetch the same way).
+fn packed_region_anchor(r: &TileRegion) -> (usize, usize) {
+    match r.dtype.stride() {
+        ElementStride::Packed {
+            bits,
+            pack_dtype_bytes,
+            ..
+        } if bits > 0 => {
+            let elems_per_slot = ((pack_dtype_bytes as u64) * 8) / bits as u64;
+            if elems_per_slot == 0 {
+                return (0, 0);
+            }
+            let col_aligned = (r.col_first / elems_per_slot) * elems_per_slot;
+            (r.row_first as usize, col_aligned as usize)
+        }
+        _ => (0, 0),
+    }
 }
 
 /// Row-batched compact fetch for `Fixed(1)`-stride regions under heavy shrink.
@@ -314,14 +412,16 @@ fn blank_tile() -> image::ImageBuffer<Rgb<u8>, Vec<u8>> {
 /// keep the byte/Hilbert-consistent Stairwell colouring.
 /// Shared skeleton for the architectural tile renderers: allocate a blank
 /// tile, walk the tile's regions, and hand each one to `paint` together with
-/// its fetched bytes, leading element offset, and compact-layout flag. All
-/// four `render_arch_tile_*` variants go through this — they differ only in
-/// the per-pixel color mapping.
+/// its region index, fetched bytes, leading element offset, and
+/// compact-layout flag. All four `render_arch_tile_*` variants go through
+/// this — they differ only in the per-pixel color mapping. The index lets
+/// the plain renderer look up per-region packed-int sidecars.
 fn render_arch_tile(
     tile: &LoadedArchTile,
     fmt: TileFormat,
     mut paint: impl FnMut(
         &mut image::ImageBuffer<Rgb<u8>, Vec<u8>>,
+        usize,
         &TileRegion,
         &[u8],
         usize,
@@ -329,8 +429,8 @@ fn render_arch_tile(
     ),
 ) -> TileResult {
     let mut img = blank_tile();
-    for (region, bytes, leading, is_compact) in &tile.regions {
-        paint(&mut img, region, bytes, *leading, *is_compact);
+    for (i, (region, bytes, leading, is_compact)) in tile.regions.iter().enumerate() {
+        paint(&mut img, i, region, bytes, *leading, *is_compact);
     }
     encode_tile(img, fmt)
 }
@@ -345,7 +445,7 @@ pub fn render_arch_tile_plain(
     } else {
         pixel_lut
     };
-    render_arch_tile(tile, fmt, |img, region, bytes, leading, is_compact| {
+    render_arch_tile(tile, fmt, |img, i, region, bytes, leading, is_compact| {
         let dtype = region.dtype;
         if is_compact {
             iter_region_pixels_compact(region, |px, py, elem_off| {
@@ -353,8 +453,20 @@ pub fn render_arch_tile_plain(
                 img.put_pixel(px, py, pixel_lut[byte as usize]);
             });
         } else {
+            // Packed-int (AWQ/GPTQ) regions carry fetched scales/qzeros
+            // sidecars; hand them to the decoder so these tensors dequantise
+            // per element instead of painting NaN sentinels.
+            let sidecar = tile.sidecars.get(i).and_then(|s| s.as_ref()).map(|sc| SidecarView {
+                scales: &sc.scales,
+                scales_dtype: sc.scales_dtype,
+                zeros: sc.zeros.as_deref(),
+                zeros_dtype: sc.zeros_dtype,
+                cols: sc.cols,
+                anchor: sc.anchor,
+            });
             iter_region_pixels(region, leading, |px, py, elem_off| {
-                let color = plain_element_color(dtype, bytes, elem_off, pixel_lut);
+                let color =
+                    plain_element_color_sidecars(dtype, bytes, elem_off, sidecar.as_ref(), pixel_lut);
                 img.put_pixel(px, py, color);
             });
         }
@@ -371,7 +483,7 @@ pub fn render_arch_tile_diff(
     pixel_lut: &[Rgb<u8>; 256],
     fmt: TileFormat,
 ) -> TileResult {
-    render_arch_tile(tile, fmt, |img, region, bytes, leading, is_compact| {
+    render_arch_tile(tile, fmt, |img, _i, region, bytes, leading, is_compact| {
         let dtype = region.dtype;
         if is_compact {
             // Compact buffer is one byte per painted pixel — exactly the
@@ -410,7 +522,7 @@ pub fn render_arch_tile_xet(
     tableau: &[Rgb<u8>; 20],
     fmt: TileFormat,
 ) -> TileResult {
-    render_arch_tile(tile, fmt, |img, region, bytes, leading, is_compact| {
+    render_arch_tile(tile, fmt, |img, _i, region, bytes, leading, is_compact| {
         let dtype = region.dtype;
         // xet xorb coloring keys off absolute byte position. For fixed-stride
         // dtypes the byte address of element K is at a known offset; for
@@ -461,7 +573,7 @@ pub fn render_arch_tile_diff_paired(
     // Per-tensor scale is unknown at this layer in v1; pass 0 → RMS path
     // falls back to RMS_FLOOR.
     let scale_orig = 0.0f32;
-    render_arch_tile(tile_a, fmt, |img, region_a, bytes_a, leading_a, _| {
+    render_arch_tile(tile_a, fmt, |img, _i, region_a, bytes_a, leading_a, _| {
         let Some((_region_b, bytes_b, leading_b, _is_compact_b)) = by_id_b.get(&region_a.tensor_id)
         else {
             return;
@@ -587,5 +699,80 @@ mod region_byte_span_tests {
         let expected_last = (2 - 1) * bytes_per_row + (cl_aligned / eps) * slot_bytes;
         assert_eq!(len as u64, expected_last - first);
         assert_eq!(leading as u64, cf - cf_aligned);
+    }
+
+    #[test]
+    fn plain_tile_renders_packed_region_with_sidecars() {
+        // 4 rows x 8 cols int4 packed (one int32 slot per row); nibble of
+        // slot r is r; scale(col) = col + 1 (f32). Dequantised value at
+        // (r, c) = r * (c + 1). The tile region covers rows 2..4 only, so
+        // the fetched qweight buffer is 2 slots and the sidecar lookups
+        // must be anchored at absolute row 2.
+        let qweight: Vec<u8> = [0u32, 1, 2, 3]
+            .iter()
+            .map(|r| r * 0x1111_1111)
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let scales: Vec<u8> = (0..8)
+            .flat_map(|c| ((c as f32) + 1.0).to_le_bytes())
+            .collect();
+        let expect = |r: u64, c: u64| -> f32 { r as f32 * (c as f32 + 1.0) };
+
+        let region = TileRegion {
+            source_idx: 0,
+            tensor_id: 0,
+            dtype: Dtype::Int4Packed,
+            tensor_rows: 4,
+            tensor_cols: 8,
+            row_first: 2,
+            row_last_exclusive: 4,
+            col_first: 0,
+            col_last_exclusive: 8,
+            tensor_byte_start: 0,
+            footprint_w: 8,
+            footprint_h: 8,
+            samp_x0: 0,
+            samp_y0: 4,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: 8,
+            tile_y1: 4,
+        };
+        let lut: Vec<Rgb<u8>> = (0..256).map(|i| Rgb([i as u8, 0, 0])).collect();
+        let mut lut_arr = [Rgb([0u8, 0, 0]); 256];
+        lut_arr.copy_from_slice(&lut);
+
+        let mut tile = LoadedArchTile {
+            regions: vec![(region, qweight[8..16].to_vec(), 0, false)],
+            magnitude_lut: false,
+            sidecars: vec![Some(OwnedRegionSidecars {
+                scales: scales.clone(),
+                scales_dtype: Dtype::F32,
+                zeros: None,
+                zeros_dtype: Dtype::Unknown,
+                cols: 8,
+                anchor: (2, 0),
+            })],
+        };
+
+        // With sidecars: painted rows decode to r * (c + 1); its f32 MSB
+        // drives the LUT index.
+        let (img, _) = render_arch_tile_plain(&tile, &lut_arr, TileFormat::Png).unwrap();
+        for (py, r) in [2u64, 2, 3, 3].iter().enumerate() {
+            for px in 0..8u32 {
+                let v = expect(*r, px as u64);
+                let want = lut[(v.to_bits() >> 24) as usize];
+                assert_eq!(img[(px, py as u32)], want, "pixel ({px},{py})");
+            }
+        }
+
+        // Without sidecars the same tile paints NaN sentinels (padding).
+        tile.sidecars = vec![None];
+        let (img, _) = render_arch_tile_plain(&tile, &lut_arr, TileFormat::Png).unwrap();
+        for py in 0..4u32 {
+            for px in 0..8u32 {
+                assert_eq!(img[(px, py)], PADDING_RGB, "pixel ({px},{py})");
+            }
+        }
     }
 }

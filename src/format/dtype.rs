@@ -590,6 +590,7 @@ fn packed_element(
     bits: u8,
     pack_dtype_bytes: u8,
     group_size: usize,
+    anchor: (usize, usize),
 ) -> f32 {
     if bits == 0 || pack_dtype_bytes == 0 || sc.cols == 0 {
         return f32::NAN;
@@ -604,8 +605,13 @@ fn packed_element(
     if cols == 0 || !cols.is_multiple_of(elems_per_slot) {
         return f32::NAN;
     }
+    // Buffer-relative row / in-row position: the qweight slot read below is
+    // purely relative to the fetched buffer. `anchor` lifts both to the
+    // element's absolute tensor position for the sidecar lookups.
     let row = k / cols;
     let col = k % cols;
+    let abs_row = anchor.0.saturating_add(row);
+    let abs_col = anchor.1.saturating_add(col);
     let slots_per_row = cols / elems_per_slot;
     let slot_idx = row * slots_per_row + col / elems_per_slot;
     let in_slot = col % elems_per_slot;
@@ -623,9 +629,10 @@ fn packed_element(
     };
     let q = ((packed >> (in_slot * bits)) & mask) as i32;
 
-    // Group index and scale lookup.
-    let group_idx = row.checked_div(group_size).unwrap_or(0);
-    let scale_elem_idx = group_idx * cols + col;
+    // Group index and scale lookup — absolute position, since the scales
+    // tensor covers the whole unpacked tensor.
+    let group_idx = abs_row.checked_div(group_size).unwrap_or(0);
+    let scale_elem_idx = group_idx.saturating_mul(cols).saturating_add(abs_col);
     let scale = read_scalar(sc.scales, sc.scales_dtype, scale_elem_idx);
     if !scale.is_finite() {
         return f32::NAN;
@@ -642,8 +649,10 @@ fn packed_element(
             }
             z
         } else {
-            // GPTQ/AWQ store zeros bit-packed identically to qweight.
-            let zslot = group_idx * slots_per_row + col / elems_per_slot;
+            // GPTQ/AWQ store zeros bit-packed identically to qweight; the
+            // zeros buffer is whole-tensor, so index it by absolute column
+            // slot.
+            let zslot = group_idx * slots_per_row + abs_col / elems_per_slot;
             let zoff = zslot * slot_bytes;
             if zoff + slot_bytes > zb.len() {
                 return f32::NAN;
@@ -699,6 +708,11 @@ pub struct TensorElementReader<'a> {
     /// AWQ/GPTQ sidecars. `None` for non-packed dtypes; required (else
     /// `element` returns NaN) for `ElementStride::Packed`.
     sidecars: Option<PackedSidecarRefs<'a>>,
+    /// Absolute `(row, col)` of the byte buffer's first element within its
+    /// tensor. Only read by the packed-int path: the qweight slot lookup
+    /// stays buffer-relative, but the scales/qzeros sidecar lookups need
+    /// the element's absolute position. `(0, 0)` for whole-tensor buffers.
+    anchor: (usize, usize),
 }
 
 /// Borrowed sidecar buffers for one packed-int tensor. Attached to a
@@ -726,19 +740,31 @@ impl<'a> TensorElementReader<'a> {
             bytes,
             cache: None,
             sidecars: None,
+            anchor: (0, 0),
         }
     }
 
     /// Builder: attach AWQ/GPTQ sidecar tensors. For plain / Block dtypes
     /// this is a no-op (the sidecars are simply unused).
     ///
-    /// Currently called only from this crate's own tests — no production
-    /// path attaches sidecars yet, so packed-int tensors render as NaN
-    /// sentinels (see BUGS.md). Kept exported for the wire-up that reads
-    /// `TensorMeta::packed_sidecars` and threads the buffers here.
-    #[allow(dead_code)]
+    /// Production wire-up: the architectural tile loader
+    /// (`crate::tiled::leaf_arch::load_arch_tile_regions`) reads
+    /// `TensorMeta::packed_sidecars` and threads the fetched scales/qzeros
+    /// buffers here.
     pub fn with_sidecars(mut self, refs: PackedSidecarRefs<'a>) -> Self {
         self.sidecars = Some(refs);
+        self
+    }
+
+    /// Builder: declare the absolute `(row, col)` of the byte buffer's first
+    /// element within its tensor. Used by the tile render path, whose fetched
+    /// buffer starts at a region's `(row_first, col_first_aligned)` rather
+    /// than element (0, 0): the packed-int decoder reads qweight slots
+    /// buffer-relatively but indexes the scales/qzeros sidecars at the
+    /// element's absolute position. Defaults to `(0, 0)` (whole-tensor
+    /// buffers), which keeps every existing call site's behaviour.
+    pub fn with_anchor(mut self, row: usize, col: usize) -> Self {
+        self.anchor = (row, col);
         self
     }
 
@@ -803,6 +829,7 @@ impl<'a> TensorElementReader<'a> {
                     bits,
                     pack_dtype_bytes,
                     group_size as usize,
+                    self.anchor,
                 )
             }
         }
@@ -1309,6 +1336,76 @@ mod tests {
                 assert_eq!(block_bytes, 144);
             }
             other => panic!("expected Block, got {other:?}"),
+        }
+    }
+    #[test]
+    fn packed_sidecar_anchor_row_region() {
+        // 4 rows x 8 cols int4 packed (one int32 slot per row). Slot value
+        // for row r is 0xRRRRRRRR so every nibble is r. Scales are f32,
+        // scale(col) = col + 1. Dequantised value at (r, c) = r * (c + 1).
+        let qweight: Vec<u8> = [0u32, 1, 2, 3]
+            .iter()
+            .map(|r| r * 0x1111_1111) // every nibble of slot r is r
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let scales: Vec<u8> = (0..8)
+            .flat_map(|c| ((c as f32) + 1.0).to_le_bytes())
+            .collect();
+        let sc = PackedSidecarRefs {
+            scales: &scales,
+            scales_dtype: Dtype::F32,
+            zeros: None,
+            zeros_dtype: Dtype::Unknown,
+            cols: 8,
+        };
+        // Whole-tensor buffer, anchor (0, 0): baseline behaviour.
+        let mut whole = TensorElementReader::new(Dtype::Int4Packed, &qweight)
+            .with_anchor(0, 0)
+            .with_sidecars(sc);
+        for (k, expect) in (0..32).map(|k| {
+            let (r, c) = (k / 8, k % 8);
+            (k, r as f32 * (c as f32 + 1.0))
+        }) {
+            assert_eq!(whole.element(k), expect, "whole-tensor k={k}");
+        }
+
+        // Tile-region slice: only row 2's slot was fetched (bytes 8..12).
+        // Without the anchor the decoder would read row 0's scales and
+        // return 0.0 * (c + 1) = 0 for every element; with it the sidecar
+        // lookups lift to the absolute row.
+        let region = &qweight[8..12];
+        let mut r2 = TensorElementReader::new(Dtype::Int4Packed, region)
+            .with_anchor(2, 0)
+            .with_sidecars(sc);
+        for (k, expect) in (0..8).map(|k| (k, 2.0f32 * (k as f32 + 1.0))) {
+            assert_eq!(r2.element(k), expect, "row-anchored region k={k}");
+        }
+    }
+
+    #[test]
+    fn packed_sidecar_anchor_col_region() {
+        // 1 row x 16 cols (two int32 slots per row), slot 0 packed with
+        // nibble value 7, slot 1 with 5. A region covering only slot 1
+        // (bytes 4..8) with anchor col 8 must read slot 1's nibbles and
+        // slot 1's scales (cols 8..16).
+        let slot = |v: u32| v.to_le_bytes();
+        let qweight: Vec<u8> = [slot(0x7777_7777), slot(0x5555_5555)].concat();
+        let scales: Vec<u8> = (0..16)
+            .flat_map(|c| ((c as f32) + 1.0).to_le_bytes())
+            .collect();
+        let sc = PackedSidecarRefs {
+            scales: &scales,
+            scales_dtype: Dtype::F32,
+            zeros: None,
+            zeros_dtype: Dtype::Unknown,
+            cols: 16,
+        };
+        let region = &qweight[4..8];
+        let mut r = TensorElementReader::new(Dtype::Int4Packed, region)
+            .with_anchor(0, 8)
+            .with_sidecars(sc);
+        for (k, expect) in (0..8).map(|k| (k, 5.0f32 * (k as f32 + 9.0))) {
+            assert_eq!(r.element(k), expect, "col-anchored region k={k}");
         }
     }
 }

@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use arbvis::{name_hue, Source, SourceKind, TILE};
 
 use crate::data::SourceMeta;
-use crate::format::{Dtype, TensorMeta};
+use crate::format::{Dtype, PackedSidecars, TensorMeta};
 use crate::layout::bin_pack::{align_up, pack, Slot};
 use crate::layout::name_tree::{self, LayerSlot};
 use crate::layout::TileRegion;
@@ -130,6 +130,11 @@ pub struct PlacedTensor {
     /// Stable id of the layer this tensor belongs to: `None` for top-level
     /// singletons; `Some(layer_idx)` for transformer-block tensors.
     pub layer_idx: Option<u32>,
+    /// AWQ/GPTQ packed-int sidecar byte ranges (file-local), mirrored from
+    /// the source [`TensorMeta`]. Read by the tile loader to fetch the
+    /// scales/qzeros buffers packed-int decoding needs; `None` for plain /
+    /// block dtypes.
+    pub packed_sidecars: Option<PackedSidecars>,
 }
 
 /// One transformer block's bounding rectangle on the canvas. Drawn as a
@@ -442,6 +447,7 @@ impl ArchLayout {
                         canvas_y: cy,
                         hue: name_hue(sp),
                         layer_idx: Some(*idx),
+                        packed_sidecars: t.packed_sidecars.clone(),
                     });
                 }
             }
@@ -748,6 +754,7 @@ impl ArchLayout {
                 canvas_y: 0,
                 hue: name_hue(key.2),
                 layer_idx: None,
+                packed_sidecars: t.packed_sidecars.clone(),
             });
         }
 
@@ -950,6 +957,7 @@ impl ArchLayout {
                     canvas_y,
                     hue: name_hue(column.label()),
                     layer_idx: Some(*layer),
+                    packed_sidecars: t.packed_sidecars.clone(),
                 });
             }
         }
@@ -1158,6 +1166,7 @@ fn place_top_level(
         canvas_y: cursor_y,
         hue: name_hue(&t.name),
         layer_idx: None,
+        packed_sidecars: t.packed_sidecars.clone(),
     });
     cursor_y.saturating_add(dh).saturating_add(PAD)
 }
