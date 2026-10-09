@@ -108,6 +108,34 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<(Vec<TensorMeta>, u64)> {
     Ok((tensors, header_end))
 }
 
+/// Validate parsed tensors' absolute byte ranges against the file's actual
+/// size, dropping entries that fall outside it.
+///
+/// A malicious or truncated `.safetensors` file can declare `data_offsets`
+/// beyond the end of the file (or `end < start`). Downstream readers slice
+/// the backing bytes at those offsets, and an out-of-range slice panics, so
+/// the header cannot be trusted on its own: this is the boundary where the
+/// declared ranges meet the real file length. Returns how many tensors were
+/// dropped and logs one warning per drop.
+pub fn validate_tensor_ranges(tensors: &mut Vec<TensorMeta>, file_size: u64) -> usize {
+    let before = tensors.len();
+    tensors.retain(|t| {
+        let in_bounds = t.file_end <= file_size && t.file_start < t.file_end;
+        if !in_bounds {
+            log::warn!(
+                "safetensors: dropping tensor '{}' with declared byte range \
+                 [{}..{}) outside file size {}",
+                t.name,
+                t.file_start,
+                t.file_end,
+                file_size
+            );
+        }
+        in_bounds
+    });
+    before - tensors.len()
+}
+
 /// Fuse AWQ / GPTQ / EXL2 `(qweight, scales, qzeros)` triples into a single
 /// logical packed-int tensor in-place.
 ///
@@ -319,6 +347,34 @@ mod tests {
             file_end: end,
             packed_sidecars: None,
         }
+    }
+
+    #[test]
+    fn validate_tensor_ranges_drops_out_of_bounds_and_inverted() {
+        let mut v = vec![
+            mk_t("ok", Dtype::F32, vec![4], 100, 200),
+            // Declared end beyond the file size — e.g. a truncated download
+            // or a hostile header. Downstream readers slice the backing
+            // bytes at these offsets, so the entry must go.
+            mk_t("past_eof", Dtype::F32, vec![4], 180, 400),
+            mk_t("way_past_eof", Dtype::F32, vec![4], 900, 1000),
+            // Inverted range: end before start.
+            mk_t("inverted", Dtype::F32, vec![4], 150, 120),
+        ];
+        let dropped = validate_tensor_ranges(&mut v, 200);
+        assert_eq!(dropped, 3);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "ok");
+    }
+
+    #[test]
+    fn validate_tensor_ranges_keeps_well_formed_file() {
+        let mut v = vec![
+            mk_t("a", Dtype::F32, vec![4], 0, 16),
+            mk_t("b", Dtype::F16, vec![2], 16, 20),
+        ];
+        assert_eq!(validate_tensor_ranges(&mut v, 20), 0);
+        assert_eq!(v.len(), 2);
     }
 
     #[test]

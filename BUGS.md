@@ -8,6 +8,12 @@ unclear-invariant).
 
 ## Open
 
+### Flaky test: `format::dtype::tests::reader_quantized_q8_0_does_not_crash_on_padded_block` (found by security 2026-10-09)
+
+- Symptom: intermittently panics with "elem 0: got NaN, expected finite" in a full `cargo test` run; passes when run alone (observed once during a full-suite run on 2026-10-09, then green on rerun and on 5 isolated runs).
+- Reproduce: run the full `cargo test` repeatedly.
+- Suspected cause: the test builds a Q8_0 block of all-zero bytes; candle's dequant kernel turns a zero f16 scale into an undefined/NaN product, so the `is_finite` assertion depends on candle's handling of zero scales, not on anything modelweightvis controls.
+
 ### AWQ/GPTQ packed-int tensors render as NaN sentinels — sidecars never attached in production (found by tumwater(clean) 2026-10-09)
 
 `TensorElementReader::with_sidecars` (`src/format/dtype.rs`) is the only way to

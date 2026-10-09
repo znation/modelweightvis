@@ -470,6 +470,10 @@ pub async fn load_model_info_async(
     fmt: SourceFormat,
 ) -> anyhow::Result<ModelInfo> {
     let (tensors, header_end) = fetch_model_header(data, fmt).await?;
+    let mut tensors = tensors;
+    if fmt == SourceFormat::Safetensors {
+        format::safetensors::validate_tensor_ranges(&mut tensors, byte_size);
+    }
     let color_ranges = match fmt {
         SourceFormat::Safetensors => {
             format::safetensors::build_color_ranges(&tensors, header_end, byte_size)
@@ -503,7 +507,18 @@ async fn fetch_model_header(
             }
             let total_header = 8 + header_size as usize;
             let header_bytes = data.fetch_range(0, total_header).await?;
-            format::safetensors::parse_header(&header_bytes)
+            let (mut tensors, header_end) = format::safetensors::parse_header(&header_bytes)?;
+            // For local sources the fetched bytes are the whole file, so the
+            // header-declared tensor ranges can be checked against the real
+            // length. Remote sources expose only the header prefix here —
+            // their callers validate against the known file size instead.
+            // Without this, a hostile or truncated header panics downstream
+            // when the render path slices the backing bytes at the declared
+            // offsets.
+            if data.is_local() && !matches!(data, Data::ZeroFill) {
+                format::safetensors::validate_tensor_ranges(&mut tensors, data.len() as u64);
+            }
+            Ok((tensors, header_end))
         }
         SourceFormat::Gguf => {
             let header = fetch_gguf_header(data).await?;
@@ -3344,4 +3359,5 @@ mod tests {
         let (jobs, _, _) = build_fused_expert_jobs(&rank);
         assert!(jobs.is_empty());
     }
+
 }
