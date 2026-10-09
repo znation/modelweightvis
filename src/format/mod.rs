@@ -25,8 +25,8 @@ pub mod safetensors;
 pub mod types;
 
 pub use dtype::{
-    frobenius_from_buf, mean_abs_from_buf, rms_from_buf, sparsity_from_buf, Dtype, ElementStride,
-    PackedSidecarRefs, TensorElementReader,
+    decode_prefix_f32, frobenius_from_buf, mean_abs_from_buf, rms_from_buf, sparsity_from_buf,
+    Dtype, ElementStride, PackedSidecarRefs, TensorElementReader,
 };
 pub use name_map::to_canonical;
 pub use types::{

@@ -2660,12 +2660,7 @@ fn percentile_bounds(scalars: &[f32], q_lo: f32, q_hi: f32) -> (f32, f32) {
 /// the only way to hit one is a malformed checkpoint, in which case
 /// CKA polluted by NaN is still a useful diagnostic).
 fn decode_tensor_to_f32(dtype: format::Dtype, bytes: &[u8], n_elements: usize) -> Vec<f32> {
-    let mut reader = format::TensorElementReader::new(dtype, bytes);
-    let mut out = vec![0.0f32; n_elements];
-    for (k, slot) in out.iter_mut().enumerate() {
-        *slot = reader.element(k);
-    }
-    out
+    format::decode_prefix_f32(dtype, bytes, n_elements)
 }
 
 /// Build the `--moe` **CKA** scene from the shared [`LoadedMoe`]: per-`(layer,

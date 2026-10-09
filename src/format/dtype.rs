@@ -474,6 +474,40 @@ impl Dtype {
         let rms_denom = (K_RMS_SAT * scale_orig.max(RMS_FLOOR)).max(f32::MIN_POSITIVE);
         let log_min = ABS_LOG_MIN.log10();
         let log_max = ABS_LOG_MAX.log10();
+        // Fixed-stride fast path: chunked little-endian reads instead of the
+        // per-element reader dispatch — the stride match and bounds check are
+        // hoisted out of the loop. Only taken when both buffers fully cover
+        // the requested element range, so out-of-range pixels keep flowing
+        // through the reader's NaN sentinel below.
+        if let (ElementStride::Fixed(bo), ElementStride::Fixed(bm)) =
+            (self.stride(), mod_dtype.stride())
+        {
+            let need_o = orig_start_elem
+                .saturating_mul(bo)
+                .saturating_add(elem_count.saturating_mul(bo));
+            let need_m = mod_start_elem
+                .saturating_mul(bm)
+                .saturating_add(elem_count.saturating_mul(bm));
+            if need_o <= orig.len() && need_m <= mod_.len() {
+                let mut out = Vec::with_capacity(elem_count);
+                for k in 0..elem_count {
+                    let o = decode_element(
+                        self,
+                        &orig[orig_start_elem * bo + k * bo..orig_start_elem * bo + (k + 1) * bo],
+                    );
+                    let m = decode_element(
+                        mod_dtype,
+                        &mod_[mod_start_elem * bm + k * bm..mod_start_elem * bm + (k + 1) * bm],
+                    );
+                    if !o.is_finite() || !m.is_finite() {
+                        out.push(255u8);
+                        continue;
+                    }
+                    push_diff_pixel(&mut out, o, m, metric, rms_denom, log_min, log_max);
+                }
+                return out;
+            }
+        }
         let mut o_reader = TensorElementReader::new(self, orig);
         let mut m_reader = TensorElementReader::new(mod_dtype, mod_);
         let mut out = Vec::with_capacity(elem_count);
@@ -484,43 +518,57 @@ impl Dtype {
                 out.push(255u8);
                 continue;
             }
-            let delta = m - o;
-            let signed = match metric {
-                DiffMetric::Rms => (delta / rms_denom).clamp(-1.0, 1.0),
-                DiffMetric::AbsLog => {
-                    let abs_d = delta.abs();
-                    if abs_d <= ABS_LOG_MIN {
-                        0.0
-                    } else {
-                        let norm =
-                            ((abs_d.log10() - log_min) / (log_max - log_min)).clamp(0.0, 1.0);
-                        if delta >= 0.0 {
-                            norm
-                        } else {
-                            -norm
-                        }
-                    }
-                }
-                DiffMetric::Exact => {
-                    if delta == 0.0 {
-                        0.0
-                    } else if delta > 0.0 {
-                        1.0
-                    } else {
-                        -1.0
-                    }
-                }
-            };
-            let brightness = (signed.abs() * 127.0).round() as u8;
-            let byte = if signed >= 0.0 {
-                127u8.saturating_add(brightness)
-            } else {
-                127u8.saturating_sub(brightness)
-            };
-            out.push(byte);
+            push_diff_pixel(&mut out, o, m, metric, rms_denom, log_min, log_max);
         }
         out
     }
+}
+
+/// Signed-delta metric + sign-magnitude byte encode for one diff pixel.
+/// Shared by the fixed-stride fast path and the reader fallback in
+/// [`Dtype::diff_to_u8`] so the two loops stay byte-identical.
+fn push_diff_pixel(
+    out: &mut Vec<u8>,
+    o: f32,
+    m: f32,
+    metric: DiffMetric,
+    rms_denom: f32,
+    log_min: f32,
+    log_max: f32,
+) {
+    let delta = m - o;
+    let signed = match metric {
+        DiffMetric::Rms => (delta / rms_denom).clamp(-1.0, 1.0),
+        DiffMetric::AbsLog => {
+            let abs_d = delta.abs();
+            if abs_d <= ABS_LOG_MIN {
+                0.0
+            } else {
+                let norm = ((abs_d.log10() - log_min) / (log_max - log_min)).clamp(0.0, 1.0);
+                if delta >= 0.0 {
+                    norm
+                } else {
+                    -norm
+                }
+            }
+        }
+        DiffMetric::Exact => {
+            if delta == 0.0 {
+                0.0
+            } else if delta > 0.0 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+    };
+    let brightness = (signed.abs() * 127.0).round() as u8;
+    let byte = if signed >= 0.0 {
+        127u8.saturating_add(brightness)
+    } else {
+        127u8.saturating_sub(brightness)
+    };
+    out.push(byte);
 }
 
 /// Decode one plain (non-quantized) element from a little-endian byte slice.
@@ -666,6 +714,49 @@ fn packed_element(
     };
 
     ((q as f32) - zero) * scale
+}
+
+/// Decode the first `n` elements of `bytes` to f32 and fold them left with
+/// `f`.
+///
+/// Fixed-stride dtypes take a chunked fast path: the per-element stride
+/// match and bounds check are hoisted out of the loop (the little-endian
+/// reads then vectorize), which matters for the multi-million-element full
+/// buffer scans behind the summary stats and the CKA panel decode.
+/// Block-quantized and packed dtypes go through [`TensorElementReader`],
+/// keeping the block dequant cache. The fallback also covers a fixed-stride
+/// buffer that doesn't cover `n` elements — the reader then paints the
+/// out-of-range tail as NaN, same as before.
+pub(crate) fn fold_prefix_f32<T>(
+    dtype: Dtype,
+    bytes: &[u8],
+    n: usize,
+    init: T,
+    mut f: impl FnMut(T, f32) -> T,
+) -> T {
+    if let ElementStride::Fixed(bpe) = dtype.stride() {
+        if n.saturating_mul(bpe) <= bytes.len() {
+            return bytes[..n * bpe]
+                .chunks_exact(bpe)
+                .fold(init, |acc, chunk| f(acc, decode_element(dtype, chunk)));
+        }
+    }
+    let mut reader = TensorElementReader::new(dtype, bytes);
+    (0..n).fold(init, |acc, k| f(acc, reader.element(k)))
+}
+
+/// Decode the first `n` elements of `bytes` into a fresh f32 vec.
+pub fn decode_prefix_f32(dtype: Dtype, bytes: &[u8], n: usize) -> Vec<f32> {
+    fold_prefix_f32(
+        dtype,
+        bytes,
+        n,
+        Vec::with_capacity(n),
+        |mut v, x| {
+            v.push(x);
+            v
+        },
+    )
 }
 
 fn read_u32_le(b: &[u8]) -> u32 {
@@ -874,15 +965,19 @@ impl<'a> TensorElementReader<'a> {
         if n == 0 {
             return 0.0;
         }
-        let mut sum_sq = 0.0f64;
-        let mut count = 0u64;
-        for k in 0..n {
-            let v = self.element(k);
-            if v.is_finite() {
-                sum_sq += (v as f64) * (v as f64);
-                count += 1;
-            }
-        }
+        let (sum_sq, count) = fold_prefix_f32(
+            self.dtype,
+            self.bytes,
+            n,
+            (0.0f64, 0u64),
+            |(sum_sq, count), v| {
+                if v.is_finite() {
+                    (sum_sq + (v as f64) * (v as f64), count + 1)
+                } else {
+                    (sum_sq, count)
+                }
+            },
+        );
         if count == 0 {
             0.0
         } else {
@@ -945,14 +1040,13 @@ pub fn frobenius_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
     if n == 0 {
         return 0.0;
     }
-    let mut reader = TensorElementReader::new(dtype, bytes);
-    let mut sum_sq = 0.0f64;
-    for k in 0..n {
-        let v = reader.element(k);
+    let sum_sq = fold_prefix_f32(dtype, bytes, n, 0.0f64, |s, v| {
         if v.is_finite() {
-            sum_sq += (v as f64) * (v as f64);
+            s + (v as f64) * (v as f64)
+        } else {
+            s
         }
-    }
+    });
     (sum_sq.sqrt()) as f32
 }
 
@@ -966,16 +1060,13 @@ pub fn mean_abs_from_buf(dtype: Dtype, bytes: &[u8]) -> f32 {
     if n == 0 {
         return 0.0;
     }
-    let mut reader = TensorElementReader::new(dtype, bytes);
-    let mut sum_abs = 0.0f64;
-    let mut count = 0u64;
-    for k in 0..n {
-        let v = reader.element(k);
+    let (sum_abs, count) = fold_prefix_f32(dtype, bytes, n, (0.0f64, 0u64), |(s, c), v| {
         if v.is_finite() {
-            sum_abs += (v as f64).abs();
-            count += 1;
+            (s + (v as f64).abs(), c + 1)
+        } else {
+            (s, c)
         }
-    }
+    });
     if count == 0 {
         0.0
     } else {
@@ -991,14 +1082,13 @@ pub fn sparsity_from_buf(dtype: Dtype, bytes: &[u8], eps: f32) -> f32 {
     if n == 0 {
         return 0.0;
     }
-    let mut reader = TensorElementReader::new(dtype, bytes);
-    let mut near_zero = 0u64;
-    for k in 0..n {
-        let v = reader.element(k);
+    let near_zero = fold_prefix_f32(dtype, bytes, n, 0u64, |nz, v| {
         if v.is_finite() && v.abs() < eps {
-            near_zero += 1;
+            nz + 1
+        } else {
+            nz
         }
-    }
+    });
     (near_zero as f64 / n as f64) as f32
 }
 
@@ -1017,6 +1107,7 @@ pub fn gguf_tensor_byte_range(info: &TensorInfo, tensor_data_offset: u64) -> (u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::DiffMetric;
 
     #[test]
     fn dtype_from_str_roundtrip() {
@@ -1117,6 +1208,73 @@ mod tests {
     fn rms_from_buf_empty_is_zero() {
         let r = rms_from_buf(Dtype::F32, &[]);
         assert_eq!(r, 0.0);
+    }
+
+    /// The fixed-stride chunked fast path must agree element-for-element with
+    /// the `TensorElementReader` fallback, including the NaN-painted tail of a
+    /// buffer that doesn't cover all requested elements.
+    #[test]
+    fn decode_prefix_f32_fast_path_matches_reader() {
+        for (dtype, bpe) in [
+            (Dtype::F32, 4usize),
+            (Dtype::F16, 2),
+            (Dtype::BF16, 2),
+            (Dtype::I32, 4),
+            (Dtype::U8, 1),
+        ] {
+            let raw: Vec<u8> = (0..9usize)
+                .flat_map(|i| (0..bpe).map(|j| ((i * 31 + j * 7) % 251) as u8).collect::<Vec<_>>())
+                .collect();
+            let mut reader = TensorElementReader::new(dtype, &raw);
+            for n in [0usize, 1, 4, 9, 12] {
+                let expect: Vec<f32> = (0..n).map(|k| reader.element(k)).collect();
+                let got = crate::format::decode_prefix_f32(dtype, &raw, n);
+                assert_eq!(got.len(), n, "{dtype:?} n={n}");
+                for (a, b) in got.iter().zip(expect.iter()) {
+                    assert_eq!(
+                        a.is_nan(), b.is_nan(),
+                        "{dtype:?} n={n}: NaN agreement"
+                    );
+                    if !a.is_nan() {
+                        assert_eq!(a, b, "{dtype:?} n={n}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `diff_to_u8`'s fixed-stride fast path must produce the same bytes as
+    /// the reader fallback, both for fully covered ranges and for a range
+    /// that overruns either buffer (NaN sentinel tail → 255).
+    #[test]
+    fn diff_to_u8_fixed_fast_path_matches_reader_fallback() {
+        let orig = f32_bytes(&[1.0, 2.0, 4.0, 8.0]);
+        let modd = f32_bytes(&[1.5, 2.0, 5.0]);
+        for metric in [
+            DiffMetric::Rms,
+            DiffMetric::AbsLog,
+            DiffMetric::Exact,
+        ] {
+            for elem_count in 3usize..6 {
+                // Force the reader fallback by requesting more elements than
+                // the modified buffer covers; the fast path must decline and
+                // both must agree.
+                let got = Dtype::F32.diff_to_u8(
+                    &orig, 0, Dtype::F32, &modd, 0, metric, 1.0, elem_count,
+                );
+                assert_eq!(got.len(), elem_count, "len n={elem_count}");
+                for (k, &byte) in got.iter().enumerate() {
+                    let tail = k >= 3;
+                    if tail {
+                        assert_eq!(byte, 255, "NaN sentinel at k={k}");
+                    }
+                }
+            }
+        }
+        // Fully covered range: exact metric on equal pixels → 127 (mid-grey).
+        let a = f32_bytes(&[1.0, 2.0]);
+        let got = Dtype::F32.diff_to_u8(&a, 0, Dtype::F32, &a, 0, DiffMetric::Exact, 1.0, 2);
+        assert_eq!(got, vec![127u8, 127]);
     }
 
     #[test]
@@ -1409,3 +1567,4 @@ mod tests {
         }
     }
 }
+
