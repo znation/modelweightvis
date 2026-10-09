@@ -312,6 +312,29 @@ fn blank_tile() -> image::ImageBuffer<Rgb<u8>, Vec<u8>> {
 /// are normalised magnitudes), the passed-in Stairwell `pixel_lut` is replaced
 /// by the perceptual [`crate::colormap::CIVIDIS_LUT`]; all other plain renders
 /// keep the byte/Hilbert-consistent Stairwell colouring.
+/// Shared skeleton for the architectural tile renderers: allocate a blank
+/// tile, walk the tile's regions, and hand each one to `paint` together with
+/// its fetched bytes, leading element offset, and compact-layout flag. All
+/// four `render_arch_tile_*` variants go through this — they differ only in
+/// the per-pixel color mapping.
+fn render_arch_tile(
+    tile: &LoadedArchTile,
+    fmt: TileFormat,
+    mut paint: impl FnMut(
+        &mut image::ImageBuffer<Rgb<u8>, Vec<u8>>,
+        &TileRegion,
+        &[u8],
+        usize,
+        bool,
+    ),
+) -> TileResult {
+    let mut img = blank_tile();
+    for (region, bytes, leading, is_compact) in &tile.regions {
+        paint(&mut img, region, bytes, *leading, *is_compact);
+    }
+    encode_tile(img, fmt)
+}
+
 pub fn render_arch_tile_plain(
     tile: &LoadedArchTile,
     pixel_lut: &[Rgb<u8>; 256],
@@ -322,22 +345,20 @@ pub fn render_arch_tile_plain(
     } else {
         pixel_lut
     };
-    let mut img = blank_tile();
-    for (region, bytes, leading, is_compact) in &tile.regions {
+    render_arch_tile(tile, fmt, |img, region, bytes, leading, is_compact| {
         let dtype = region.dtype;
-        if *is_compact {
+        if is_compact {
             iter_region_pixels_compact(region, |px, py, elem_off| {
                 let byte = bytes.get(elem_off).copied().unwrap_or(127);
                 img.put_pixel(px, py, pixel_lut[byte as usize]);
             });
         } else {
-            iter_region_pixels(region, *leading, |px, py, elem_off| {
+            iter_region_pixels(region, leading, |px, py, elem_off| {
                 let color = plain_element_color(dtype, bytes, elem_off, pixel_lut);
                 img.put_pixel(px, py, color);
             });
         }
-    }
-    encode_tile(img, fmt)
+    })
 }
 
 /// Diff-mode. Each region carries paired byte ranges — fetched in
@@ -350,10 +371,9 @@ pub fn render_arch_tile_diff(
     pixel_lut: &[Rgb<u8>; 256],
     fmt: TileFormat,
 ) -> TileResult {
-    let mut img = blank_tile();
-    for (region, bytes, leading, is_compact) in &tile.regions {
+    render_arch_tile(tile, fmt, |img, region, bytes, leading, is_compact| {
         let dtype = region.dtype;
-        if *is_compact {
+        if is_compact {
             // Compact buffer is one byte per painted pixel — exactly the
             // U8-diff happy path.
             iter_region_pixels_compact(region, |px, py, elem_off| {
@@ -361,7 +381,7 @@ pub fn render_arch_tile_diff(
                 img.put_pixel(px, py, pixel_lut[byte as usize]);
             });
         } else {
-            iter_region_pixels(region, *leading, |px, py, elem_off| {
+            iter_region_pixels(region, leading, |px, py, elem_off| {
                 // `TensorDiff` produces one byte per *element pair* (not per
                 // element of the source dtype). For diff buffers `dtype` is U8
                 // and `stride` is `Fixed(1)`, so the per-pixel byte index is
@@ -379,8 +399,7 @@ pub fn render_arch_tile_diff(
                 img.put_pixel(px, py, pixel_lut[byte as usize]);
             });
         }
-    }
-    encode_tile(img, fmt)
+    })
 }
 
 /// Xet (plain) mode — byte intensity × xorb tableau color.
@@ -391,8 +410,7 @@ pub fn render_arch_tile_xet(
     tableau: &[Rgb<u8>; 20],
     fmt: TileFormat,
 ) -> TileResult {
-    let mut img = blank_tile();
-    for (region, bytes, leading, is_compact) in &tile.regions {
+    render_arch_tile(tile, fmt, |img, region, bytes, leading, is_compact| {
         let dtype = region.dtype;
         // xet xorb coloring keys off absolute byte position. For fixed-stride
         // dtypes the byte address of element K is at a known offset; for
@@ -401,7 +419,7 @@ pub fn render_arch_tile_xet(
         let tbs = region.tensor_byte_start
             + region.row_first * region.tensor_cols * dtype.element_size() as u64
             + region.col_first * dtype.element_size() as u64;
-        if *is_compact {
+        if is_compact {
             // Compact only fires for Fixed(1); xet_element_color reads one
             // byte at `elem_off` and the byte-address proxy still keys off
             // `tbs` (the region's anchor), which is fine for xorb hue lookup.
@@ -411,14 +429,13 @@ pub fn render_arch_tile_xet(
                 img.put_pixel(px, py, color);
             });
         } else {
-            iter_region_pixels(region, *leading, |px, py, elem_off| {
+            iter_region_pixels(region, leading, |px, py, elem_off| {
                 let color =
                     xet_element_color(dtype, bytes, elem_off, tbs, xorb_ranges, tableau, pixel_lut);
                 img.put_pixel(px, py, color);
             });
         }
-    }
-    encode_tile(img, fmt)
+    })
 }
 
 /// Element-aware diff render when paired byte ranges are available on both
@@ -433,7 +450,6 @@ pub fn render_arch_tile_diff_paired(
     pixel_lut: &[Rgb<u8>; 256],
     fmt: TileFormat,
 ) -> TileResult {
-    let mut img = blank_tile();
     // Pair regions by tensor_id; assume parallel layouts (same canvas, same
     // tensor placement). Mismatches fall back to padding.
     let mut by_id_b: std::collections::HashMap<usize, &(TileRegion, Vec<u8>, usize, bool)> =
@@ -442,30 +458,37 @@ pub fn render_arch_tile_diff_paired(
         by_id_b.insert(r.0.tensor_id, r);
     }
 
-    for (region_a, bytes_a, leading_a, _is_compact_a) in &tile_a.regions {
+    // Per-tensor scale is unknown at this layer in v1; pass 0 → RMS path
+    // falls back to RMS_FLOOR.
+    let scale_orig = 0.0f32;
+    render_arch_tile(tile_a, fmt, |img, region_a, bytes_a, leading_a, _| {
         let Some((_region_b, bytes_b, leading_b, _is_compact_b)) = by_id_b.get(&region_a.tensor_id)
         else {
-            continue;
+            return;
         };
         let dtype = region_a.dtype;
         let dtype_b = _region_b.dtype;
-        // Per-tensor scale is unknown at this layer in v1; pass 0 → RMS path
-        // falls back to RMS_FLOOR.
-        let scale_orig = 0.0f32;
         let leading_b = *leading_b;
-        iter_region_pixels(region_a, *leading_a, |px, py, elem_off| {
+        iter_region_pixels(region_a, leading_a, |px, py, elem_off| {
             // Symmetric layouts give the same element offset on both sides
             // for fixed-stride dtypes; for block-stride we additionally
             // offset by side B's `leading` minus side A's so the matched
             // element pairs line up.
-            let mod_off = elem_off + leading_b - *leading_a;
+            let mod_off = elem_off + leading_b - leading_a;
             let color = diff_element_color(
-                dtype, bytes_a, elem_off, dtype_b, bytes_b, mod_off, metric, scale_orig, pixel_lut,
+                dtype,
+                bytes_a,
+                elem_off,
+                dtype_b,
+                bytes_b,
+                mod_off,
+                metric,
+                scale_orig,
+                pixel_lut,
             );
             img.put_pixel(px, py, color);
         });
-    }
-    encode_tile(img, fmt)
+    })
 }
 
 #[cfg(test)]
