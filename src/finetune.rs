@@ -130,3 +130,47 @@ pub async fn detect_relation(orig_url: &str, mod_url: &str) -> Option<bool> {
 fn repo_ids_equal(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_flags_maps_both_cli_flags() {
+        assert!(matches!(FinetuneForce::from_flags(true, false), FinetuneForce::On));
+        assert!(matches!(FinetuneForce::from_flags(false, true), FinetuneForce::Off));
+        assert!(matches!(FinetuneForce::from_flags(false, false), FinetuneForce::Auto));
+        // --finetune wins when both are passed (clap still allows the pair).
+        assert!(matches!(FinetuneForce::from_flags(true, true), FinetuneForce::On));
+    }
+
+    #[test]
+    fn repo_ids_equal_is_case_insensitive() {
+        assert!(repo_ids_equal("Owner/Name", "owner/name"));
+        assert!(repo_ids_equal("meta-llama/Llama-3.2-1B", "META-LLAMA/LLAMA-3.2-1B"));
+        assert!(!repo_ids_equal("org/a", "org/b"));
+        assert!(!repo_ids_equal("org/a", "other/a"));
+    }
+
+    #[tokio::test]
+    async fn detect_relation_returns_none_for_non_model_urls() {
+        // Datasets are not models: the finetune relation doesn't apply.
+        assert_eq!(
+            detect_relation("hf://datasets/squad", "hf://datasets/other/squad").await,
+            None
+        );
+        // Either side failing to parse short-circuits before any API call.
+        assert_eq!(detect_relation("not a url", "hf://org/model").await, None);
+        assert_eq!(detect_relation("hf://org/model", "https://example.com/x").await, None);
+    }
+
+    #[tokio::test]
+    async fn detect_relation_none_when_both_sides_are_valid_models_but_lookup_fails() {
+        // A well-formed model URL whose repo cannot exist: fetch fails, so
+        // detection is not applicable and the caller's default applies.
+        assert_eq!(
+            detect_relation("hf://no/such-repo-zz", "hf://no/such-repo-zz").await,
+            None
+        );
+    }
+}
