@@ -1237,7 +1237,7 @@ mod tests {
             let mut reader = TensorElementReader::new(dtype, &raw);
             for n in [0usize, 1, 4, 9, 12] {
                 let expect: Vec<f32> = (0..n).map(|k| reader.element(k)).collect();
-                let got = crate::format::decode_prefix_f32(dtype, &raw, n);
+                let got = decode_prefix_f32(dtype, &raw, n);
                 assert_eq!(got.len(), n, "{dtype:?} n={n}");
                 for (a, b) in got.iter().zip(expect.iter()) {
                     assert_eq!(

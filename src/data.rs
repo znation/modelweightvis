@@ -473,7 +473,7 @@ pub async fn load_model_info_async(
     byte_size: u64,
     fmt: SourceFormat,
 ) -> anyhow::Result<ModelInfo> {
-    let (mut tensors, header_end, dropped) = fetch_model_header(data, fmt).await?;
+    let (tensors, header_end, dropped) = fetch_model_header(data, fmt).await?;
     // Main's `validate_tensor_ranges` guard inside `fetch_model_header` drops
     // hostile safetensors entries with a warning so per-tile slicing can't
     // panic; but for the up-front model-info load a dropped entry means the
