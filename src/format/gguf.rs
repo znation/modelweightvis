@@ -294,4 +294,43 @@ mod tests {
         assert_eq!(r[1].0, 64);
         assert_eq!(r[1].1, 128);
     }
+
+    /// Build a minimal valid GGUF v2 byte stream with zero KV pairs and one
+    /// F32 tensor info (`t`: 4 elements = 16 bytes) whose data lives at
+    /// `tensor_data_offset` — i.e. immediately past the end of the returned
+    /// bytes. Exercises candle's header parser accepting a tensor that
+    /// extends beyond EOF (candle never checks this itself).
+    fn hostile_gguf_tensor_past_eof() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x46554747u32.to_le_bytes()); // magic
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+        // Tensor info: name, dims, dtype, offset.
+        let name = b"t";
+        bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // n_dimensions
+        bytes.extend_from_slice(&4u64.to_le_bytes()); // dim[0]
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // GGML type F32
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // offset
+        // Pad to the default 32-byte alignment so tensor_data_offset == 32;
+        // the declared range [32..48) exceeds the 32-byte file.
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    #[test]
+    fn parse_header_accepts_but_validate_tensor_ranges_drops_past_eof_tensor() {
+        let bytes = hostile_gguf_tensor_past_eof();
+        let header = parse_header(&bytes).expect("candle parses the hostile header");
+        assert_eq!(header.tensors.len(), 1);
+        assert!(header.tensors[0].file_end > bytes.len() as u64);
+        let mut tensors = header.tensors;
+        let dropped = super::super::types::validate_tensor_ranges(&mut tensors, bytes.len() as u64);
+        assert_eq!(dropped, 1);
+        assert!(tensors.is_empty());
+    }
 }

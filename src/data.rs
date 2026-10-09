@@ -376,6 +376,13 @@ fn parse_gguf_header_local(path: &Path) -> anyhow::Result<format::gguf::GgufHead
 /// bytes — the file is genuinely not parseable as GGUF and we surface the error.
 async fn fetch_gguf_header(data: &Data) -> anyhow::Result<format::gguf::GgufHeader> {
     let mut want = GGUF_HEADER_FETCH_INITIAL;
+    // arbvis's local `fetch_range` slices `bytes[start..start+len]` and
+    // panics past EOF, and a small GGUF file is smaller than the initial
+    // fetch: clamp the prefix to the real length so the parse sees the
+    // whole (short) file instead of faulting.
+    if data.is_local() && !matches!(data, Data::ZeroFill) {
+        want = want.min(data.len());
+    }
     loop {
         let buf = data.fetch_range(0, want).await?;
         match format::gguf::parse_header(&buf) {
@@ -475,15 +482,15 @@ pub async fn load_model_info_async(
 ) -> anyhow::Result<ModelInfo> {
     let (tensors, header_end, dropped) = fetch_model_header(data, fmt).await?;
     // Main's `validate_tensor_ranges` guard inside `fetch_model_header` drops
-    // hostile safetensors entries with a warning so per-tile slicing can't
-    // panic; but for the up-front model-info load a dropped entry means the
-    // declared data extends past the real file — an interrupted or corrupt
+    // hostile safetensors and GGUF entries with a warning so per-tile slicing
+    // can't panic; but for the up-front model-info load a dropped entry means
+    // the declared data extends past the real file — an interrupted or corrupt
     // download — so reject it outright rather than advertise a hollow tensor
-    // list. GGUF and pickle carry no such drop path; their truncation is
-    // caught by the offset check below against the true remote length.
+    // list. Pickle carries no such drop path; its truncation is caught by the
+    // offset check below against the true remote length.
     if dropped > 0 {
         anyhow::bail!(
-            "truncated safetensors: {dropped} tensor(s) declare byte ranges past the file size"
+            "truncated model file: {dropped} tensor(s) declare byte ranges past the file size"
         );
     }
     // The same truncation fault as the local path applies to remote sources:
@@ -540,7 +547,18 @@ async fn fetch_model_header(
         }
         SourceFormat::Gguf => {
             let header = fetch_gguf_header(data).await?;
-            Ok((header.tensors, header.tensor_data_offset, 0))
+            let mut tensors = header.tensors;
+            // Mirror the safetensors arm: candle's GGUF reader reads raw u64
+            // offsets and never checks them against the real file, so for
+            // local sources (where the fetched bytes are the whole file) drop
+            // tensors whose declared ranges fall outside it — a later
+            // per-tile slice at those offsets would panic.
+            let dropped = if data.is_local() && !matches!(data, Data::ZeroFill) {
+                format::types::validate_tensor_ranges(&mut tensors, data.len() as u64)
+            } else {
+                0
+            };
+            Ok((tensors, header.tensor_data_offset, dropped))
         }
         SourceFormat::Pickle => {
             // The zip end-of-central-directory record lives at the END of a
@@ -3400,6 +3418,42 @@ mod tests {
         buf.extend_from_slice(&[0u8; 4]);
         let data = arbvis::data::Data::Owned(buf.clone());
         let err = load_model_info_async(&data, buf.len() as u64, SourceFormat::Safetensors)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+    }
+
+    /// Minimal valid GGUF v2 byte stream with zero KVs and one F32 tensor
+    /// info whose declared data range lies entirely past the end of the
+    /// bytes (candle's header parser accepts it; see the unit test in
+    /// `format::gguf`).
+    fn hostile_gguf_tensor_past_eof_bytes() -> Vec<u8> {
+        let mut buf = 0x46554747u32.to_le_bytes().to_vec(); // magic "GGUF"
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version
+        buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+        // Tensor info: name "t", 1 dim of 4, dtype F32 (0), offset 0.
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.push(b't');
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&4u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        while buf.len() % 32 != 0 {
+            buf.push(0); // alignment padding so tensor_data_offset is reachable
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn load_model_info_drops_gguf_tensors_declared_past_eof() {
+        // Local `Data::Owned` exposes the whole file, so the header-declared
+        // range [32..48) of a 32-byte GGUF is past EOF: the hostile tensor
+        // must be dropped and the model-info load rejected, not left in place
+        // to panic a later per-tile slice.
+        let buf = hostile_gguf_tensor_past_eof_bytes();
+        let data = arbvis::data::Data::Owned(buf.clone());
+        let err = load_model_info_async(&data, buf.len() as u64, SourceFormat::Gguf)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("truncated"), "{err:#}");

@@ -207,3 +207,34 @@ pub struct ModelInfo {
     #[allow(dead_code)]
     pub color_ranges: Vec<(u64, u64, Rgb<u8>)>,
 }
+
+/// Validate parsed tensors' absolute byte ranges against the file's actual
+/// size, dropping entries that fall outside it.
+///
+/// A malicious or truncated model file (safetensors and GGUF alike) can
+/// declare tensor ranges beyond the end of the file (or `end < start`):
+/// safetensors carries `data_offsets` straight from its JSON header, and
+/// GGUF tensor infos carry raw u64 `offset` fields that candle's
+/// `Content::read` never checks against the real file. Downstream readers
+/// slice the backing bytes at those offsets, and an out-of-range slice
+/// panics, so the header cannot be trusted on its own: this is the
+/// boundary where the declared ranges meet the real file length. Returns
+/// how many tensors were dropped and logs one warning per drop.
+pub fn validate_tensor_ranges(tensors: &mut Vec<TensorMeta>, file_size: u64) -> usize {
+    let before = tensors.len();
+    tensors.retain(|t| {
+        let in_bounds = t.file_end <= file_size && t.file_start < t.file_end;
+        if !in_bounds {
+            log::warn!(
+                "dropping tensor '{}' with declared byte range [{}..{}) \
+                 outside file size {}",
+                t.name,
+                t.file_start,
+                t.file_end,
+                file_size
+            );
+        }
+        in_bounds
+    });
+    before - tensors.len()
+}
