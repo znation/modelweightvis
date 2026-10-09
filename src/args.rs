@@ -304,3 +304,137 @@ impl ModelArgs {
         ProbeOpts { enabled, source }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse<const N: usize>(args: [&str; N]) -> Result<ModelArgs, clap::Error> {
+        ModelArgs::try_parse_from(std::iter::once("modelweightvis").chain(args))
+    }
+
+    #[test]
+    fn defaults_match_documented_choices() {
+        let a = parse(["hf://x/y"]).unwrap();
+        assert!(matches!(a.diff_metric, DiffMetricArg::Rms));
+        assert!(matches!(a.summary_stat, SummaryStatArg::Rms));
+        assert!(matches!(a.moe_norm, MoeNormArg::Percentile));
+        assert!(matches!(a.layout, LayoutArg::Arch));
+        assert_eq!(a.cka_sample, 128);
+        assert!(a.moe.is_none() && !a.finetune && !a.no_finetune);
+        let o = a.probe_opts();
+        assert!(!o.enabled);
+        assert!(matches!(o.source, ProbeSource::Default));
+    }
+
+    #[test]
+    fn from_impls_map_every_variant() {
+        assert_eq!(DiffMetric::from(DiffMetricArg::Rms), DiffMetric::Rms);
+        assert_eq!(DiffMetric::from(DiffMetricArg::AbsLog), DiffMetric::AbsLog);
+        assert_eq!(DiffMetric::from(DiffMetricArg::Exact), DiffMetric::Exact);
+
+        assert_eq!(SummaryStat::from(SummaryStatArg::Rms), SummaryStat::Rms);
+        assert_eq!(SummaryStat::from(SummaryStatArg::Frobenius), SummaryStat::Frobenius);
+        assert_eq!(SummaryStat::from(SummaryStatArg::MeanAbs), SummaryStat::MeanAbs);
+        assert_eq!(SummaryStat::from(SummaryStatArg::Sparsity), SummaryStat::Sparsity);
+
+        assert_eq!(crate::data::MoeNorm::from(MoeNormArg::Max), crate::data::MoeNorm::Max);
+        assert_eq!(
+            crate::data::MoeNorm::from(MoeNormArg::MinMax),
+            crate::data::MoeNorm::MinMax
+        );
+        assert_eq!(
+            crate::data::MoeNorm::from(MoeNormArg::Percentile),
+            crate::data::MoeNorm::Percentile
+        );
+
+        assert_eq!(LayoutMode::from(LayoutArg::Arch), LayoutMode::Forced("arch"));
+        assert_eq!(LayoutMode::from(LayoutArg::Hilbert), LayoutMode::Hilbert);
+    }
+
+    #[test]
+    fn probe_opts_resolve_source_overrides() {
+        let o = parse(["--moe", "m", "--probe-text", "hi"]).unwrap().probe_opts();
+        assert!(o.enabled);
+        assert!(matches!(o.source, ProbeSource::Text(t) if t == "hi"));
+
+        let o = parse(["--moe", "m", "--probe-file", "p.txt"]).unwrap().probe_opts();
+        assert!(o.enabled);
+        assert!(matches!(o.source, ProbeSource::File(f) if f == PathBuf::from("p.txt")));
+
+        let o = parse(["--moe", "m", "--probe-url", "hf://x/y"]).unwrap().probe_opts();
+        assert!(o.enabled);
+        assert!(matches!(o.source, ProbeSource::Url(u) if u == "hf://x/y"));
+    }
+
+    #[test]
+    fn bare_probe_enables_with_default_source() {
+        let o = parse(["--moe", "m", "--probe"]).unwrap().probe_opts();
+        assert!(o.enabled);
+        assert!(matches!(o.source, ProbeSource::Default));
+    }
+
+    #[test]
+    fn probe_overrides_are_mutually_exclusive() {
+        assert!(parse(["--moe", "m", "--probe-text", "t", "--probe-file", "f"]).is_err());
+        assert!(parse(["--moe", "m", "--probe-file", "f", "--probe-url", "u"]).is_err());
+        assert!(parse(["--moe", "m", "--probe-text", "t", "--probe-url", "u"]).is_err());
+    }
+
+    #[test]
+    fn probe_flags_require_moe() {
+        let err = match parse(["--probe"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--probe without --moe should fail"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(parse(["--probe-text", "t"]).is_err());
+        assert!(parse(["--probe-url", "u"]).is_err());
+    }
+
+    #[test]
+    fn finetune_family_requires_diff_and_excludes_itself() {
+        assert!(parse(["--finetune"]).is_err());
+        assert!(parse(["--no-finetune"]).is_err());
+        assert!(parse(["--finetune", "--no-finetune", "--diff", "a", "b"]).is_err());
+        // Each accepted individually when --diff is present.
+        assert!(parse(["--diff", "a", "b", "--finetune"]).is_ok());
+        assert!(parse(["--diff", "a", "b", "--no-finetune"]).is_ok());
+    }
+
+    #[test]
+    fn moe_conflicts_with_diff_and_finetune_flags() {
+        assert!(parse(["--moe", "m", "--diff", "a", "b"]).is_err());
+        assert!(parse(["--moe", "m", "--finetune"]).is_err());
+        assert!(parse(["--moe", "m"]).is_ok());
+    }
+
+    #[test]
+    fn cka_sample_range_is_enforced() {
+        assert!(parse(["--moe", "m", "--cka-sample", "15"]).is_err());
+        assert!(parse(["--moe", "m", "--cka-sample", "4097"]).is_err());
+        assert_eq!(parse(["--moe", "m", "--cka-sample", "16"]).unwrap().cka_sample, 16);
+        assert_eq!(parse(["--moe", "m", "--cka-sample", "4096"]).unwrap().cka_sample, 4096);
+    }
+
+    #[test]
+    fn value_enum_flags_parse_choices_and_reject_unknown() {
+        let a = parse(["--layout", "hilbert", "--diff-metric", "exact"]).unwrap();
+        assert!(matches!(a.layout, LayoutArg::Hilbert));
+        assert!(matches!(a.diff_metric, DiffMetricArg::Exact));
+        let a = parse(["--summary-stat", "sparsity", "--moe-norm", "min-max"]).unwrap();
+        assert!(matches!(a.summary_stat, SummaryStatArg::Sparsity));
+        assert!(matches!(a.moe_norm, MoeNormArg::MinMax));
+        assert!(parse(["--diff-metric", "nonsense"]).is_err());
+    }
+
+    #[test]
+    fn into_arbvis_args_consumes_and_yields_inner_args() {
+        let a = parse(["--moe", "m", "--layout", "hilbert"]).unwrap();
+        let inner = a.into_arbvis_args();
+        // The model-side flags live on the outer struct; the inner half is the
+        // flattened arbvis::Args. arbvis::Args fields are byte-view only; just
+        // confirm the call compiles and returns a movable value.
+        let _ = inner;
+    }
+}
